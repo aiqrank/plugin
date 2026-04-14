@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,35 @@ SKILL_TOOL = "Skill"
 # The plugin writes metrics for myaiscore itself; exclude self-references from
 # custom-skill-creation detection.
 MYAISCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/myaiscore/"
+
+# Heuristic "correction" detection. A user message is counted as a correction
+# when its first ~120 chars contain one of these patterns — i.e. the user is
+# pushing back on, negating, or redirecting Claude's prior turn. Only counts
+# occurrences; no text is stored or transmitted.
+_CORRECTION_RE = re.compile(
+    r"""
+    (?:^|[\s.,!?;:-])          # word boundary
+    (?:
+        no[,!.\s]              | # "no," / "no!" / "no " (bare 'no')
+        don'?t\b                | # don't
+        stop\b                  |
+        wait[,!.\s]             | # "wait," at start of message
+        undo\b                  |
+        revert\b                |
+        incorrect\b             |
+        wrong\b                 |
+        actually[,!.\s]         | # "actually," redirect
+        try\s+again\b           |
+        you\s+(?:missed|forgot|broke)\b |
+        that'?s\s+not\s+(?:right|correct|what\s+i) |
+        not\s+what\s+i\s+(?:meant|want|asked) |
+        nope\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_CORRECTION_SCAN_PREFIX = 120  # only scan first N chars for speed/signal
 
 
 def scan(
@@ -68,6 +98,18 @@ def scan(
         "custom_skill_files_written": 0,
         "custom_mcp_config_writes": 0,
         "first_messages_sample": [],
+        # Peak count of Agent tool_uses dispatched in a single assistant turn
+        # (parallel sub-agent orchestration). >=2 means genuine parallelism.
+        "max_parallel_agents": 0,
+        # Count of assistant turns that dispatched >=2 Agents simultaneously.
+        "parallel_agent_turns": 0,
+        # Deepest single session (by message count) — a proxy for sustained
+        # sessions vs short one-shots.
+        "max_messages_in_session": 0,
+        # User turns total and user turns matching a correction pattern.
+        # The ratio is computed in scoring.py for display.
+        "user_messages": 0,
+        "user_corrections": 0,
     }
 
     if not projects.is_dir():
@@ -126,6 +168,12 @@ def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> 
     session_used_orchestration = False
     session_used_context_leverage = False
     first_user_msg_captured = False
+    session_message_count = 0
+    # Claude Code writes each parallel tool_use as its own JSONL event but
+    # tags them with the same `requestId` (they all came from one model
+    # turn). Accumulate Agent dispatches per requestId so we can detect
+    # parallel fan-out at session end.
+    agents_by_request: dict[str, int] = {}
 
     try:
         with path.open("r") as fh:
@@ -140,24 +188,53 @@ def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> 
                     continue
 
                 results["messages"] += 1
+                session_message_count += 1
                 msg = event.get("message") or {}
 
-                # Capture first user message from this session (for later role
-                # classification). Cap the sample globally to protect memory.
-                if (
-                    not first_user_msg_captured
-                    and event.get("type") == "user"
-                    and len(results["first_messages_sample"]) < 500
-                ):
-                    content = msg.get("content")
-                    text = content_to_text(content)
+                if event.get("type") == "user":
+                    text = content_to_text(msg.get("content"))
+                    # Only count human-typed user turns, not tool-result echoes.
+                    # content_to_text returns "" for tool_result-only content.
                     if text:
-                        results["first_messages_sample"].append(text[:500])
-                        first_user_msg_captured = True
+                        results["user_messages"] += 1
+
+                        # Correction detection: match in the first 120 chars.
+                        if _CORRECTION_RE.search(text[:_CORRECTION_SCAN_PREFIX]):
+                            results["user_corrections"] += 1
+
+                        # Capture first user message from this session (for
+                        # later role classification). Cap globally for memory.
+                        if (
+                            not first_user_msg_captured
+                            and len(results["first_messages_sample"]) < 500
+                        ):
+                            results["first_messages_sample"].append(text[:500])
+                            first_user_msg_captured = True
 
                 # Tool_use calls live in assistant messages' content array
                 if event.get("type") == "assistant":
-                    for tool_use in extract_tool_uses(msg):
+                    turn_tool_uses = list(extract_tool_uses(msg))
+
+                    # Count Agent dispatches in THIS event's content. Parallel
+                    # fan-out is detected across events via requestId below,
+                    # since Claude Code may split tool_uses into separate
+                    # events that share one requestId.
+                    agents_in_event = sum(
+                        1 for t in turn_tool_uses if t.get("name") in ORCHESTRATION_TOOLS
+                    )
+                    request_id = event.get("requestId")
+                    if agents_in_event and request_id:
+                        agents_by_request[request_id] = (
+                            agents_by_request.get(request_id, 0) + agents_in_event
+                        )
+                    elif agents_in_event:
+                        # No requestId — treat each event as its own turn.
+                        if agents_in_event > results["max_parallel_agents"]:
+                            results["max_parallel_agents"] = agents_in_event
+                        if agents_in_event >= 2:
+                            results["parallel_agent_turns"] += 1
+
+                    for tool_use in turn_tool_uses:
                         results["tool_calls"] += 1
                         session_used_tools = True
 
@@ -208,6 +285,17 @@ def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> 
     except OSError:
         return
 
+    # Fold per-request Agent tallies into session totals. One request =
+    # one model turn, so if N Agents share a requestId, the model dispatched
+    # N agents in parallel.
+    for count in agents_by_request.values():
+        if count > results["max_parallel_agents"]:
+            results["max_parallel_agents"] = count
+        if count >= 2:
+            results["parallel_agent_turns"] += 1
+
+    if session_message_count > results["max_messages_in_session"]:
+        results["max_messages_in_session"] = session_message_count
     if session_used_tools:
         results["sessions_with_tools"] += 1
     if session_used_orchestration:

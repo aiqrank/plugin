@@ -39,6 +39,11 @@ def main(argv: list[str]) -> int:
     with open(args.src, "r") as fh:
         payload = json.load(fh)
 
+    # `stats` is a local-only summary (scanner counts, top-N lists) shown in
+    # the skill preview. Strip it before transmission so the privacy promise
+    # — "only the score + skill/MCP names cross the wire" — stays honest.
+    payload.pop("stats", None)
+
     # Ensure computed_at is set (the server enforces it)
     payload.setdefault("computed_at", iso_now())
 

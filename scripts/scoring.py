@@ -65,13 +65,22 @@ ROLE_WEIGHT_MULTIPLIERS = {
 # at low values (so a user who just started gets meaningful score movement).
 DIMENSION_REFERENCE_MAX = {
     "custom_creation": 10,  # distinct SKILL.md files authored
-    "agent_orchestration": 50,  # # of sessions using agents
+    "agent_orchestration": 50,  # # of sessions using agents (breadth sub-signal)
     "context_leverage": 80,  # # of sessions using context tools
     "skills_mcps": 100,  # combined distinct skills + MCP servers
     "tool_diversity": 40,  # # of unique tool names
     "conversation_depth": 300,  # avg messages per session (capped high)
     "basic_chat": 20,  # # of tool-less sessions
 }
+
+# `agent_orchestration` blends three sub-signals: breadth (# sessions),
+# parallelism depth (# turns dispatching >=2 agents), and peak (max parallel
+# agents in one turn). Weights sum to 1.0 so the dimension stays in [0, 100].
+ORCHESTRATION_BREADTH_WEIGHT = 0.5
+ORCHESTRATION_DEPTH_WEIGHT = 0.3
+ORCHESTRATION_PEAK_WEIGHT = 0.2
+ORCHESTRATION_DEPTH_REF_MAX = 100  # turns with parallel fan-out
+ORCHESTRATION_PEAK_REF_MAX = 10  # parallel agents in a single turn
 
 TIER_RANGES = [
     (850, "S"),
@@ -150,6 +159,7 @@ def score(metrics: dict) -> dict:
     overall = compute_overall_score(dimension_values, inferred_role)
     tier = tier_for_score(overall)
     top_strength = top_strength_label(dimension_values)
+    stats = compute_stats(metrics)
 
     return {
         "overall_score": overall,
@@ -158,7 +168,67 @@ def score(metrics: dict) -> dict:
         "activity_breakdown": round_map(activity_breakdown, 2),
         "dimension_values": round_map(dimension_values, 1),
         "top_strength": top_strength,
+        # `stats` is local-only: shown in the skill preview so the user sees
+        # the raw counts behind their tier. `submit_score.py` strips this
+        # block before POSTing so the server only receives score payload.
+        "stats": stats,
     }
+
+
+def compute_stats(metrics: dict) -> dict:
+    """
+    Human-readable activity summary for the skill preview. Pure counts and
+    top-N lists — nothing derived from the scoring curves. These exist to
+    tell users what they actually did, not how it mapped to dimensions.
+    """
+    tool_counts = metrics.get("tool_name_counts") or {}
+    skill_counts = metrics.get("skill_counts") or {}
+    mcp_counts = metrics.get("mcp_server_counts") or {}
+    agent_counts = metrics.get("agent_type_counts") or {}
+
+    sessions = int(metrics.get("sessions", 0))
+    messages = int(metrics.get("messages", 0))
+    sessions_with_tools = int(metrics.get("sessions_with_tools", 0))
+    basic_chat_sessions = max(sessions - sessions_with_tools, 0)
+    user_messages = int(metrics.get("user_messages", 0))
+    user_corrections = int(metrics.get("user_corrections", 0))
+    correction_rate_pct = (
+        round(100.0 * user_corrections / user_messages, 1) if user_messages else 0.0
+    )
+
+    return {
+        "window_days": int(metrics.get("window_days", 0)),
+        "sessions": sessions,
+        "messages": messages,
+        "tool_calls": int(metrics.get("tool_calls", 0)),
+        "basic_chat_sessions": basic_chat_sessions,
+        "user_messages": user_messages,
+        "user_corrections": user_corrections,
+        "correction_rate_pct": correction_rate_pct,
+        "sessions_with_orchestration": int(metrics.get("sessions_with_orchestration", 0)),
+        "sessions_with_context_leverage": int(metrics.get("sessions_with_context_leverage", 0)),
+        "distinct_tools": len(tool_counts),
+        "distinct_skills": len(skill_counts),
+        "distinct_mcps": len(mcp_counts),
+        "distinct_agent_types": len(agent_counts),
+        "max_parallel_agents": int(metrics.get("max_parallel_agents", 0)),
+        "parallel_agent_turns": int(metrics.get("parallel_agent_turns", 0)),
+        "total_agent_calls": sum(agent_counts.values()),
+        "custom_skills_written": int(metrics.get("custom_skill_files_written", 0)),
+        "custom_mcp_writes": int(metrics.get("custom_mcp_config_writes", 0)),
+        "avg_messages_per_session": round(messages / sessions, 1) if sessions else 0.0,
+        "max_messages_in_session": int(metrics.get("max_messages_in_session", 0)),
+        "top_tools": top_n(tool_counts, 10),
+        "top_skills": top_n(skill_counts, 10),
+        "top_mcps": top_n(mcp_counts, 10),
+        "top_agents": top_n(agent_counts, 10),
+    }
+
+
+def top_n(counts: dict, n: int) -> list:
+    """Return top-N items as [[name, count], ...], sorted desc by count."""
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [[name, int(count)] for name, count in ranked[:n]]
 
 
 def compute_dimensions(metrics: dict) -> dict:
@@ -168,6 +238,8 @@ def compute_dimensions(metrics: dict) -> dict:
     )
 
     sessions_with_orchestration = int(metrics.get("sessions_with_orchestration", 0))
+    parallel_agent_turns = int(metrics.get("parallel_agent_turns", 0))
+    max_parallel_agents = int(metrics.get("max_parallel_agents", 0))
     sessions_with_context = int(metrics.get("sessions_with_context_leverage", 0))
 
     skills = len(metrics.get("skill_counts") or {})
@@ -185,11 +257,22 @@ def compute_dimensions(metrics: dict) -> dict:
         0,
     )
 
+    # Blended agent_orchestration: breadth (how often agents appear) +
+    # parallel depth (how often you fan out) + peak (how wide you go).
+    orchestration_breadth = log_normalize(
+        sessions_with_orchestration, DIMENSION_REFERENCE_MAX["agent_orchestration"]
+    )
+    orchestration_depth = log_normalize(parallel_agent_turns, ORCHESTRATION_DEPTH_REF_MAX)
+    orchestration_peak = log_normalize(max_parallel_agents, ORCHESTRATION_PEAK_REF_MAX)
+    orchestration = (
+        ORCHESTRATION_BREADTH_WEIGHT * orchestration_breadth
+        + ORCHESTRATION_DEPTH_WEIGHT * orchestration_depth
+        + ORCHESTRATION_PEAK_WEIGHT * orchestration_peak
+    )
+
     return {
         "custom_creation": log_normalize(custom_skills, DIMENSION_REFERENCE_MAX["custom_creation"]),
-        "agent_orchestration": log_normalize(
-            sessions_with_orchestration, DIMENSION_REFERENCE_MAX["agent_orchestration"]
-        ),
+        "agent_orchestration": orchestration,
         "context_leverage": log_normalize(
             sessions_with_context, DIMENSION_REFERENCE_MAX["context_leverage"]
         ),

@@ -234,6 +234,78 @@ class EndToEndTests(unittest.TestCase):
 
         self.assertIsInstance(result["top_strength"], str)
 
+    def test_stats_block_exposes_rich_local_signals(self):
+        metrics = {
+            "window_days": 60,
+            "sessions": 100,
+            "messages": 5000,
+            "tool_calls": 800,
+            "sessions_with_tools": 85,
+            "sessions_with_orchestration": 12,
+            "sessions_with_context_leverage": 20,
+            "tool_name_counts": {"Bash": 300, "Read": 200, "Edit": 100, "Agent": 40, "Skill": 10},
+            "skill_counts": {"commit": 3, "review": 2},
+            "mcp_server_counts": {"pencil": 4, "playwright": 2},
+            "agent_type_counts": {"general-purpose": 20, "Explore": 15, "Plan": 5},
+            "custom_skill_files_written": 2,
+            "custom_mcp_config_writes": 0,
+            "max_parallel_agents": 5,
+            "parallel_agent_turns": 7,
+            "max_messages_in_session": 420,
+            "first_messages_sample": [],
+        }
+
+        stats = score(metrics)["stats"]
+
+        self.assertEqual(stats["sessions"], 100)
+        self.assertEqual(stats["basic_chat_sessions"], 15)  # 100 - 85
+        self.assertEqual(stats["distinct_tools"], 5)
+        self.assertEqual(stats["distinct_skills"], 2)
+        self.assertEqual(stats["distinct_mcps"], 2)
+        self.assertEqual(stats["distinct_agent_types"], 3)
+        self.assertEqual(stats["max_parallel_agents"], 5)
+        self.assertEqual(stats["parallel_agent_turns"], 7)
+        self.assertEqual(stats["total_agent_calls"], 40)  # sum of agent_type_counts
+        self.assertEqual(stats["max_messages_in_session"], 420)
+        self.assertEqual(stats["avg_messages_per_session"], 50.0)
+
+        # top_tools is sorted desc and capped
+        self.assertEqual(stats["top_tools"][0], ["Bash", 300])
+        self.assertEqual(stats["top_tools"][1], ["Read", 200])
+        self.assertLessEqual(len(stats["top_tools"]), 10)
+
+    def test_stats_block_handles_empty_metrics(self):
+        stats = score({})["stats"]
+
+        self.assertEqual(stats["sessions"], 0)
+        self.assertEqual(stats["avg_messages_per_session"], 0.0)
+        self.assertEqual(stats["top_tools"], [])
+        self.assertEqual(stats["max_parallel_agents"], 0)
+        self.assertEqual(stats["user_messages"], 0)
+        self.assertEqual(stats["correction_rate_pct"], 0.0)
+
+    def test_correction_rate_computed_from_raw_counts(self):
+        stats = score({"user_messages": 200, "user_corrections": 15})["stats"]
+        self.assertEqual(stats["user_messages"], 200)
+        self.assertEqual(stats["user_corrections"], 15)
+        self.assertEqual(stats["correction_rate_pct"], 7.5)
+
+    def test_agent_orchestration_rewards_parallel_dispatch(self):
+        # Two users with identical breadth (10 orchestration sessions) but
+        # one fans out in parallel — that user should score higher on the
+        # agent_orchestration dimension.
+        base = {
+            "sessions": 50,
+            "sessions_with_tools": 40,
+            "sessions_with_orchestration": 10,
+        }
+        solo = score(base)["dimension_values"]["agent_orchestration"]
+        parallel = score(
+            {**base, "parallel_agent_turns": 40, "max_parallel_agents": 6}
+        )["dimension_values"]["agent_orchestration"]
+
+        self.assertGreater(parallel, solo)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -270,6 +270,80 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(result["tool_calls"], 0)
         self.assertEqual(result["sessions_with_tools"], 0)
 
+    def test_tracks_max_parallel_agents_in_single_turn(self):
+        # Claude Code splits parallel tool_uses from a single model turn
+        # into separate assistant events that share a `requestId`. The
+        # scanner must group by requestId to detect parallelism.
+        def agent_event(request_id):
+            return {
+                "type": "assistant",
+                "requestId": request_id,
+                "message": {"content": [{"type": "tool_use", "name": "Agent", "input": {}}]},
+            }
+
+        write_jsonl(
+            self.projects / "proj1" / "parallel.jsonl",
+            [
+                make_user_msg("fan out"),
+                # One turn dispatching 4 Agents in parallel (shared requestId)
+                agent_event("req_A"),
+                agent_event("req_A"),
+                agent_event("req_A"),
+                agent_event("req_A"),
+                # A second turn dispatching 2 Agents (shared requestId)
+                agent_event("req_B"),
+                agent_event("req_B"),
+                # A single-Agent turn — not parallel
+                agent_event("req_C"),
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["max_parallel_agents"], 4)
+        self.assertEqual(result["parallel_agent_turns"], 2)
+
+    def test_counts_user_corrections(self):
+        write_jsonl(
+            self.projects / "proj1" / "sess.jsonl",
+            [
+                make_user_msg("please add a feature"),           # not a correction
+                make_user_msg("no, not like that"),               # correction ("no,")
+                make_user_msg("stop — don't touch that file"),   # correction ("stop")
+                make_user_msg("actually, let's revert it"),      # correction ("actually,")
+                make_user_msg("looks good, ship it"),             # not a correction
+                make_user_msg("that's wrong"),                    # correction ("wrong")
+                # tool_result user-echo should NOT count (no human text)
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "x", "content": "ok"}
+                        ]
+                    },
+                },
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["user_messages"], 6)
+        self.assertEqual(result["user_corrections"], 4)
+
+    def test_tracks_max_messages_in_session(self):
+        write_jsonl(
+            self.projects / "proj1" / "short.jsonl",
+            [make_user_msg("hi"), make_user_msg("again")],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "long.jsonl",
+            [make_user_msg(f"msg {i}") for i in range(12)],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["max_messages_in_session"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()
