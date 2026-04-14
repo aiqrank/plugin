@@ -1,0 +1,17 @@
+{
+  "name": "myaiscore",
+  "owner": {
+    "name": "MyAIScore",
+    "url": "https://myaiscore.com"
+  },
+  "plugins": [
+    {
+      "name": "myaiscore",
+      "source": ".",
+      "description": "Compute and share your AI proficiency score from your Claude Code transcripts.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "tags": ["ai-proficiency", "metrics", "social"]
+    }
+  ]
+}
