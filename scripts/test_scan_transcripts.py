@@ -303,6 +303,111 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(result["max_parallel_agents"], 4)
         self.assertEqual(result["parallel_agent_turns"], 2)
 
+    def test_sums_token_usage_from_assistant_messages(self):
+        write_jsonl(
+            self.projects / "proj1" / "sess.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 50,
+                            "cache_read_input_tokens": 1000,
+                            "cache_creation_input_tokens": 200,
+                        },
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": "again"}],
+                        "usage": {"input_tokens": 10, "output_tokens": 5},
+                    },
+                },
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["tokens_input"], 110)
+        self.assertEqual(result["tokens_output"], 55)
+        self.assertEqual(result["tokens_cache_read"], 1000)
+        self.assertEqual(result["tokens_cache_creation"], 200)
+        self.assertEqual(result["tokens_total"], 1365)
+
+    def test_detects_concurrent_main_sessions(self):
+        # Two main sessions whose windows overlap (A runs 10:00-10:30,
+        # B runs 10:15-10:45) → max concurrent = 2.
+        write_jsonl(
+            self.projects / "proj1" / "A.jsonl",
+            [
+                {"type": "user", "message": {"content": "hi"}, "timestamp": "2026-04-01T10:00:00Z"},
+                {"type": "user", "message": {"content": "bye"}, "timestamp": "2026-04-01T10:30:00Z"},
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "B.jsonl",
+            [
+                {"type": "user", "message": {"content": "hi"}, "timestamp": "2026-04-01T10:15:00Z"},
+                {"type": "user", "message": {"content": "bye"}, "timestamp": "2026-04-01T10:45:00Z"},
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["main_sessions"], 2)
+        self.assertEqual(result["max_concurrent_sessions"], 2)
+
+    def test_back_to_back_sessions_are_not_concurrent(self):
+        # A ends at 10:30, B starts at 10:30 → not counted as concurrent.
+        write_jsonl(
+            self.projects / "proj1" / "A.jsonl",
+            [
+                {"type": "user", "message": {"content": "hi"}, "timestamp": "2026-04-01T10:00:00Z"},
+                {"type": "user", "message": {"content": "bye"}, "timestamp": "2026-04-01T10:30:00Z"},
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "B.jsonl",
+            [
+                {"type": "user", "message": {"content": "hi"}, "timestamp": "2026-04-01T10:30:00Z"},
+                {"type": "user", "message": {"content": "bye"}, "timestamp": "2026-04-01T11:00:00Z"},
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["max_concurrent_sessions"], 1)
+
+    def test_subagent_transcripts_do_not_count_for_concurrency(self):
+        # Main session at 10:00-10:30, subagent also at 10:10-10:20.
+        # Subagents are nested, not independent "user sessions", so they
+        # should NOT inflate max_concurrent_sessions.
+        session_uuid = "abc123"
+        write_jsonl(
+            self.projects / "proj1" / f"{session_uuid}.jsonl",
+            [
+                {"type": "user", "message": {"content": "hi"}, "timestamp": "2026-04-01T10:00:00Z"},
+                {"type": "user", "message": {"content": "bye"}, "timestamp": "2026-04-01T10:30:00Z"},
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / session_uuid / "subagents" / "agent-001.jsonl",
+            [
+                {"type": "user", "message": {"content": "x"}, "timestamp": "2026-04-01T10:10:00Z"},
+                {"type": "user", "message": {"content": "y"}, "timestamp": "2026-04-01T10:20:00Z"},
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["main_sessions"], 1)
+        # `sessions` counts both main + subagent transcripts
+        self.assertEqual(result["sessions"], 2)
+        self.assertEqual(result["max_concurrent_sessions"], 1)
+
     def test_counts_user_corrections(self):
         write_jsonl(
             self.projects / "proj1" / "sess.jsonl",

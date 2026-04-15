@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -110,7 +111,24 @@ def scan(
         # The ratio is computed in scoring.py for display.
         "user_messages": 0,
         "user_corrections": 0,
+        # Tokens billed by Claude — input + output + cache_creation + cache_read.
+        # Summed from message.usage on assistant events.
+        "tokens_total": 0,
+        "tokens_input": 0,
+        "tokens_output": 0,
+        "tokens_cache_read": 0,
+        "tokens_cache_creation": 0,
+        # Count of main (top-level) Claude Code sessions, as distinct from
+        # spawned subagent transcripts. Drives per-day rates and concurrency.
+        "main_sessions": 0,
+        # Max number of main Claude Code sessions whose timestamp windows
+        # overlap. Computed via sweep-line at the end of scan().
+        "max_concurrent_sessions": 0,
     }
+
+    # Main-session timestamp windows [(start_unix, end_unix), ...]. Local —
+    # folded into `max_concurrent_sessions` before returning and never emitted.
+    _main_session_intervals: list[tuple[float, float]] = []
 
     if not projects.is_dir():
         return results
@@ -124,7 +142,10 @@ def scan(
         # Scan both main sessions (flat *.jsonl at the project root) and
         # subagent transcripts (<session_uuid>/subagents/agent-*.jsonl).
         for jsonl_path in iter_transcript_files(project_dir, cutoff_ts):
-            process_session(jsonl_path, results, custom_skills_seen)
+            is_main = "subagents" not in jsonl_path.parts
+            interval = process_session(jsonl_path, results, custom_skills_seen, is_main)
+            if is_main and interval is not None:
+                _main_session_intervals.append(interval)
 
         # Agent type metadata lives in sibling .meta.json files.
         for meta_path in project_dir.rglob("agent-*.meta.json"):
@@ -143,7 +164,45 @@ def scan(
                 continue
 
     results["custom_skill_files_written"] = len(custom_skills_seen)
+    results["max_concurrent_sessions"] = _max_concurrent(_main_session_intervals)
     return results
+
+
+def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
+    """Sweep-line over (start, +1)/(end, -1); max running sum = concurrency.
+
+    Departures tie-break BEFORE arrivals at the same timestamp so that a
+    session ending at T and another starting at T are NOT counted as
+    concurrent (back-to-back use of a single Claude Code window).
+    """
+    if not intervals:
+        return 0
+
+    events: list[tuple[float, int]] = []
+    for start, end in intervals:
+        events.append((start, 1))
+        events.append((end, -1))
+    # Python tuple sort: (ts, -1) < (ts, 1) since -1 < 1, so departures first.
+    events.sort()
+
+    current = 0
+    peak = 0
+    for _, delta in events:
+        current += delta
+        if current > peak:
+            peak = current
+    return peak
+
+
+def _parse_timestamp(value) -> float | None:
+    """ISO-8601 (with or without trailing Z) → unix seconds. None on failure."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt.timestamp()
 
 
 def iter_transcript_files(project_dir: Path, cutoff_ts: float) -> Iterable[Path]:
@@ -160,15 +219,29 @@ def iter_transcript_files(project_dir: Path, cutoff_ts: float) -> Iterable[Path]
             yield subagent_path
 
 
-def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> None:
-    """Parse a single JSONL transcript file and update running counters."""
+def process_session(
+    path: Path,
+    results: dict,
+    custom_skills_seen: set[str],
+    is_main: bool = True,
+) -> tuple[float, float] | None:
+    """Parse a single JSONL transcript file and update running counters.
+
+    Returns the session's (start_ts, end_ts) in unix seconds when both
+    timestamps could be parsed, otherwise None. Caller aggregates intervals
+    from main sessions for concurrency detection.
+    """
     results["sessions"] += 1
+    if is_main:
+        results["main_sessions"] += 1
 
     session_used_tools = False
     session_used_orchestration = False
     session_used_context_leverage = False
     first_user_msg_captured = False
     session_message_count = 0
+    earliest_ts: float | None = None
+    latest_ts: float | None = None
     # Claude Code writes each parallel tool_use as its own JSONL event but
     # tags them with the same `requestId` (they all came from one model
     # turn). Accumulate Agent dispatches per requestId so we can detect
@@ -190,6 +263,27 @@ def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> 
                 results["messages"] += 1
                 session_message_count += 1
                 msg = event.get("message") or {}
+
+                ts = _parse_timestamp(event.get("timestamp"))
+                if ts is not None:
+                    if earliest_ts is None or ts < earliest_ts:
+                        earliest_ts = ts
+                    if latest_ts is None or ts > latest_ts:
+                        latest_ts = ts
+
+                # Token usage lives on assistant messages as `message.usage`.
+                if event.get("type") == "assistant":
+                    usage = msg.get("usage") or {}
+                    if isinstance(usage, dict):
+                        ti = int(usage.get("input_tokens") or 0)
+                        to = int(usage.get("output_tokens") or 0)
+                        tr = int(usage.get("cache_read_input_tokens") or 0)
+                        tc = int(usage.get("cache_creation_input_tokens") or 0)
+                        results["tokens_input"] += ti
+                        results["tokens_output"] += to
+                        results["tokens_cache_read"] += tr
+                        results["tokens_cache_creation"] += tc
+                        results["tokens_total"] += ti + to + tr + tc
 
                 if event.get("type") == "user":
                     text = content_to_text(msg.get("content"))
@@ -302,6 +396,18 @@ def process_session(path: Path, results: dict, custom_skills_seen: set[str]) -> 
         results["sessions_with_orchestration"] += 1
     if session_used_context_leverage:
         results["sessions_with_context_leverage"] += 1
+
+    # Only main (top-level) sessions contribute to concurrency detection.
+    # Subagents are spawned by a parent session and don't represent
+    # independent user activity.
+    if is_main and earliest_ts is not None and latest_ts is not None:
+        # Single-event sessions (start == end) have no duration and can't
+        # concurrently overlap with other sessions; treat them as 1s wide so
+        # they still contribute +1 briefly to the sweep-line.
+        if latest_ts == earliest_ts:
+            latest_ts = earliest_ts + 1.0
+        return (earliest_ts, latest_ts)
+    return None
 
 
 def extract_tool_uses(message: dict) -> Iterable[dict]:

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Submit a scored payload to MyAIScore's API.
+Submit raw scanner metrics to MyAIScore's API. The server computes the
+tier and score; the client only sends counts.
 
 Usage:
-  python3 submit_score.py --from score.json [--base-url https://myaiscore.com]
+  python3 submit_score.py --metrics metrics.json --role engineer \
+      [--base-url https://myaiscore.com]
 
-Reads JSON score payload from --from file, POSTs with Authorization: Bearer
-<token> (token read from ~/.config/myaiscore/config.json), prints the
-returned profile URL.
+`--metrics` is the output of `scan_transcripts.py` — raw counts and
+distributions. `--role` is the user-confirmed role (suggested by
+`infer_role.py`, confirmed or overridden by the user in the skill flow).
+
+Privacy: the client strips `first_messages_sample` from the metrics
+before transmission. The server never sees conversation content.
 """
 
 from __future__ import annotations
@@ -24,11 +29,26 @@ from pathlib import Path
 DEFAULT_BASE_URL = "https://myaiscore.com"
 CONFIG_PATH = Path.home() / ".config" / "myaiscore" / "config.json"
 
+VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
+
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--from", dest="src", required=True, help="Path to JSON score payload")
-    parser.add_argument("--base-url", default=os.environ.get("MYAISCORE_BASE_URL", DEFAULT_BASE_URL))
+    parser.add_argument(
+        "--metrics",
+        dest="metrics_path",
+        required=True,
+        help="Path to scan_transcripts.py output (raw scanner metrics)",
+    )
+    parser.add_argument(
+        "--role",
+        required=True,
+        choices=sorted(VALID_ROLES),
+        help="User-confirmed role (suggested by infer_role.py)",
+    )
+    parser.add_argument(
+        "--base-url", default=os.environ.get("MYAISCORE_BASE_URL", DEFAULT_BASE_URL)
+    )
     args = parser.parse_args(argv)
 
     token = load_token()
@@ -36,16 +56,10 @@ def main(argv: list[str]) -> int:
         print("✗ No API token found — run /myaiscore setup first.", file=sys.stderr)
         return 2
 
-    with open(args.src, "r") as fh:
-        payload = json.load(fh)
+    with open(args.metrics_path, "r") as fh:
+        metrics = json.load(fh)
 
-    # `stats` is a local-only summary (scanner counts, top-N lists) shown in
-    # the skill preview. Strip it before transmission so the privacy promise
-    # — "only the score + skill/MCP names cross the wire" — stays honest.
-    payload.pop("stats", None)
-
-    # Ensure computed_at is set (the server enforces it)
-    payload.setdefault("computed_at", iso_now())
+    payload = build_payload(metrics, args.role)
 
     try:
         response = submit(args.base_url.rstrip("/"), token, payload)
@@ -58,6 +72,50 @@ def main(argv: list[str]) -> int:
     print(json.dumps(response, indent=2))
     update_last_scan_at()
     return 0
+
+
+def build_payload(metrics: dict, role: str) -> dict:
+    """
+    Send only raw scanner counts plus the confirmed role + computed_at.
+    Strip anything text-based, derived, or pre-scored — the server runs
+    the scoring formula itself so users can't tamper with their tier.
+    """
+    # Allowlist of fields permitted in the transmitted payload. Keeps the
+    # wire format explicit; any scanner additions must be added here to be
+    # transmitted. Message text (first_messages_sample) and any derived
+    # display stats are intentionally omitted.
+    RAW_FIELDS = {
+        "window_days",
+        "sessions",
+        "main_sessions",
+        "max_concurrent_sessions",
+        "messages",
+        "max_messages_in_session",
+        "tool_calls",
+        "sessions_with_tools",
+        "sessions_with_orchestration",
+        "sessions_with_context_leverage",
+        "parallel_agent_turns",
+        "max_parallel_agents",
+        "custom_skill_files_written",
+        "custom_mcp_config_writes",
+        "user_messages",
+        "user_corrections",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cache_read",
+        "tokens_cache_creation",
+        "tokens_total",
+        "tool_name_counts",
+        "skill_counts",
+        "mcp_server_counts",
+        "agent_type_counts",
+    }
+
+    payload = {k: v for k, v in metrics.items() if k in RAW_FIELDS}
+    payload["inferred_role"] = role
+    payload["computed_at"] = iso_now()
+    return payload
 
 
 def submit(base_url: str, token: str, payload: dict) -> dict:
@@ -89,11 +147,11 @@ def handle_http_error(exc: urllib.error.HTTPError) -> int:
         return 4
 
     if exc.code == 422:
-        print(f"✗ Score payload was rejected (validation): {body}", file=sys.stderr)
+        print(f"✗ Metrics rejected (validation): {body}", file=sys.stderr)
         return 5
 
     if exc.code == 400:
-        print(f"✗ Score payload was rejected (anti-gaming check): {body}", file=sys.stderr)
+        print(f"✗ Metrics rejected (anomaly guard): {body}", file=sys.stderr)
         return 6
 
     print(f"✗ Server error {exc.code}: {body}", file=sys.stderr)
