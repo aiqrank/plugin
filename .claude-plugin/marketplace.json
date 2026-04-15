@@ -1,12 +1,12 @@
 {
-  "name": "myaiscore",
+  "name": "cyborgscore",
   "owner": {
-    "name": "MyAIScore",
-    "url": "https://myaiscore.com"
+    "name": "Cyborg Score",
+    "url": "https://cyborgscore.com"
   },
   "plugins": [
     {
-      "name": "myaiscore",
+      "name": "cyborgscore",
       "source": ".",
       "description": "Compute and share your AI proficiency score from your Claude Code transcripts.",
       "version": "0.1.0",

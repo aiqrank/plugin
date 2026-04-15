@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Submit raw scanner metrics to MyAIScore's API. The server computes the
+Submit raw scanner metrics to Cyborg Score's API. The server computes the
 tier and score; the client only sends counts.
 
 Usage:
   python3 submit_score.py --metrics metrics.json --role engineer \
-      [--base-url https://myaiscore.com]
+      [--base-url https://cyborgscore.com]
 
 `--metrics` is the output of `scan_transcripts.py` — raw counts and
 distributions. `--role` is the user-confirmed role (suggested by
@@ -26,8 +26,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_BASE_URL = "https://myaiscore.com"
-CONFIG_PATH = Path.home() / ".config" / "myaiscore" / "config.json"
+DEFAULT_BASE_URL = "https://cyborgscore.com"
+CONFIG_PATH = Path.home() / ".config" / "cyborgscore" / "config.json"
 
 VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
 
@@ -47,13 +47,13 @@ def main(argv: list[str]) -> int:
         help="User-confirmed role (suggested by infer_role.py)",
     )
     parser.add_argument(
-        "--base-url", default=os.environ.get("MYAISCORE_BASE_URL", DEFAULT_BASE_URL)
+        "--base-url", default=os.environ.get("CYBORGSCORE_BASE_URL", DEFAULT_BASE_URL)
     )
     args = parser.parse_args(argv)
 
     token = load_token()
     if not token:
-        print("✗ No API token found — run /myaiscore setup first.", file=sys.stderr)
+        print("✗ No API token found — run /cyborgscore setup first.", file=sys.stderr)
         return 2
 
     with open(args.metrics_path, "r") as fh:
@@ -143,7 +143,7 @@ def handle_http_error(exc: urllib.error.HTTPError) -> int:
 
     if exc.code == 401:
         print("✗ Your API token is invalid or expired.", file=sys.stderr)
-        print("  Regenerate one at myaiscore.com/users/settings.", file=sys.stderr)
+        print("  Regenerate one at cyborgscore.com/users/settings.", file=sys.stderr)
         return 4
 
     if exc.code == 422:

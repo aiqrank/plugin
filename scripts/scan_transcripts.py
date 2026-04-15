@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MyAIScore transcript scanner.
+Cyborg Score transcript scanner.
 
 Walks ~/.claude/projects/* and extracts activity metrics from Claude Code
 transcripts modified in the last 60 days. Outputs JSON to stdout.
@@ -39,9 +39,9 @@ CONTEXT_LEVERAGE_TOOLS = {
 }
 ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
-# The plugin writes metrics for myaiscore itself; exclude self-references from
+# The plugin writes metrics for cyborgscore itself; exclude self-references from
 # custom-skill-creation detection.
-MYAISCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/myaiscore/"
+CYBORGSCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/cyborgscore/"
 
 # Heuristic "correction" detection. A user message is counted as a correction
 # when its first ~120 chars contain one of these patterns — i.e. the user is
@@ -365,7 +365,7 @@ def process_session(
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
                             if (
                                 target_path.endswith("/SKILL.md")
-                                and MYAISCORE_SKILL_DIR_FRAGMENT not in target_path
+                                and CYBORGSCORE_SKILL_DIR_FRAGMENT not in target_path
                             ):
                                 custom_skills_seen.add(target_path)
 

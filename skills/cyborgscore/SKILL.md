@@ -1,10 +1,10 @@
 ---
-name: myaiscore
-description: Analyse your Claude Code transcripts to compute and share your AI proficiency score. Score is calculated locally; only metrics are sent to myaiscore.com (never your conversations or code).
+name: cyborgscore
+description: Analyse your Claude Code transcripts to compute and share your AI proficiency score. Score is calculated locally; only metrics are sent to cyborgscore.com (never your conversations or code).
 allowed-tools: [Bash, Read, Write, AskUserQuestion]
 ---
 
-# MyAIScore
+# Cyborg Score
 
 Find out your AI tier. Score is based on how you actually use Claude Code:
 tool diversity, agent orchestration, skills & MCPs, custom skill creation,
@@ -12,7 +12,7 @@ context leverage (memory, schedules, tasks), and conversation depth.
 
 ## First time using this?
 
-1. Run `/myaiscore` — it will open `myaiscore.com/pair?session=...` in your browser
+1. Run `/cyborgscore` — it will open `cyborgscore.com/pair?session=...` in your browser
 2. Sign in with Google or an email code
 3. Your Claude Code plugin will automatically receive its API token
 
@@ -22,7 +22,7 @@ No passwords. Your transcripts stay on your machine.
 
 ### Regular flow (paired already)
 
-Run `/myaiscore`. The plugin will:
+Run `/cyborgscore`. The plugin will:
 
 1. Scan your Claude Code transcripts from the last 60 days.
 2. Infer a role suggestion (engineer / product / gtm / research / devops / ...) **locally** from the first user message of each session.
@@ -36,21 +36,21 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 ### Sub-commands
 
-- `/myaiscore` — full flow (scan + score + confirm + submit)
-- `/myaiscore setup <TOKEN>` — save your API token (if you got it from settings rather than via device pairing)
-- `/myaiscore pair` — force re-pair (if your token was lost or revoked)
+- `/cyborgscore` — full flow (scan + score + confirm + submit)
+- `/cyborgscore setup <TOKEN>` — save your API token (if you got it from settings rather than via device pairing)
+- `/cyborgscore pair` — force re-pair (if your token was lost or revoked)
 
-## What happens when you run /myaiscore
+## What happens when you run /cyborgscore
 
-1. **Check for token** — look in `~/.config/myaiscore/config.json`. If missing,
+1. **Check for token** — look in `~/.config/cyborgscore/config.json`. If missing,
    start the pairing flow (`python3 {{PLUGIN_ROOT}}/scripts/pair_device.py`).
 
 2. **Scan transcripts locally** —
-   `python3 {{PLUGIN_ROOT}}/scripts/scan_transcripts.py --days 60 > /tmp/myaiscore_metrics.json`.
+   `python3 {{PLUGIN_ROOT}}/scripts/scan_transcripts.py --days 60 > /tmp/cyborgscore_metrics.json`.
    NOTHING is transmitted yet.
 
 3. **Infer role locally** —
-   `python3 {{PLUGIN_ROOT}}/scripts/infer_role.py --from /tmp/myaiscore_metrics.json > /tmp/myaiscore_role.json`.
+   `python3 {{PLUGIN_ROOT}}/scripts/infer_role.py --from /tmp/cyborgscore_metrics.json > /tmp/cyborgscore_role.json`.
    This only classifies a role from the first user message of each
    session. It does NOT compute any tier or score.
 
@@ -64,8 +64,8 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
    and let them accept or pick a different one from:
    engineer / product / gtm / research / devops / ops / design / other.
 
-6. **Ask the user: transmit to myaiscore.com?**
-   - If yes: `python3 {{PLUGIN_ROOT}}/scripts/submit_score.py --metrics /tmp/myaiscore_metrics.json --role <confirmed-role>`
+6. **Ask the user: transmit to cyborgscore.com?**
+   - If yes: `python3 {{PLUGIN_ROOT}}/scripts/submit_score.py --metrics /tmp/cyborgscore_metrics.json --role <confirmed-role>`
      The client strips `first_messages_sample` before POSTing; the server
      computes the tier/score/dimensions from the raw counts and returns
      them in the response.
@@ -111,13 +111,13 @@ with their rank before transmit). Fields sent:
 
 All computation happens on your machine. The server only ever receives the
 metric summary above. See
-[myaiscore.com/privacy](https://myaiscore.com/privacy) for details.
+[cyborgscore.com/privacy](https://cyborgscore.com/privacy) for details.
 
 ## Stale-score reminders (optional)
 
 This plugin installs a `SessionStart` hook that reminds you to re-run
-`/myaiscore` if your score is over 30 days old. It does NOT scan or submit
+`/cyborgscore` if your score is over 30 days old. It does NOT scan or submit
 automatically — it just prints a single line.
 
 To turn it off, add `"HOOK_DISABLED": "true"` to
-`~/.config/myaiscore/config.json`.
+`~/.config/cyborgscore/config.json`.

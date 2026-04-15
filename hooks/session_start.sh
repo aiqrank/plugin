@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# MyAIScore SessionStart hook.
+# Cyborg Score SessionStart hook.
 #
-# Reminds the user to re-run `/myaiscore` when their score is stale (> 30
+# Reminds the user to re-run `/cyborgscore` when their score is stale (> 30
 # days). Exits silently if:
 #   - the user hasn't paired yet (no config)
 #   - they've scanned recently
@@ -12,7 +12,7 @@
 
 set -u
 
-CONFIG_PATH="${HOME}/.config/myaiscore/config.json"
+CONFIG_PATH="${HOME}/.config/cyborgscore/config.json"
 STALE_AFTER_DAYS=30
 
 # No config → user hasn't set up yet, stay silent
@@ -68,5 +68,5 @@ if [ "$AGE_DAYS" -lt "$STALE_AFTER_DAYS" ]; then
 fi
 
 # Stale — print single-line reminder to stderr (visible in Claude Code status)
-echo "💡 Your MyAIScore is ${AGE_DAYS} days old. Run /myaiscore to update your tier." >&2
+echo "💡 Your Cyborg Score is ${AGE_DAYS} days old. Run /cyborgscore to update your tier." >&2
 exit 0

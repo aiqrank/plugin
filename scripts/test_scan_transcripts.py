@@ -171,7 +171,7 @@ class ScanTranscriptsTests(unittest.TestCase):
                 make_tool_call(
                     "Write",
                     {
-                        "file_path": "/Users/me/.claude/skills/myaiscore/SKILL.md",
+                        "file_path": "/Users/me/.claude/skills/cyborgscore/SKILL.md",
                         "content": "self - should be excluded",
                     },
                 ),
