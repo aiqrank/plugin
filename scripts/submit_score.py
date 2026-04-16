@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_BASE_URL = "https://cyborgscore.com"
+DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://cyborgscore.com before release
 CONFIG_PATH = Path.home() / ".config" / "cyborgscore" / "config.json"
 
 VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
