@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_BASE_URL = "https://cyborgscore.com"
+DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://cyborgscore.com before release
 POLL_INTERVAL_SECONDS = 2
 MAX_POLL_SECONDS = 10 * 60
 
@@ -34,8 +34,11 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 def main(argv: list[str]) -> int:
     base_url = os.environ.get("CYBORGSCORE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 
+    metrics_path = parse_metrics_arg(argv)
+    metrics = load_metrics(metrics_path) if metrics_path else None
+
     try:
-        session = create_pair_session(base_url)
+        session = create_pair_session(base_url, metrics)
     except urllib.error.URLError as exc:
         print(f"✗ Couldn't reach {base_url}: {exc}", file=sys.stderr)
         return 1
@@ -61,15 +64,42 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def create_pair_session(base_url: str) -> dict:
+def create_pair_session(base_url: str, metrics: dict | None = None) -> dict:
+    body = {"metrics": metrics} if metrics is not None else {}
     req = urllib.request.Request(
         base_url + "/api/pair/create",
-        data=b"{}",
+        data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
+
+
+def parse_metrics_arg(argv: list[str]) -> str | None:
+    """Minimal --metrics <path> parser; avoids pulling in argparse."""
+    for i, arg in enumerate(argv):
+        if arg == "--metrics" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--metrics="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def load_metrics(path: str) -> dict | None:
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠ Could not read metrics from {path}: {exc} — continuing without preview.", file=sys.stderr)
+        return None
+
+    # The server caps the payload at 256KB. Strip the first_messages_sample
+    # buffer (used only locally for role inference) and any other non-count
+    # fields before sending, for privacy AND to stay under the cap.
+    if isinstance(data, dict):
+        data.pop("first_messages_sample", None)
+    return data
 
 
 def open_in_browser(url: str) -> None:

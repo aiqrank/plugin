@@ -42,15 +42,30 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 ## What happens when you run /cyborgscore
 
-1. **Check for token** — look in `~/.config/cyborgscore/config.json`. If missing,
-   start the pairing flow (`python3 {{PLUGIN_ROOT}}/scripts/pair_device.py`).
+> **Running the helper scripts**: every `python3` command below uses the
+> shell env var `$CLAUDE_PLUGIN_ROOT`, which Claude Code sets to this
+> plugin's install directory for commands spawned from this skill. Run
+> the commands *exactly as written* — do NOT substitute `$CLAUDE_PLUGIN_ROOT`
+> yourself or derive a path from this SKILL.md's location; the shell will
+> expand the variable at execution time. If the env var is unset, the
+> plugin is at `~/.claude/plugins/cache/cyborgscore/cyborgscore/<version>/`
+> — but this is only a fallback; the env var is the canonical path.
 
-2. **Scan transcripts locally** —
-   `python3 {{PLUGIN_ROOT}}/scripts/scan_transcripts.py --days 60 > /tmp/cyborgscore_metrics.json`.
-   NOTHING is transmitted yet.
+1. **Scan transcripts locally** —
+   `python3 "$CLAUDE_PLUGIN_ROOT/scripts/scan_transcripts.py" --days 60 > /tmp/cyborgscore_metrics.json`.
+   NOTHING is transmitted yet. We do this first so an unauthenticated
+   teaser page can show raw counts during the pairing flow.
+
+2. **Check for token** — look in `~/.config/cyborgscore/config.json`. If missing,
+   start the pairing flow and pass the freshly-scanned metrics so the teaser
+   page can display them:
+   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pair_device.py --metrics /tmp/cyborgscore_metrics.json`.
+   The plugin POSTs the raw counts to the server, which stashes them on the
+   pair session and returns a teaser URL. The teaser shows the counts with a
+   `?` tier — the user signs in to unlock the real tier, score, and profile.
 
 3. **Infer role locally** —
-   `python3 {{PLUGIN_ROOT}}/scripts/infer_role.py --from /tmp/cyborgscore_metrics.json > /tmp/cyborgscore_role.json`.
+   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/infer_role.py --from /tmp/cyborgscore_metrics.json > /tmp/cyborgscore_role.json`.
    This only classifies a role from the first user message of each
    session. It does NOT compute any tier or score.
 
@@ -65,7 +80,7 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
    engineer / product / gtm / research / devops / ops / design / other.
 
 6. **Ask the user: transmit to cyborgscore.com?**
-   - If yes: `python3 {{PLUGIN_ROOT}}/scripts/submit_score.py --metrics /tmp/cyborgscore_metrics.json --role <confirmed-role>`
+   - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/cyborgscore_metrics.json --role <confirmed-role>`
      The client strips `first_messages_sample` before POSTing; the server
      computes the tier/score/dimensions from the raw counts and returns
      them in the response.
