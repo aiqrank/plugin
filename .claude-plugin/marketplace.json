@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "cyborgscore",
-      "source": ".",
+      "source": "./",
       "description": "Compute and share your AI proficiency score from your Claude Code transcripts.",
       "version": "0.1.0",
       "category": "productivity",

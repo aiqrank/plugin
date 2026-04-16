@@ -5,5 +5,5 @@
   "homepage": "https://cyborgscore.com",
   "repository": "https://github.com/cyborgscore/plugin",
   "license": "MIT",
-  "author": "Cyborg Score"
+  "author": { "name": "Cyborg Score", "url": "https://cyborgscore.com" }
 }
