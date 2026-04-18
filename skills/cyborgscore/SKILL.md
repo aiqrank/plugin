@@ -24,7 +24,7 @@ No passwords. Your transcripts stay on your machine.
 
 Run `/cyborgscore`. The plugin will:
 
-1. Scan your Claude Code transcripts from the last 60 days.
+1. Scan your Claude Code transcripts from the last 30 days, bucketed by day.
 2. Infer a role suggestion (engineer / product / gtm / research / devops / ...) **locally** from the first user message of each session.
 3. Ask you to confirm or override the suggested role.
 4. Show you exactly the raw counts that will be sent to the server.
@@ -52,8 +52,9 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 > — but this is only a fallback; the env var is the canonical path.
 
 1. **Scan transcripts locally** —
-   `python3 "$CLAUDE_PLUGIN_ROOT/scripts/scan_transcripts.py" --days 60 > /tmp/cyborgscore_metrics.json`.
-   NOTHING is transmitted yet. We do this first so an unauthenticated
+   `python3 "$CLAUDE_PLUGIN_ROOT/scripts/scan_transcripts.py" --days 30 > /tmp/cyborgscore_metrics.json`.
+   NOTHING is transmitted yet. The scanner emits a per-day `daily` array
+   plus a 30-day `rollup` summary; we do this first so an unauthenticated
    teaser page can show raw counts during the pairing flow.
 
 2. **Check for token** — look in `~/.config/cyborgscore/config.json`. If missing,
@@ -81,9 +82,11 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 6. **Ask the user: transmit to cyborgscore.com?**
    - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/cyborgscore_metrics.json --role <confirmed-role>`
-     The client strips `first_messages_sample` before POSTing; the server
-     computes the tier/score/dimensions from the raw counts and returns
-     them in the response.
+     The client first fetches `GET /api/metrics/latest_date` so it only
+     uploads days the server doesn't already have (subsequent runs are
+     near-instant — just today's new data). `first_messages_sample` is
+     stripped before POSTing; the server stores the daily records, rolls
+     them up over 30 days, and returns the computed tier/score/dimensions.
    - If no: show the raw counts locally and exit.
 
 7. **On success**, the response contains the server-computed tier,
@@ -93,9 +96,10 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 ## What gets transmitted
 
-The client sends raw, aggregated counts from the scanner so the server
-can compute the tier/score itself (this prevents clients from tampering
-with their rank before transmit). Fields sent:
+The client sends per-day records (one entry per calendar day that had
+activity, only for days the server doesn't already have) so the server
+can compute the tier/score itself and retain usage history for trending
+graphs. Each day's entry contains:
 
 - Session / message / tool-call counts and per-day totals
 - Token totals (input, output, cache read, cache creation)

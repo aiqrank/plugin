@@ -16,17 +16,22 @@ Then run `/cyborgscore` to get started.
 
 1. You run `/cyborgscore`. The plugin opens a browser tab to `cyborgscore.com/pair?session=...`.
 2. You sign in with Google or an 8-digit email code.
-3. The plugin scans your Claude Code transcripts from the last 60 days and
-   computes your tier, role, and activity breakdown — all locally.
+3. The plugin scans your Claude Code transcripts from the last 30 days,
+   bucketing activity by calendar day.
 4. You see exactly what data will be transmitted, and confirm before
    anything leaves your machine.
-5. Your profile appears at `cyborgscore.com/@username`.
+5. The server stores per-day records and computes your tier/score from
+   the 30-day rollup. Subsequent runs only upload days the server
+   doesn't yet have.
+6. Your profile appears at `cyborgscore.com/@username` — with a 30-day
+   activity sparkline.
 
 ## Privacy
 
-Scores are computed on your device. The server only ever receives the
-metric summary (scores, percentages, skill/MCP names with usage counts) —
-never conversation content, code, prompts, or file contents.
+Scores are computed on the server from per-day metric counts the plugin
+sends. The server only ever receives the per-day metric summary (tool /
+skill / MCP / agent names with counts) — never conversation content,
+code, prompts, or file contents.
 
 ## License
 
