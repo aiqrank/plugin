@@ -14,7 +14,9 @@ from submit_score import build_payload, filter_after_cursor  # noqa: E402
 
 
 class FilterAfterCursorTests(unittest.TestCase):
-    def test_filters_to_strictly_after_cursor(self):
+    def test_filters_to_on_or_after_cursor(self):
+        # `>=` semantics: entries on the cursor day are KEPT so a same-day
+        # re-run can replace the partial day's data on the server.
         daily = [
             {"date": "2026-04-15", "metrics": {"sessions": 1}},
             {"date": "2026-04-16", "metrics": {"sessions": 2}},
@@ -22,8 +24,8 @@ class FilterAfterCursorTests(unittest.TestCase):
         ]
 
         out = filter_after_cursor(daily, date(2026, 4, 16))
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["date"], "2026-04-17")
+        kept_dates = [entry["date"] for entry in out]
+        self.assertEqual(kept_dates, ["2026-04-16", "2026-04-17"])
 
     def test_none_cursor_falls_back_to_today_minus_30(self):
         # All entries within last 30 days are kept; older ones are dropped.
@@ -40,14 +42,21 @@ class FilterAfterCursorTests(unittest.TestCase):
         kept_dates = {entry["date"] for entry in out}
         self.assertNotIn((today - timedelta(days=40)).isoformat(), kept_dates)
 
-    def test_all_entries_at_or_before_cursor_returns_empty(self):
+    def test_all_entries_strictly_before_cursor_returns_empty(self):
         daily = [
             {"date": "2026-04-15", "metrics": {}},
             {"date": "2026-04-16", "metrics": {}},
         ]
 
-        self.assertEqual(filter_after_cursor(daily, date(2026, 4, 16)), [])
         self.assertEqual(filter_after_cursor(daily, date(2026, 4, 17)), [])
+        self.assertEqual(filter_after_cursor(daily, date(2030, 1, 1)), [])
+
+    def test_same_day_cursor_keeps_today_for_replacement(self):
+        # The bug we're guarding against: server says latest_date=today,
+        # plugin runs again, today's fresher data must still upload.
+        daily = [{"date": "2026-04-17", "metrics": {"sessions": 5}}]
+        out = filter_after_cursor(daily, date(2026, 4, 17))
+        self.assertEqual(len(out), 1)
 
     def test_skips_entries_with_missing_or_malformed_date(self):
         daily = [

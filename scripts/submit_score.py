@@ -153,10 +153,17 @@ def fetch_latest_date(base_url: str, token: str) -> date | None:
 
 
 def filter_after_cursor(daily: list, cursor: date | None) -> list:
-    """Keep entries whose date > cursor. If cursor is None, default the
-    cursor to today − 30 so a brand-new user backfills 30 days."""
+    """Keep entries whose date is on or after the cursor.
+
+    `>=` (not `>`) so that re-running the plugin later the same day
+    re-uploads today's fresher numbers — the server's upsert is replace,
+    so last write wins. With strict `>`, a same-day re-run would never
+    update today's row.
+
+    If cursor is None, default to today − 30 so a brand-new user
+    backfills 30 days."""
     if cursor is None:
-        cursor = date.today() - timedelta(days=DEFAULT_BACKFILL_DAYS)
+        cursor = date.today() - timedelta(days=DEFAULT_BACKFILL_DAYS - 1)
 
     out = []
     for entry in daily:
@@ -169,7 +176,7 @@ def filter_after_cursor(daily: list, cursor: date | None) -> list:
             entry_date = date.fromisoformat(date_str)
         except ValueError:
             continue
-        if entry_date > cursor:
+        if entry_date >= cursor:
             out.append(entry)
     return out
 
