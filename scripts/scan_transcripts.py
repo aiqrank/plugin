@@ -3,10 +3,26 @@
 Cyborg Score transcript scanner.
 
 Walks ~/.claude/projects/* and extracts activity metrics from Claude Code
-transcripts modified in the last 60 days. Outputs JSON to stdout.
+transcripts modified in the last 30 days. Buckets every event by its
+local-calendar-day timestamp, emits a `daily` array (one entry per day
+that had activity) plus a `rollup` aggregate over the full window.
 
-Emits metrics only — no conversation content, no code, no prompts. The user
-confirms the preview in the skill before transmission to the server.
+Output JSON:
+
+    {
+      "window_days": 30,
+      "daily": [
+        {"date": "YYYY-MM-DD", "metrics": { ...fields... }},
+        ...
+      ],
+      "rollup": { ...same fields, summed/maxed/merged across days... },
+      "first_messages_sample": [...]   # local-only, for role inference
+    }
+
+The plugin sends only `daily` (filtered by latest_date cursor) plus role
+metadata to the server. The `first_messages_sample` never leaves the
+machine. The rollup is included so the unauthenticated pair/teaser flow
+can show preview totals without re-aggregating server-side.
 
 Python stdlib only (no third-party dependencies).
 """
@@ -18,14 +34,14 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
 
 # -- Constants --
 
-DEFAULT_WINDOW_DAYS = 60
+DEFAULT_WINDOW_DAYS = 30
 CONTEXT_LEVERAGE_TOOLS = {
     "TaskCreate",
     "TaskUpdate",
@@ -40,27 +56,21 @@ CONTEXT_LEVERAGE_TOOLS = {
 ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
 PLAN_MODE_TOOL = "ExitPlanMode"
-# The plugin writes metrics for cyborgscore itself; exclude self-references from
-# custom-skill-creation detection.
 CYBORGSCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/cyborgscore/"
 
-# Heuristic "correction" detection. A user message is counted as a correction
-# when its first ~120 chars contain one of these patterns — i.e. the user is
-# pushing back on, negating, or redirecting Claude's prior turn. Only counts
-# occurrences; no text is stored or transmitted.
 _CORRECTION_RE = re.compile(
     r"""
-    (?:^|[\s.,!?;:-])          # word boundary
+    (?:^|[\s.,!?;:-])
     (?:
-        no[,!.\s]              | # "no," / "no!" / "no " (bare 'no')
-        don'?t\b                | # don't
+        no[,!.\s]              |
+        don'?t\b                |
         stop\b                  |
-        wait[,!.\s]             | # "wait," at start of message
+        wait[,!.\s]             |
         undo\b                  |
         revert\b                |
         incorrect\b             |
         wrong\b                 |
-        actually[,!.\s]         | # "actually," redirect
+        actually[,!.\s]         |
         try\s+again\b           |
         you\s+(?:missed|forgot|broke)\b |
         that'?s\s+not\s+(?:right|correct|what\s+i) |
@@ -71,7 +81,60 @@ _CORRECTION_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-_CORRECTION_SCAN_PREFIX = 120  # only scan first N chars for speed/signal
+_CORRECTION_SCAN_PREFIX = 120
+
+# Field aggregation rules — must match CyborgScore.Metrics module attributes.
+_COUNT_FIELDS = (
+    "sessions",
+    "main_sessions",
+    "messages",
+    "tool_calls",
+    "sessions_with_tools",
+    "sessions_with_orchestration",
+    "sessions_with_context_leverage",
+    "sessions_with_plan_mode",
+    "parallel_agent_turns",
+    "custom_skill_files_written",
+    "custom_mcp_config_writes",
+    "claude_md_writes",
+    "user_messages",
+    "user_corrections",
+    "plan_mode_invocations",
+    "tokens_input",
+    "tokens_output",
+    "tokens_cache_read",
+    "tokens_cache_creation",
+    "tokens_total",
+)
+
+_PEAK_FIELDS = (
+    "max_concurrent_sessions",
+    "max_messages_in_session",
+    "max_parallel_agents",
+)
+
+_DICT_FIELDS = (
+    "tool_name_counts",
+    "skill_counts",
+    "mcp_server_counts",
+    "agent_type_counts",
+)
+
+
+def _new_day_metrics() -> dict:
+    """Empty metrics dict for one calendar day."""
+    out: dict = {f: 0 for f in _COUNT_FIELDS}
+    for f in _PEAK_FIELDS:
+        out[f] = 0
+    for f in _DICT_FIELDS:
+        out[f] = {}
+    return out
+
+
+def _bucket(daily: dict[date, dict], d: date) -> dict:
+    if d not in daily:
+        daily[d] = _new_day_metrics()
+    return daily[d]
 
 
 def scan(
@@ -79,106 +142,104 @@ def scan(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now_ts: float | None = None,
 ) -> dict:
-    """Scan ~/.claude for transcript data within the last `window_days`."""
+    """Scan ~/.claude for transcript data within the last `window_days`.
+
+    Returns `{window_days, daily, rollup, first_messages_sample}` where
+    `daily` is a date-sorted list of per-day metrics blobs.
+    """
     home = claude_dir or Path.home() / ".claude"
     projects = home / "projects"
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
 
-    results = {
+    daily: dict[date, dict] = {}
+    first_messages_sample: list[str] = []
+    custom_skills_seen: set[str] = set()
+    # Per-day list of main-session intervals for sweep-line concurrency.
+    intervals_by_day: dict[date, list[tuple[float, float]]] = {}
+
+    if projects.is_dir():
+        for project_dir in sorted(projects.iterdir()):
+            if not project_dir.is_dir():
+                continue
+
+            for jsonl_path in iter_transcript_files(project_dir, cutoff_ts):
+                is_main = "subagents" not in jsonl_path.parts
+                process_session(
+                    jsonl_path,
+                    daily,
+                    first_messages_sample,
+                    custom_skills_seen,
+                    intervals_by_day,
+                    is_main,
+                )
+
+            for meta_path in project_dir.rglob("agent-*.meta.json"):
+                if meta_path.stat().st_mtime < cutoff_ts:
+                    continue
+                meta_date = datetime.fromtimestamp(meta_path.stat().st_mtime).date()
+                bucket = _bucket(daily, meta_date)
+                try:
+                    with meta_path.open("r") as fh:
+                        data = json.load(fh)
+                    agent_type = data.get("agentType")
+                    if agent_type:
+                        bucket["agent_type_counts"][agent_type] = (
+                            bucket["agent_type_counts"].get(agent_type, 0) + 1
+                        )
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+    # Per-day concurrency from sweep-line over each day's clipped intervals.
+    for d, intervals in intervals_by_day.items():
+        bucket = _bucket(daily, d)
+        bucket["max_concurrent_sessions"] = _max_concurrent(intervals)
+
+    # Drop any days that recorded zero activity (a meta-only day with no
+    # parseable agentType, for example).
+    daily = {d: m for d, m in daily.items() if _has_activity(m)}
+
+    daily_list = [
+        {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
+    ]
+
+    rollup = _rollup_from_daily(daily.values())
+
+    return {
         "window_days": window_days,
-        "sessions": 0,
-        "messages": 0,
-        "tool_calls": 0,
-        "sessions_with_tools": 0,
-        "sessions_with_orchestration": 0,
-        "sessions_with_context_leverage": 0,
-        "sessions_with_plan_mode": 0,
-        "plan_mode_invocations": 0,
-        "tool_name_counts": {},
-        "skill_counts": {},
-        "mcp_server_counts": {},
-        "agent_type_counts": {},
-        "custom_skill_files_written": 0,
-        "custom_mcp_config_writes": 0,
-        "claude_md_writes": 0,
-        "first_messages_sample": [],
-        # Peak count of Agent tool_uses dispatched in a single assistant turn
-        # (parallel sub-agent orchestration). >=2 means genuine parallelism.
-        "max_parallel_agents": 0,
-        # Count of assistant turns that dispatched >=2 Agents simultaneously.
-        "parallel_agent_turns": 0,
-        # Deepest single session (by message count) — a proxy for sustained
-        # sessions vs short one-shots.
-        "max_messages_in_session": 0,
-        # User turns total and user turns matching a correction pattern.
-        # The ratio is computed in scoring.py for display.
-        "user_messages": 0,
-        "user_corrections": 0,
-        # Tokens billed by Claude — input + output + cache_creation + cache_read.
-        # Summed from message.usage on assistant events.
-        "tokens_total": 0,
-        "tokens_input": 0,
-        "tokens_output": 0,
-        "tokens_cache_read": 0,
-        "tokens_cache_creation": 0,
-        # Count of main (top-level) Claude Code sessions, as distinct from
-        # spawned subagent transcripts. Drives per-day rates and concurrency.
-        "main_sessions": 0,
-        # Max number of main Claude Code sessions whose timestamp windows
-        # overlap. Computed via sweep-line at the end of scan().
-        "max_concurrent_sessions": 0,
+        "daily": daily_list,
+        "rollup": rollup,
+        "first_messages_sample": first_messages_sample,
     }
 
-    # Main-session timestamp windows [(start_unix, end_unix), ...]. Local —
-    # folded into `max_concurrent_sessions` before returning and never emitted.
-    _main_session_intervals: list[tuple[float, float]] = []
 
-    if not projects.is_dir():
-        return results
+def _has_activity(metrics: dict) -> bool:
+    """True if the day saw any countable activity."""
+    if any(metrics.get(f, 0) for f in _COUNT_FIELDS):
+        return True
+    if any(metrics.get(f, 0) for f in _PEAK_FIELDS):
+        return True
+    if any(metrics.get(f) for f in _DICT_FIELDS):
+        return True
+    return False
 
-    custom_skills_seen: set[str] = set()
 
-    for project_dir in sorted(projects.iterdir()):
-        if not project_dir.is_dir():
-            continue
-
-        # Scan both main sessions (flat *.jsonl at the project root) and
-        # subagent transcripts (<session_uuid>/subagents/agent-*.jsonl).
-        for jsonl_path in iter_transcript_files(project_dir, cutoff_ts):
-            is_main = "subagents" not in jsonl_path.parts
-            interval = process_session(jsonl_path, results, custom_skills_seen, is_main)
-            if is_main and interval is not None:
-                _main_session_intervals.append(interval)
-
-        # Agent type metadata lives in sibling .meta.json files.
-        for meta_path in project_dir.rglob("agent-*.meta.json"):
-            if meta_path.stat().st_mtime < cutoff_ts:
-                continue
-
-            try:
-                with meta_path.open("r") as fh:
-                    data = json.load(fh)
-                agent_type = data.get("agentType")
-                if agent_type:
-                    results["agent_type_counts"][agent_type] = (
-                        results["agent_type_counts"].get(agent_type, 0) + 1
-                    )
-            except (json.JSONDecodeError, OSError):
-                continue
-
-    results["custom_skill_files_written"] = len(custom_skills_seen)
-    results["max_concurrent_sessions"] = _max_concurrent(_main_session_intervals)
-    return results
+def _rollup_from_daily(per_day_metrics) -> dict:
+    """Aggregate a sequence of daily metrics maps into a single rollup."""
+    out = _new_day_metrics()
+    for m in per_day_metrics:
+        for f in _COUNT_FIELDS:
+            out[f] = out.get(f, 0) + int(m.get(f, 0) or 0)
+        for f in _PEAK_FIELDS:
+            out[f] = max(out.get(f, 0), int(m.get(f, 0) or 0))
+        for f in _DICT_FIELDS:
+            for k, v in (m.get(f) or {}).items():
+                out[f][k] = out[f].get(k, 0) + int(v or 0)
+    return out
 
 
 def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
-    """Sweep-line over (start, +1)/(end, -1); max running sum = concurrency.
-
-    Departures tie-break BEFORE arrivals at the same timestamp so that a
-    session ending at T and another starting at T are NOT counted as
-    concurrent (back-to-back use of a single Claude Code window).
-    """
+    """Sweep-line over (start, +1)/(end, -1); max running sum = concurrency."""
     if not intervals:
         return 0
 
@@ -186,7 +247,6 @@ def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
     for start, end in intervals:
         events.append((start, 1))
         events.append((end, -1))
-    # Python tuple sort: (ts, -1) < (ts, 1) since -1 < 1, so departures first.
     events.sort()
 
     current = 0
@@ -199,7 +259,6 @@ def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
 
 
 def _parse_timestamp(value) -> float | None:
-    """ISO-8601 (with or without trailing Z) → unix seconds. None on failure."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -209,15 +268,19 @@ def _parse_timestamp(value) -> float | None:
     return dt.timestamp()
 
 
+def _ts_to_date(ts: float | None) -> date | None:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts).date()
+
+
 def iter_transcript_files(project_dir: Path, cutoff_ts: float) -> Iterable[Path]:
     """Yields JSONL transcript file paths within the cutoff."""
-    # Main session transcripts (flat files at project root)
     for entry in project_dir.iterdir():
         if entry.is_file() and entry.suffix == ".jsonl":
             if entry.stat().st_mtime >= cutoff_ts:
                 yield entry
 
-    # Subagent transcripts (nested under {session_uuid}/subagents/)
     for subagent_path in project_dir.rglob("subagents/agent-*.jsonl"):
         if subagent_path.stat().st_mtime >= cutoff_ts:
             yield subagent_path
@@ -225,33 +288,43 @@ def iter_transcript_files(project_dir: Path, cutoff_ts: float) -> Iterable[Path]
 
 def process_session(
     path: Path,
-    results: dict,
+    daily: dict[date, dict],
+    first_messages_sample: list,
     custom_skills_seen: set[str],
+    intervals_by_day: dict[date, list[tuple[float, float]]],
     is_main: bool = True,
-) -> tuple[float, float] | None:
-    """Parse a single JSONL transcript file and update running counters.
+) -> None:
+    """Parse a single JSONL transcript and update per-day buckets.
 
-    Returns the session's (start_ts, end_ts) in unix seconds when both
-    timestamps could be parsed, otherwise None. Caller aggregates intervals
-    from main sessions for concurrency detection.
+    All counts are bucketed by each event's own timestamp date, so a session
+    that crosses midnight contributes to two days. Session-level booleans
+    (sessions, sessions_with_tools, ...) count once per (session, day).
     """
-    results["sessions"] += 1
-    if is_main:
-        results["main_sessions"] += 1
-
-    session_used_tools = False
-    session_used_orchestration = False
-    session_used_context_leverage = False
-    session_used_plan_mode = False
+    # Per-session-per-day: which days saw which kinds of activity.
+    days_seen: set[date] = set()
+    days_with_tools: set[date] = set()
+    days_with_orchestration: set[date] = set()
+    days_with_context_leverage: set[date] = set()
+    days_with_plan_mode: set[date] = set()
+    # Per-day message counts within this session — used to update daily
+    # max_messages_in_session at the end.
+    msgs_per_day: dict[date, int] = {}
+    # Per-day timestamp interval [(start, end)] for this session, for the
+    # daily concurrency sweep.
+    earliest_per_day: dict[date, float] = {}
+    latest_per_day: dict[date, float] = {}
+    # Agents grouped by (date, requestId) — same model turn shows up as one
+    # bucket per day (a single turn is virtually always within one day).
+    agents_by_request_day: dict[tuple[date, str], int] = {}
     first_user_msg_captured = False
-    session_message_count = 0
-    earliest_ts: float | None = None
-    latest_ts: float | None = None
-    # Claude Code writes each parallel tool_use as its own JSONL event but
-    # tags them with the same `requestId` (they all came from one model
-    # turn). Accumulate Agent dispatches per requestId so we can detect
-    # parallel fan-out at session end.
-    agents_by_request: dict[str, int] = {}
+
+    # Fallback bucket date when an event lacks a parseable timestamp:
+    # the file's mtime date. Real transcripts always include timestamps,
+    # but legacy or partial events shouldn't be silently dropped.
+    try:
+        fallback_date = datetime.fromtimestamp(path.stat().st_mtime).date()
+    except OSError:
+        return
 
     try:
         with path.open("r") as fh:
@@ -265,18 +338,21 @@ def process_session(
                 except json.JSONDecodeError:
                     continue
 
-                results["messages"] += 1
-                session_message_count += 1
                 msg = event.get("message") or {}
-
                 ts = _parse_timestamp(event.get("timestamp"))
-                if ts is not None:
-                    if earliest_ts is None or ts < earliest_ts:
-                        earliest_ts = ts
-                    if latest_ts is None or ts > latest_ts:
-                        latest_ts = ts
+                d = _ts_to_date(ts) or fallback_date
 
-                # Token usage lives on assistant messages as `message.usage`.
+                bucket = _bucket(daily, d)
+                bucket["messages"] += 1
+                msgs_per_day[d] = msgs_per_day.get(d, 0) + 1
+                days_seen.add(d)
+
+                if ts is not None:
+                    if d not in earliest_per_day or ts < earliest_per_day[d]:
+                        earliest_per_day[d] = ts
+                    if d not in latest_per_day or ts > latest_per_day[d]:
+                        latest_per_day[d] = ts
+
                 if event.get("type") == "assistant":
                     usage = msg.get("usage") or {}
                     if isinstance(usage, dict):
@@ -284,152 +360,136 @@ def process_session(
                         to = int(usage.get("output_tokens") or 0)
                         tr = int(usage.get("cache_read_input_tokens") or 0)
                         tc = int(usage.get("cache_creation_input_tokens") or 0)
-                        results["tokens_input"] += ti
-                        results["tokens_output"] += to
-                        results["tokens_cache_read"] += tr
-                        results["tokens_cache_creation"] += tc
-                        results["tokens_total"] += ti + to + tr + tc
+                        bucket["tokens_input"] += ti
+                        bucket["tokens_output"] += to
+                        bucket["tokens_cache_read"] += tr
+                        bucket["tokens_cache_creation"] += tc
+                        bucket["tokens_total"] += ti + to + tr + tc
 
                 if event.get("type") == "user":
                     text = content_to_text(msg.get("content"))
-                    # Only count human-typed user turns, not tool-result echoes.
-                    # content_to_text returns "" for tool_result-only content.
                     if text:
-                        results["user_messages"] += 1
-
-                        # Correction detection: match in the first 120 chars.
+                        bucket["user_messages"] += 1
                         if _CORRECTION_RE.search(text[:_CORRECTION_SCAN_PREFIX]):
-                            results["user_corrections"] += 1
+                            bucket["user_corrections"] += 1
 
-                        # Capture first user message from this session (for
-                        # later role classification). Cap globally for memory.
-                        if (
-                            not first_user_msg_captured
-                            and len(results["first_messages_sample"]) < 500
-                        ):
-                            results["first_messages_sample"].append(text[:500])
+                        if not first_user_msg_captured and len(first_messages_sample) < 500:
+                            first_messages_sample.append(text[:500])
                             first_user_msg_captured = True
 
-                # Tool_use calls live in assistant messages' content array
                 if event.get("type") == "assistant":
                     turn_tool_uses = list(extract_tool_uses(msg))
 
-                    # Count Agent dispatches in THIS event's content. Parallel
-                    # fan-out is detected across events via requestId below,
-                    # since Claude Code may split tool_uses into separate
-                    # events that share one requestId.
                     agents_in_event = sum(
                         1 for t in turn_tool_uses if t.get("name") in ORCHESTRATION_TOOLS
                     )
                     request_id = event.get("requestId")
                     if agents_in_event and request_id:
-                        agents_by_request[request_id] = (
-                            agents_by_request.get(request_id, 0) + agents_in_event
+                        key = (d, request_id)
+                        agents_by_request_day[key] = (
+                            agents_by_request_day.get(key, 0) + agents_in_event
                         )
                     elif agents_in_event:
-                        # No requestId — treat each event as its own turn.
-                        if agents_in_event > results["max_parallel_agents"]:
-                            results["max_parallel_agents"] = agents_in_event
+                        if agents_in_event > bucket["max_parallel_agents"]:
+                            bucket["max_parallel_agents"] = agents_in_event
                         if agents_in_event >= 2:
-                            results["parallel_agent_turns"] += 1
+                            bucket["parallel_agent_turns"] += 1
 
                     for tool_use in turn_tool_uses:
-                        results["tool_calls"] += 1
-                        session_used_tools = True
+                        bucket["tool_calls"] += 1
+                        days_with_tools.add(d)
 
                         name = tool_use.get("name", "")
                         if not name:
                             continue
 
-                        results["tool_name_counts"][name] = (
-                            results["tool_name_counts"].get(name, 0) + 1
+                        bucket["tool_name_counts"][name] = (
+                            bucket["tool_name_counts"].get(name, 0) + 1
                         )
 
                         if name == SKILL_TOOL:
                             skill = (tool_use.get("input") or {}).get("skill")
                             if skill:
-                                results["skill_counts"][skill] = (
-                                    results["skill_counts"].get(skill, 0) + 1
+                                bucket["skill_counts"][skill] = (
+                                    bucket["skill_counts"].get(skill, 0) + 1
                                 )
 
                         if name.startswith("mcp__"):
-                            server = name.split("__")[1] if len(name.split("__")) >= 3 else ""
+                            parts = name.split("__")
+                            server = parts[1] if len(parts) >= 3 else ""
                             if server:
-                                results["mcp_server_counts"][server] = (
-                                    results["mcp_server_counts"].get(server, 0) + 1
+                                bucket["mcp_server_counts"][server] = (
+                                    bucket["mcp_server_counts"].get(server, 0) + 1
                                 )
 
                         if name in ORCHESTRATION_TOOLS:
-                            session_used_orchestration = True
+                            days_with_orchestration.add(d)
 
                         if name in CONTEXT_LEVERAGE_TOOLS:
-                            session_used_context_leverage = True
+                            days_with_context_leverage.add(d)
 
                         if name == PLAN_MODE_TOOL:
-                            session_used_plan_mode = True
-                            results["plan_mode_invocations"] += 1
+                            days_with_plan_mode.add(d)
+                            bucket["plan_mode_invocations"] += 1
 
-                        # Detect custom skill creation (Write/Edit on SKILL.md)
                         if name in ("Write", "Edit"):
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
                             if (
                                 target_path.endswith("/SKILL.md")
                                 and CYBORGSCORE_SKILL_DIR_FRAGMENT not in target_path
+                                and target_path not in custom_skills_seen
                             ):
                                 custom_skills_seen.add(target_path)
+                                bucket["custom_skill_files_written"] += 1
 
-                            # MCP config edits
                             if target_path.endswith("/.mcp.json") or target_path.endswith(
                                 "/mcp.json"
                             ):
-                                results["custom_mcp_config_writes"] = (
-                                    results["custom_mcp_config_writes"] + 1
-                                )
+                                bucket["custom_mcp_config_writes"] += 1
 
-                            # CLAUDE.md / AGENTS.md authorship — a core signal
-                            # that the user configures their AI environment.
                             if target_path.endswith("/CLAUDE.md") or target_path.endswith(
                                 "/AGENTS.md"
                             ):
-                                results["claude_md_writes"] += 1
+                                bucket["claude_md_writes"] += 1
     except OSError:
         return
 
-    # Fold per-request Agent tallies into session totals. One request =
-    # one model turn, so if N Agents share a requestId, the model dispatched
-    # N agents in parallel.
-    for count in agents_by_request.values():
-        if count > results["max_parallel_agents"]:
-            results["max_parallel_agents"] = count
+    # Fold (date, requestId) Agent tallies into per-day peaks.
+    for (d, _rid), count in agents_by_request_day.items():
+        bucket = _bucket(daily, d)
+        if count > bucket["max_parallel_agents"]:
+            bucket["max_parallel_agents"] = count
         if count >= 2:
-            results["parallel_agent_turns"] += 1
+            bucket["parallel_agent_turns"] += 1
 
-    if session_message_count > results["max_messages_in_session"]:
-        results["max_messages_in_session"] = session_message_count
-    if session_used_tools:
-        results["sessions_with_tools"] += 1
-    if session_used_orchestration:
-        results["sessions_with_orchestration"] += 1
-    if session_used_context_leverage:
-        results["sessions_with_context_leverage"] += 1
-    if session_used_plan_mode:
-        results["sessions_with_plan_mode"] += 1
+    for d in days_seen:
+        bucket = _bucket(daily, d)
+        bucket["sessions"] += 1
+        if is_main:
+            bucket["main_sessions"] += 1
+    for d in days_with_tools:
+        _bucket(daily, d)["sessions_with_tools"] += 1
+    for d in days_with_orchestration:
+        _bucket(daily, d)["sessions_with_orchestration"] += 1
+    for d in days_with_context_leverage:
+        _bucket(daily, d)["sessions_with_context_leverage"] += 1
+    for d in days_with_plan_mode:
+        _bucket(daily, d)["sessions_with_plan_mode"] += 1
 
-    # Only main (top-level) sessions contribute to concurrency detection.
-    # Subagents are spawned by a parent session and don't represent
-    # independent user activity.
-    if is_main and earliest_ts is not None and latest_ts is not None:
-        # Single-event sessions (start == end) have no duration and can't
-        # concurrently overlap with other sessions; treat them as 1s wide so
-        # they still contribute +1 briefly to the sweep-line.
-        if latest_ts == earliest_ts:
-            latest_ts = earliest_ts + 1.0
-        return (earliest_ts, latest_ts)
-    return None
+    for d, count in msgs_per_day.items():
+        bucket = _bucket(daily, d)
+        if count > bucket["max_messages_in_session"]:
+            bucket["max_messages_in_session"] = count
+
+    if is_main:
+        for d, start in earliest_per_day.items():
+            end = latest_per_day.get(d, start)
+            if end == start:
+                end = start + 1.0
+            intervals_by_day.setdefault(d, []).append((start, end))
 
 
 def extract_tool_uses(message: dict) -> Iterable[dict]:
-    """Yields the tool_use content blocks from an assistant message."""
     content = message.get("content")
     if isinstance(content, list):
         for block in content:
@@ -438,7 +498,6 @@ def extract_tool_uses(message: dict) -> Iterable[dict]:
 
 
 def content_to_text(content) -> str:
-    """Flattens message content (string or list of blocks) to plain text."""
     if isinstance(content, str):
         return content
 

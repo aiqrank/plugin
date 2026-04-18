@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Submit raw scanner metrics to Cyborg Score's API. The server computes the
-tier and score; the client only sends counts.
+Submit per-day scanner metrics to Cyborg Score's API.
+
+Flow:
+  1. GET /api/metrics/latest_date with the device token → cursor date
+     (or None if the user has no records yet).
+  2. Filter the scanner's `daily` array to entries strictly after the
+     cursor — that's the delta we need to upload.
+  3. POST /api/metrics with the daily delta + role + computed_at.
+  4. Server upserts the daily rows, computes a 30-day rollup, scores it,
+     and returns the same response shape the user is used to.
+
+Privacy: `first_messages_sample` is stripped before transmission.
+Each day's metrics is also stripped to allowlisted scanner fields.
 
 Usage:
   python3 submit_score.py --metrics metrics.json --role engineer \
       [--base-url https://cyborgscore.com]
-
-`--metrics` is the output of `scan_transcripts.py` — raw counts and
-distributions. `--role` is the user-confirmed role (suggested by
-`infer_role.py`, confirmed or overridden by the user in the skill flow).
-
-Privacy: the client strips `first_messages_sample` from the metrics
-before transmission. The server never sees conversation content.
 """
 
 from __future__ import annotations
@@ -24,12 +28,47 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://cyborgscore.com before release
 CONFIG_PATH = Path.home() / ".config" / "cyborgscore" / "config.json"
 
 VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
+
+# Allowlist of scanner field names permitted in each per-day metrics blob.
+# Must match CyborgScore.Metrics.allowed_metric_keys/0 on the server.
+ALLOWED_METRIC_KEYS = {
+    "sessions",
+    "main_sessions",
+    "messages",
+    "tool_calls",
+    "sessions_with_tools",
+    "sessions_with_orchestration",
+    "sessions_with_context_leverage",
+    "sessions_with_plan_mode",
+    "parallel_agent_turns",
+    "custom_skill_files_written",
+    "custom_mcp_config_writes",
+    "claude_md_writes",
+    "user_messages",
+    "user_corrections",
+    "plan_mode_invocations",
+    "tokens_input",
+    "tokens_output",
+    "tokens_cache_read",
+    "tokens_cache_creation",
+    "tokens_total",
+    "max_concurrent_sessions",
+    "max_messages_in_session",
+    "max_parallel_agents",
+    "tool_name_counts",
+    "skill_counts",
+    "mcp_server_counts",
+    "agent_type_counts",
+}
+
+DEFAULT_BACKFILL_DAYS = 30
 
 
 def main(argv: list[str]) -> int:
@@ -38,7 +77,7 @@ def main(argv: list[str]) -> int:
         "--metrics",
         dest="metrics_path",
         required=True,
-        help="Path to scan_transcripts.py output (raw scanner metrics)",
+        help="Path to scan_transcripts.py output (with `daily` array)",
     )
     parser.add_argument(
         "--role",
@@ -59,10 +98,30 @@ def main(argv: list[str]) -> int:
     with open(args.metrics_path, "r") as fh:
         metrics = json.load(fh)
 
-    payload = build_payload(metrics, args.role)
+    daily = metrics.get("daily") or []
+    if not isinstance(daily, list) or not daily:
+        print("✗ Scanner output has no `daily` array — nothing to upload.", file=sys.stderr)
+        return 8
+
+    base_url = args.base_url.rstrip("/")
 
     try:
-        response = submit(args.base_url.rstrip("/"), token, payload)
+        cursor = fetch_latest_date(base_url, token)
+    except urllib.error.HTTPError as exc:
+        return handle_http_error(exc)
+    except urllib.error.URLError as exc:
+        print(f"✗ Couldn't reach {args.base_url}: {exc}", file=sys.stderr)
+        return 3
+
+    delta = filter_after_cursor(daily, cursor)
+    if not delta:
+        print(f"✓ Already up to date — server has data through {cursor}.")
+        return 0
+
+    payload = build_payload(delta, args.role)
+
+    try:
+        response = submit(base_url, token, payload)
     except urllib.error.HTTPError as exc:
         return handle_http_error(exc)
     except urllib.error.URLError as exc:
@@ -74,54 +133,73 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def build_payload(metrics: dict, role: str) -> dict:
-    """
-    Send only raw scanner counts plus the confirmed role + computed_at.
-    Strip anything text-based, derived, or pre-scored — the server runs
-    the scoring formula itself so users can't tamper with their tier.
-    """
-    # Allowlist of fields permitted in the transmitted payload. Keeps the
-    # wire format explicit; any scanner additions must be added here to be
-    # transmitted. Message text (first_messages_sample) and any derived
-    # display stats are intentionally omitted.
-    RAW_FIELDS = {
-        "window_days",
-        "sessions",
-        "main_sessions",
-        "max_concurrent_sessions",
-        "messages",
-        "max_messages_in_session",
-        "tool_calls",
-        "sessions_with_tools",
-        "sessions_with_orchestration",
-        "sessions_with_context_leverage",
-        "parallel_agent_turns",
-        "max_parallel_agents",
-        "custom_skill_files_written",
-        "custom_mcp_config_writes",
-        "user_messages",
-        "user_corrections",
-        "tokens_input",
-        "tokens_output",
-        "tokens_cache_read",
-        "tokens_cache_creation",
-        "tokens_total",
-        "tool_name_counts",
-        "skill_counts",
-        "mcp_server_counts",
-        "agent_type_counts",
-    }
+def fetch_latest_date(base_url: str, token: str) -> date | None:
+    """GET /api/metrics/latest_date → date or None."""
+    req = urllib.request.Request(
+        base_url + "/api/metrics/latest_date",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read())
 
-    payload = {k: v for k, v in metrics.items() if k in RAW_FIELDS}
-    payload["inferred_role"] = role
-    payload["computed_at"] = iso_now()
-    return payload
+    raw = body.get("latest_date")
+    if raw is None:
+        return None
+    return date.fromisoformat(raw)
+
+
+def filter_after_cursor(daily: list, cursor: date | None) -> list:
+    """Keep entries whose date > cursor. If cursor is None, default the
+    cursor to today − 30 so a brand-new user backfills 30 days."""
+    if cursor is None:
+        cursor = date.today() - timedelta(days=DEFAULT_BACKFILL_DAYS)
+
+    out = []
+    for entry in daily:
+        if not isinstance(entry, dict):
+            continue
+        date_str = entry.get("date")
+        if not isinstance(date_str, str):
+            continue
+        try:
+            entry_date = date.fromisoformat(date_str)
+        except ValueError:
+            continue
+        if entry_date > cursor:
+            out.append(entry)
+    return out
+
+
+def build_payload(daily_delta: list, role: str) -> dict:
+    """Sanitize each day's metrics to allowlisted fields and assemble
+    the request body. The server also sanitizes — this is defense-in-depth
+    so an old plugin can't accidentally leak unknown fields if the server
+    relaxes its allowlist."""
+    sanitized = []
+    for entry in daily_delta:
+        m = entry.get("metrics") or {}
+        sanitized.append(
+            {
+                "date": entry["date"],
+                "metrics": {k: v for k, v in m.items() if k in ALLOWED_METRIC_KEYS},
+            }
+        )
+
+    return {
+        "daily": sanitized,
+        "inferred_role": role,
+        "computed_at": iso_now(),
+    }
 
 
 def submit(base_url: str, token: str, payload: dict) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        base_url + "/api/scores",
+        base_url + "/api/metrics",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -154,6 +232,10 @@ def handle_http_error(exc: urllib.error.HTTPError) -> int:
         print(f"✗ Metrics rejected (anomaly guard): {body}", file=sys.stderr)
         return 6
 
+    if exc.code == 413:
+        print(f"✗ Metrics payload too large: {body}", file=sys.stderr)
+        return 9
+
     print(f"✗ Server error {exc.code}: {body}", file=sys.stderr)
     return 7
 
@@ -184,7 +266,6 @@ def update_last_scan_at() -> None:
 
 
 def iso_now() -> str:
-    # Use UTC ISO8601 with Z suffix (server expects ISO8601)
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
