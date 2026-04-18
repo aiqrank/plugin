@@ -450,5 +450,40 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(result["max_messages_in_session"], 12)
 
 
+    def test_counts_claude_md_and_agents_md_writes(self):
+        write_jsonl(
+            self.projects / "proj1" / "s.jsonl",
+            [
+                make_tool_call("Write", {"file_path": "/repo/CLAUDE.md"}),
+                make_tool_call("Edit", {"file_path": "/repo/AGENTS.md"}),
+                make_tool_call("Write", {"file_path": "/repo/src/foo.py"}),
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["claude_md_writes"], 2)
+
+    def test_counts_plan_mode_invocations_and_sessions(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_user_msg("plan this"),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call("Bash"),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "noplan.jsonl",
+            [make_user_msg("hi"), make_tool_call("Bash")],
+        )
+
+        result = scan(claude_dir=self.tmp)
+
+        self.assertEqual(result["plan_mode_invocations"], 2)
+        self.assertEqual(result["sessions_with_plan_mode"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

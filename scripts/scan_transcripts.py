@@ -39,6 +39,7 @@ CONTEXT_LEVERAGE_TOOLS = {
 }
 ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
+PLAN_MODE_TOOL = "ExitPlanMode"
 # The plugin writes metrics for cyborgscore itself; exclude self-references from
 # custom-skill-creation detection.
 CYBORGSCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/cyborgscore/"
@@ -92,12 +93,15 @@ def scan(
         "sessions_with_tools": 0,
         "sessions_with_orchestration": 0,
         "sessions_with_context_leverage": 0,
+        "sessions_with_plan_mode": 0,
+        "plan_mode_invocations": 0,
         "tool_name_counts": {},
         "skill_counts": {},
         "mcp_server_counts": {},
         "agent_type_counts": {},
         "custom_skill_files_written": 0,
         "custom_mcp_config_writes": 0,
+        "claude_md_writes": 0,
         "first_messages_sample": [],
         # Peak count of Agent tool_uses dispatched in a single assistant turn
         # (parallel sub-agent orchestration). >=2 means genuine parallelism.
@@ -238,6 +242,7 @@ def process_session(
     session_used_tools = False
     session_used_orchestration = False
     session_used_context_leverage = False
+    session_used_plan_mode = False
     first_user_msg_captured = False
     session_message_count = 0
     earliest_ts: float | None = None
@@ -360,6 +365,10 @@ def process_session(
                         if name in CONTEXT_LEVERAGE_TOOLS:
                             session_used_context_leverage = True
 
+                        if name == PLAN_MODE_TOOL:
+                            session_used_plan_mode = True
+                            results["plan_mode_invocations"] += 1
+
                         # Detect custom skill creation (Write/Edit on SKILL.md)
                         if name in ("Write", "Edit"):
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
@@ -376,6 +385,13 @@ def process_session(
                                 results["custom_mcp_config_writes"] = (
                                     results["custom_mcp_config_writes"] + 1
                                 )
+
+                            # CLAUDE.md / AGENTS.md authorship — a core signal
+                            # that the user configures their AI environment.
+                            if target_path.endswith("/CLAUDE.md") or target_path.endswith(
+                                "/AGENTS.md"
+                            ):
+                                results["claude_md_writes"] += 1
     except OSError:
         return
 
@@ -396,6 +412,8 @@ def process_session(
         results["sessions_with_orchestration"] += 1
     if session_used_context_leverage:
         results["sessions_with_context_leverage"] += 1
+    if session_used_plan_mode:
+        results["sessions_with_plan_mode"] += 1
 
     # Only main (top-level) sessions contribute to concurrency detection.
     # Subagents are spawned by a parent session and don't represent
