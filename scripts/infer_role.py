@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cyborg Score role inference.
+AIQ Rank role inference.
 
 Reads a scanner metrics JSON (from `scan_transcripts.py`) and classifies
 the user's role using keyword matching over `first_messages_sample` —

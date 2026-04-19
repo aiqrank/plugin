@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Device pairing flow for the Cyborg Score plugin.
+Device pairing flow for the AIQ Rank plugin.
 
 Flow:
   1. POST /api/pair/create → receive session_id + pair_url
   2. Open pair_url in the user's default browser
   3. Poll /api/pair/status every 2 seconds (up to 10 min)
-  4. On completed: write the returned API token to ~/.config/cyborgscore/config.json
+  4. On completed: write the returned API token to ~/.config/aiqrank/config.json
   5. On expired / network error: exit nonzero with a clear message
 
 Python stdlib only.
@@ -23,16 +23,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://cyborgscore.com before release
+DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://aiqrank.com before release
 POLL_INTERVAL_SECONDS = 2
 MAX_POLL_SECONDS = 10 * 60
 
-CONFIG_DIR = Path.home() / ".config" / "cyborgscore"
+CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
 def main(argv: list[str]) -> int:
-    base_url = os.environ.get("CYBORGSCORE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    base_url = os.environ.get("AIQRANK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 
     metrics_path = parse_metrics_arg(argv)
     metrics = load_metrics(metrics_path) if metrics_path else None
@@ -56,11 +56,11 @@ def main(argv: list[str]) -> int:
 
     if token is None:
         print("✗ Pairing timed out or was cancelled.", file=sys.stderr)
-        print("  Run /cyborgscore again to start a new pairing.", file=sys.stderr)
+        print("  Run /aiqrank again to start a new pairing.", file=sys.stderr)
         return 1
 
     write_config({"api_token": token})
-    print("✓ Paired! Your token is saved to ~/.config/cyborgscore/config.json")
+    print("✓ Paired! Your token is saved to ~/.config/aiqrank/config.json")
     return 0
 
 

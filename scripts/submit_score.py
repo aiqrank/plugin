@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Submit per-day scanner metrics to Cyborg Score's API.
+Submit per-day scanner metrics to AIQ Rank's API.
 
 Flow:
   1. GET /api/metrics/latest_date with the device token → cursor date
@@ -16,7 +16,7 @@ Each day's metrics is also stripped to allowlisted scanner fields.
 
 Usage:
   python3 submit_score.py --metrics metrics.json --role engineer \
-      [--base-url https://cyborgscore.com]
+      [--base-url https://aiqrank.com]
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://cyborgscore.com before release
-CONFIG_PATH = Path.home() / ".config" / "cyborgscore" / "config.json"
+DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://aiqrank.com before release
+CONFIG_PATH = Path.home() / ".config" / "aiqrank" / "config.json"
 
 VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
 
 # Allowlist of scanner field names permitted in each per-day metrics blob.
-# Must match CyborgScore.Metrics.allowed_metric_keys/0 on the server.
+# Must match AIQRank.Metrics.allowed_metric_keys/0 on the server.
 ALLOWED_METRIC_KEYS = {
     "sessions",
     "main_sessions",
@@ -86,13 +86,13 @@ def main(argv: list[str]) -> int:
         help="User-confirmed role (suggested by infer_role.py)",
     )
     parser.add_argument(
-        "--base-url", default=os.environ.get("CYBORGSCORE_BASE_URL", DEFAULT_BASE_URL)
+        "--base-url", default=os.environ.get("AIQRANK_BASE_URL", DEFAULT_BASE_URL)
     )
     args = parser.parse_args(argv)
 
     token = load_token()
     if not token:
-        print("✗ No API token found — run /cyborgscore setup first.", file=sys.stderr)
+        print("✗ No API token found — run /aiqrank setup first.", file=sys.stderr)
         return 2
 
     with open(args.metrics_path, "r") as fh:
@@ -228,7 +228,7 @@ def handle_http_error(exc: urllib.error.HTTPError) -> int:
 
     if exc.code == 401:
         print("✗ Your API token is invalid or expired.", file=sys.stderr)
-        print("  Regenerate one at cyborgscore.com/users/settings.", file=sys.stderr)
+        print("  Regenerate one at aiqrank.com/users/settings.", file=sys.stderr)
         return 4
 
     if exc.code == 422:

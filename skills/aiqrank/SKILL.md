@@ -1,10 +1,10 @@
 ---
-name: cyborgscore
-description: Analyse your Claude Code transcripts to compute and share your AI proficiency score. Score is calculated locally; only metrics are sent to cyborgscore.com (never your conversations or code).
+name: aiqrank
+description: Analyse your Claude Code transcripts to compute and share your AI proficiency score. Score is calculated locally; only metrics are sent to aiqrank.com (never your conversations or code).
 allowed-tools: [Bash, Read, Write, AskUserQuestion]
 ---
 
-# Cyborg Score
+# AIQ Rank
 
 Find out your AI tier. Score is based on how you actually use Claude Code:
 tool diversity, agent orchestration, skills & MCPs, custom skill creation,
@@ -12,7 +12,7 @@ context leverage (memory, schedules, tasks), and conversation depth.
 
 ## First time using this?
 
-1. Run `/cyborgscore` — it will open `cyborgscore.com/pair?session=...` in your browser
+1. Run `/aiqrank` — it will open `aiqrank.com/pair?session=...` in your browser
 2. Sign in with Google or an email code
 3. Your Claude Code plugin will automatically receive its API token
 
@@ -22,7 +22,7 @@ No passwords. Your transcripts stay on your machine.
 
 ### Regular flow (paired already)
 
-Run `/cyborgscore`. The plugin will:
+Run `/aiqrank`. The plugin will:
 
 1. Scan your Claude Code transcripts from the last 30 days, bucketed by day.
 2. Infer a role suggestion (engineer / product / gtm / research / devops / ...) **locally** from the first user message of each session.
@@ -36,11 +36,11 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 ### Sub-commands
 
-- `/cyborgscore` — full flow (scan + score + confirm + submit)
-- `/cyborgscore setup <TOKEN>` — save your API token (if you got it from settings rather than via device pairing)
-- `/cyborgscore pair` — force re-pair (if your token was lost or revoked)
+- `/aiqrank` — full flow (scan + score + confirm + submit)
+- `/aiqrank setup <TOKEN>` — save your API token (if you got it from settings rather than via device pairing)
+- `/aiqrank pair` — force re-pair (if your token was lost or revoked)
 
-## What happens when you run /cyborgscore
+## What happens when you run /aiqrank
 
 > **Running the helper scripts**: every `python3` command below uses the
 > shell env var `$CLAUDE_PLUGIN_ROOT`, which Claude Code sets to this
@@ -48,25 +48,25 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 > the commands *exactly as written* — do NOT substitute `$CLAUDE_PLUGIN_ROOT`
 > yourself or derive a path from this SKILL.md's location; the shell will
 > expand the variable at execution time. If the env var is unset, the
-> plugin is at `~/.claude/plugins/cache/cyborgscore/cyborgscore/<version>/`
+> plugin is at `~/.claude/plugins/cache/aiqrank/aiqrank/<version>/`
 > — but this is only a fallback; the env var is the canonical path.
 
 1. **Scan transcripts locally** —
-   `python3 "$CLAUDE_PLUGIN_ROOT/scripts/scan_transcripts.py" --days 30 > /tmp/cyborgscore_metrics.json`.
+   `python3 "$CLAUDE_PLUGIN_ROOT/scripts/scan_transcripts.py" --days 30 > /tmp/aiqrank_metrics.json`.
    NOTHING is transmitted yet. The scanner emits a per-day `daily` array
    plus a 30-day `rollup` summary; we do this first so an unauthenticated
    teaser page can show raw counts during the pairing flow.
 
-2. **Check for token** — look in `~/.config/cyborgscore/config.json`. If missing,
+2. **Check for token** — look in `~/.config/aiqrank/config.json`. If missing,
    start the pairing flow and pass the freshly-scanned metrics so the teaser
    page can display them:
-   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pair_device.py --metrics /tmp/cyborgscore_metrics.json`.
+   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pair_device.py --metrics /tmp/aiqrank_metrics.json`.
    The plugin POSTs the raw counts to the server, which stashes them on the
    pair session and returns a teaser URL. The teaser shows the counts with a
    `?` tier — the user signs in to unlock the real tier, score, and profile.
 
 3. **Infer role locally** —
-   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/infer_role.py --from /tmp/cyborgscore_metrics.json > /tmp/cyborgscore_role.json`.
+   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/infer_role.py --from /tmp/aiqrank_metrics.json > /tmp/aiqrank_role.json`.
    This only classifies a role from the first user message of each
    session. It does NOT compute any tier or score.
 
@@ -80,8 +80,8 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
    and let them accept or pick a different one from:
    engineer / product / gtm / research / devops / ops / design / other.
 
-6. **Ask the user: transmit to cyborgscore.com?**
-   - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/cyborgscore_metrics.json --role <confirmed-role>`
+6. **Ask the user: transmit to aiqrank.com?**
+   - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/aiqrank_metrics.json --role <confirmed-role>`
      The client first fetches `GET /api/metrics/latest_date` so it only
      uploads days the server doesn't already have (subsequent runs are
      near-instant — just today's new data). `first_messages_sample` is
@@ -130,13 +130,13 @@ graphs. Each day's entry contains:
 
 All computation happens on your machine. The server only ever receives the
 metric summary above. See
-[cyborgscore.com/privacy](https://cyborgscore.com/privacy) for details.
+[aiqrank.com/privacy](https://aiqrank.com/privacy) for details.
 
 ## Stale-score reminders (optional)
 
 This plugin installs a `SessionStart` hook that reminds you to re-run
-`/cyborgscore` if your score is over 30 days old. It does NOT scan or submit
+`/aiqrank` if your score is over 30 days old. It does NOT scan or submit
 automatically — it just prints a single line.
 
 To turn it off, add `"HOOK_DISABLED": "true"` to
-`~/.config/cyborgscore/config.json`.
+`~/.config/aiqrank/config.json`.

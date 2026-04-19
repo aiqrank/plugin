@@ -1,12 +1,12 @@
 {
-  "name": "cyborgscore",
+  "name": "aiqrank",
   "owner": {
-    "name": "Cyborg Score",
-    "url": "https://cyborgscore.com"
+    "name": "AIQ Rank",
+    "url": "https://aiqrank.com"
   },
   "plugins": [
     {
-      "name": "cyborgscore",
+      "name": "aiqrank",
       "source": "./",
       "description": "Compute and share your AI proficiency score from your Claude Code transcripts.",
       "version": "0.1.0",

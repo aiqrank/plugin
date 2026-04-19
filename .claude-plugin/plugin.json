@@ -1,9 +1,9 @@
 {
-  "name": "cyborgscore",
+  "name": "aiqrank",
   "version": "0.1.0",
-  "description": "Analyse your Claude Code transcripts and find out your AI tier. Scores computed locally — only metrics are sent to cyborgscore.com.",
-  "homepage": "https://cyborgscore.com",
-  "repository": "https://github.com/cyborgscore/plugin",
+  "description": "Analyse your Claude Code transcripts and find out your AI tier. Scores computed locally — only metrics are sent to aiqrank.com.",
+  "homepage": "https://aiqrank.com",
+  "repository": "https://github.com/aiqrank/plugin",
   "license": "MIT",
-  "author": { "name": "Cyborg Score", "url": "https://cyborgscore.com" }
+  "author": { "name": "AIQ Rank", "url": "https://aiqrank.com" }
 }

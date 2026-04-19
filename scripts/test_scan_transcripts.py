@@ -177,13 +177,13 @@ class ScanTranscriptsTests(unittest.TestCase):
                 ),
                 make_tool_call(
                     "Write",
-                    {"file_path": "/Users/me/.claude/skills/cyborgscore/SKILL.md"},
+                    {"file_path": "/Users/me/.claude/skills/aiqrank/SKILL.md"},
                 ),
             ],
         )
 
         r = self.rollup(scan(claude_dir=self.tmp))
-        # Same SKILL.md path counted once; cyborgscore self-reference excluded.
+        # Same SKILL.md path counted once; aiqrank self-reference excluded.
         self.assertEqual(r["custom_skill_files_written"], 1)
 
     def test_detects_mcp_config_writes(self):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cyborg Score transcript scanner.
+AIQ Rank transcript scanner.
 
 Walks ~/.claude/projects/* and extracts activity metrics from Claude Code
 transcripts modified in the last 30 days. Buckets every event by its
@@ -56,7 +56,7 @@ CONTEXT_LEVERAGE_TOOLS = {
 ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
 PLAN_MODE_TOOL = "ExitPlanMode"
-CYBORGSCORE_SKILL_DIR_FRAGMENT = "/.claude/skills/cyborgscore/"
+AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 
 _CORRECTION_RE = re.compile(
     r"""
@@ -83,7 +83,7 @@ _CORRECTION_RE = re.compile(
 
 _CORRECTION_SCAN_PREFIX = 120
 
-# Field aggregation rules — must match CyborgScore.Metrics module attributes.
+# Field aggregation rules — must match AIQRank.Metrics module attributes.
 _COUNT_FIELDS = (
     "sessions",
     "main_sessions",
@@ -436,7 +436,7 @@ def process_session(
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
                             if (
                                 target_path.endswith("/SKILL.md")
-                                and CYBORGSCORE_SKILL_DIR_FRAGMENT not in target_path
+                                and AIQRANK_SKILL_DIR_FRAGMENT not in target_path
                                 and target_path not in custom_skills_seen
                             ):
                                 custom_skills_seen.add(target_path)
