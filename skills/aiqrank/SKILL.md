@@ -57,18 +57,29 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
    plus a 30-day `rollup` summary; we do this first so an unauthenticated
    teaser page can show raw counts during the pairing flow.
 
-2. **Check for token** — look in `~/.config/aiqrank/config.json`. If missing,
-   start the pairing flow and pass the freshly-scanned metrics so the teaser
-   page can display them:
-   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pair_device.py --metrics /tmp/aiqrank_metrics.json`.
-   The plugin POSTs the raw counts to the server, which stashes them on the
-   pair session and returns a teaser URL. The teaser shows the counts with a
-   `?` tier — the user signs in to unlock the real tier, score, and profile.
+   **Before running, tell the user — in one short line — that the scan
+   runs locally on their machine, not on a server.** Example:
 
-3. **Infer role locally** —
+   > Scanning your last 30 days of Claude Code transcripts locally — no transcripts ever leave your machine.
+
+   Keep it to one line. Don't list files, paths, or the command.
+
+2. **Infer role locally** —
    `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/infer_role.py --from /tmp/aiqrank_metrics.json > /tmp/aiqrank_role.json`.
    This only classifies a role from the first user message of each
-   session. It does NOT compute any tier or score.
+   session. It does NOT compute any tier or score. Must run before pairing
+   so the teaser page can personalize role comparisons ("how you compare as
+   an engineer") instead of falling back to a generic pitch.
+
+3. **Check for token** — look in `~/.config/aiqrank/config.json`. If missing,
+   start the pairing flow and pass the freshly-scanned metrics **plus the
+   inferred role** so the teaser page can display them:
+   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pair_device.py --metrics /tmp/aiqrank_metrics.json --role <inferred-role>`.
+   The plugin POSTs the raw counts + role to the server, which stashes them
+   on the pair session and returns a teaser URL. The teaser shows the counts
+   with a `?` tier — the user signs in to unlock the real tier, score, and
+   profile. On successful sign-in the server computes the score from the
+   stashed metrics and redirects straight to the user's `/u/:id` rank page.
 
 4. **Show the raw data preview** — the counts that will be transmitted
    (sessions, messages, tokens, tool/skill/MCP/agent usage maps, etc.),
@@ -76,18 +87,33 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
    contain project or company names, so the user should review before
    confirming.
 
-5. **Ask the user to confirm the role.** Show the suggestion ("engineer")
-   and let them accept or pick a different one from:
-   engineer / product / marketing / sales / revops / research / devops / ops / design / founder / executive / other.
+5. **Confirm the role with the rank-teaser pitch baked in.** This is the
+   ONE question — don't ask role and transmit separately, and don't drop
+   the "see your rank" framing. Example wording:
 
-6. **Ask the user: transmit to aiqrank.com?**
-   - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/aiqrank_metrics.json --role <confirmed-role>`
-     The client first fetches `GET /api/metrics/latest_date` so it only
-     uploads days the server doesn't already have (subsequent runs are
-     near-instant — just today's new data). `first_messages_sample` is
-     stripped before POSTing; the server stores the daily records, rolls
-     them up over 30 days, and returns the computed tier/score/dimensions.
-   - If no: show the raw counts locally and exit.
+   > Want to see how you rank against other **Engineers**? We'll open
+   > aiqrank.com to sign you in — only aggregate counts (tool calls,
+   > skill names, token totals) leave your machine. Your conversations,
+   > code, and prompts never do.
+   >
+   > Confirm you're an **Engineer**? (`y` to go, `n` to cancel, or type
+   > one of: engineer / product / marketing / sales / revops / research /
+   > devops / ops / design / founder / executive / other to change)
+
+   - `y` → transmit with the inferred role (next step).
+   - `n` → show the raw counts locally and exit.
+   - A different role → re-show this same teaser with the new role, then
+     ask again.
+
+   Wait for a clear answer. Always include both the rank-teaser line and
+   the role confirmation in the same prompt.
+
+6. **On `y`, transmit.** `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/aiqrank_metrics.json --role <confirmed-role>`
+   The client first fetches `GET /api/metrics/latest_date` so it only
+   uploads days the server doesn't already have (subsequent runs are
+   near-instant — just today's new data). `first_messages_sample` is
+   stripped before POSTing; the server stores the daily records, rolls
+   them up over 30 days, and returns the computed tier/score/dimensions.
 
 7. **On success**, the response contains the profile URL. Open it in
    the browser: `open "<profile_url>"` (macOS) or `xdg-open "<profile_url>"` (Linux).
