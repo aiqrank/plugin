@@ -34,7 +34,10 @@ from pathlib import Path
 DEFAULT_BASE_URL = "http://localhost:4999"  # TEMP: local dev — revert to https://aiqrank.com before release
 CONFIG_PATH = Path.home() / ".config" / "aiqrank" / "config.json"
 
-VALID_ROLES = {"engineer", "product", "gtm", "research", "devops", "ops", "design", "other"}
+VALID_ROLES = {
+    "engineer", "product", "marketing", "sales", "revops", "research",
+    "devops", "ops", "design", "founder", "executive", "other",
+}
 
 # Allowlist of scanner field names permitted in each per-day metrics blob.
 # Must match AIQRank.Metrics.allowed_metric_keys/0 on the server.

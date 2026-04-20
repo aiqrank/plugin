@@ -68,5 +68,5 @@ if [ "$AGE_DAYS" -lt "$STALE_AFTER_DAYS" ]; then
 fi
 
 # Stale — print single-line reminder to stderr (visible in Claude Code status)
-echo "💡 Your AIQ Rank is ${AGE_DAYS} days old. Run /aiqrank to update your tier." >&2
+echo "💡 Your AIQ Rank is ${AGE_DAYS} days old. Run /aiqrank to see how your rank has changed this month." >&2
 exit 0

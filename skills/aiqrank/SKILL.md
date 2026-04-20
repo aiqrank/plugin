@@ -25,7 +25,7 @@ No passwords. Your transcripts stay on your machine.
 Run `/aiqrank`. The plugin will:
 
 1. Scan your Claude Code transcripts from the last 30 days, bucketed by day.
-2. Infer a role suggestion (engineer / product / gtm / research / devops / ...) **locally** from the first user message of each session.
+2. Infer a role suggestion (engineer / product / marketing / sales / research / devops / founder / ...) **locally** from the first user message of each session.
 3. Ask you to confirm or override the suggested role.
 4. Show you exactly the raw counts that will be sent to the server.
 5. Ask you to confirm transmission.
@@ -78,7 +78,7 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 5. **Ask the user to confirm the role.** Show the suggestion ("engineer")
    and let them accept or pick a different one from:
-   engineer / product / gtm / research / devops / ops / design / other.
+   engineer / product / marketing / sales / revops / research / devops / ops / design / founder / executive / other.
 
 6. **Ask the user: transmit to aiqrank.com?**
    - If yes: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/submit_score.py --metrics /tmp/aiqrank_metrics.json --role <confirmed-role>`
@@ -89,10 +89,10 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
      them up over 30 days, and returns the computed tier/score/dimensions.
    - If no: show the raw counts locally and exit.
 
-7. **On success**, the response contains the server-computed tier,
-   score, role, dimension values, activity breakdown, top strength, and
-   the profile URL. The skill displays these plus the score delta
-   ("+47 since last run") and a pre-composed tweet text.
+7. **On success**, the response contains the profile URL. Open it in
+   the browser: `open "<profile_url>"` (macOS) or `xdg-open "<profile_url>"` (Linux).
+   Tell the user their profile is opening and show the URL. Do NOT display
+   tier, score, or dimension tables — the profile page shows all of that.
 
 ## What gets transmitted
 
@@ -112,7 +112,7 @@ graphs. Each day's entry contains:
 - Agent type names + counts (e.g. "Explore: 558")
 - Custom-skill-file-write and MCP-config-write counts
 - Human-message count and correction-pattern match count
-- Inferred role (engineer / product / gtm / research / devops / other)
+- Inferred role (engineer / product / marketing / sales / research / devops / founder / other)
 - `computed_at` timestamp
 
 ### What is NEVER transmitted

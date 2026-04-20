@@ -39,14 +39,32 @@ class ClassifyRoleTests(unittest.TestCase):
         result = classify_role(messages)
         self.assertEqual(result["inferred_role"], "product")
 
-    def test_strongly_gtm_messages_classify_as_gtm(self):
+    def test_strongly_marketing_messages_classify_as_marketing(self):
         messages = [
             "marketing copy for the landing page",
             "seo audit for the campaign",
-            "email content for the audience",
+            "social content for the audience",
         ]
         result = classify_role(messages)
-        self.assertEqual(result["inferred_role"], "gtm")
+        self.assertEqual(result["inferred_role"], "marketing")
+
+    def test_strongly_sales_messages_classify_as_sales(self):
+        messages = [
+            "sales pipeline update for the deal",
+            "outbound prospect follow-up",
+            "discovery call notes and proposal",
+        ]
+        result = classify_role(messages)
+        self.assertEqual(result["inferred_role"], "sales")
+
+    def test_strongly_founder_messages_classify_as_founder(self):
+        messages = [
+            "pitch deck for the investor meeting",
+            "fundraise update and cap table",
+            "hiring plan for the seed round",
+        ]
+        result = classify_role(messages)
+        self.assertEqual(result["inferred_role"], "founder")
 
     def test_ambiguous_messages_fall_back_to_default(self):
         # A mix that doesn't clearly favor any role.

@@ -37,6 +37,12 @@ def main(argv: list[str]) -> int:
     metrics_path = parse_metrics_arg(argv)
     metrics = load_metrics(metrics_path) if metrics_path else None
 
+    role = parse_role_arg(argv)
+    if role is not None:
+        if metrics is None:
+            metrics = {}
+        metrics["inferred_role"] = role
+
     try:
         session = create_pair_session(base_url, metrics)
     except urllib.error.URLError as exc:
@@ -82,6 +88,16 @@ def parse_metrics_arg(argv: list[str]) -> str | None:
         if arg == "--metrics" and i + 1 < len(argv):
             return argv[i + 1]
         if arg.startswith("--metrics="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def parse_role_arg(argv: list[str]) -> str | None:
+    """Minimal --role <role> parser. Server validates the value."""
+    for i, arg in enumerate(argv):
+        if arg == "--role" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--role="):
             return arg.split("=", 1)[1]
     return None
 
