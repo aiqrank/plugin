@@ -89,21 +89,31 @@ No tier, score, or dimensions are computed on your machine — the scoring formu
 
 5. **Confirm the role with the rank-teaser pitch baked in.** This is the
    ONE question — don't ask role and transmit separately, and don't drop
-   the "see your rank" framing. Example wording:
+   the "see your rank" framing.
 
-   > Want to see how you rank against other **Engineers**? We'll open
-   > aiqrank.com to sign you in — only aggregate counts (tool calls,
-   > skill names, token totals) leave your machine. Your conversations,
-   > code, and prompts never do.
+   **Substitute the inferred role everywhere.** `Engineers` / `Engineer`
+   below are placeholders — if the inferred role is `product`, the prompt
+   must say "other **Product** folks" and "Confirm you're in **Product**?".
+   If `designer`, substitute Designer. Never leave the literal word
+   "Engineer" in the prompt unless that was the inferred role.
+
+   Use the plural, role-appropriate noun for the comparison line (e.g.
+   Engineers, Designers, Product folks, Founders, Marketers, Salespeople,
+   DevOps engineers, Researchers, Executives, Ops folks, Other users).
+
+   Example wording when the inferred role is `engineer`:
+
+   > Now let's see how you rank against other **{PluralRole}**. We'll set
+   > you up with an aiqrank account to see how you compare.
    >
-   > Confirm you're an **Engineer**? (`y` to go, `n` to cancel, or type
+   > Confirm you're {an/a} **{Role}**? (`y` to go, `n` to cancel, or type
    > one of: engineer / product / marketing / sales / revops / research /
    > devops / ops / design / founder / executive / other to change)
 
    - `y` → transmit with the inferred role (next step).
    - `n` → show the raw counts locally and exit.
-   - A different role → re-show this same teaser with the new role, then
-     ask again.
+   - A different role → re-show this same teaser with the NEW role
+     substituted, then ask again.
 
    Wait for a clear answer. Always include both the rank-teaser line and
    the role confirmation in the same prompt.
