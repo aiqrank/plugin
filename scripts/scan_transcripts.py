@@ -141,6 +141,7 @@ def scan(
     claude_dir: Path | None = None,
     window_days: int = DEFAULT_WINDOW_DAYS,
     now_ts: float | None = None,
+    mtime_after_ts: float | None = None,
 ) -> dict:
     """Scan ~/.claude for transcript data within the last `window_days`.
 
@@ -163,7 +164,7 @@ def scan(
             if not project_dir.is_dir():
                 continue
 
-            for jsonl_path in iter_transcript_files(project_dir, cutoff_ts):
+            for jsonl_path in iter_transcript_files(project_dir, cutoff_ts, mtime_after_ts):
                 is_main = "subagents" not in jsonl_path.parts
                 process_session(
                     jsonl_path,
@@ -174,8 +175,9 @@ def scan(
                     is_main,
                 )
 
+            meta_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
             for meta_path in project_dir.rglob("agent-*.meta.json"):
-                if meta_path.stat().st_mtime < cutoff_ts:
+                if meta_path.stat().st_mtime < meta_cutoff:
                     continue
                 meta_date = datetime.fromtimestamp(meta_path.stat().st_mtime).date()
                 bucket = _bucket(daily, meta_date)
@@ -274,15 +276,25 @@ def _ts_to_date(ts: float | None) -> date | None:
     return datetime.fromtimestamp(ts).date()
 
 
-def iter_transcript_files(project_dir: Path, cutoff_ts: float) -> Iterable[Path]:
-    """Yields JSONL transcript file paths within the cutoff."""
+def iter_transcript_files(
+    project_dir: Path,
+    cutoff_ts: float,
+    mtime_after_ts: float | None = None,
+) -> Iterable[Path]:
+    """Yields JSONL transcript file paths within the cutoff.
+
+    When ``mtime_after_ts`` is provided, it acts as an additional lower
+    bound on file mtime — files older than this timestamp are skipped.
+    """
+    effective_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+
     for entry in project_dir.iterdir():
         if entry.is_file() and entry.suffix == ".jsonl":
-            if entry.stat().st_mtime >= cutoff_ts:
+            if entry.stat().st_mtime >= effective_cutoff:
                 yield entry
 
     for subagent_path in project_dir.rglob("subagents/agent-*.jsonl"):
-        if subagent_path.stat().st_mtime >= cutoff_ts:
+        if subagent_path.stat().st_mtime >= effective_cutoff:
             yield subagent_path
 
 
@@ -523,7 +535,17 @@ def main(argv: list[str]) -> int:
         except (IndexError, ValueError):
             pass
 
-    result = scan(window_days=window_days)
+    mtime_after_ts: float | None = None
+    if "--mtime-after" in argv:
+        idx = argv.index("--mtime-after")
+        try:
+            raw = argv[idx + 1]
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            mtime_after_ts = dt.timestamp()
+        except (IndexError, ValueError):
+            pass
+
+    result = scan(window_days=window_days, mtime_after_ts=mtime_after_ts)
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0
