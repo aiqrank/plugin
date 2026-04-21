@@ -6,8 +6,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.sh\"",
-            "timeout": 10
+            "timeout": 2,
+            "command": "python3 $CLAUDE_PLUGIN_ROOT/scripts/hook_nudge_if_stale.py"
+          },
+          {
+            "type": "command",
+            "command": "nohup python3 $CLAUDE_PLUGIN_ROOT/scripts/hook_upload_today.py </dev/null >/dev/null 2>&1 &"
           }
         ]
       }
