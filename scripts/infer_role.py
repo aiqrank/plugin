@@ -10,7 +10,7 @@ the short text of each session's first user message. Emits JSON:
 
 The role is the ONLY thing derived from message text. This happens
 locally on the user's machine; the raw sample text is never transmitted
-(the skill strips `first_messages_sample` before calling submit_score.py).
+(the skill strips `first_messages_sample` before calling upload_metrics.py).
 
 Keeping this separate from scoring keeps the skill flow honest: no tier,
 no overall score, and no dimensions are ever computed on the client.
