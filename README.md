@@ -6,7 +6,7 @@ proficiency score.
 ## Install
 
 ```
-/plugin marketplace add https://github.com/aiqrank/plugin
+/plugin marketplace add aiqrank/plugin
 /plugin install aiqrank
 ```
 
