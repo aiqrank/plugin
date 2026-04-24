@@ -19,9 +19,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from infer_role import classify_role  # noqa: E402
 
 DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
@@ -111,9 +114,8 @@ def _run(logger: logging.Logger) -> None:
                 logger.info("gated")
                 return
 
-        scan_days = _compute_scan_days(last_upload_at)
         try:
-            metrics = _run_scan(scan_days)
+            metrics = _run_scan()
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as e:
             logger.info(f"error {type(e).__name__}")
             return
@@ -124,10 +126,15 @@ def _run(logger: logging.Logger) -> None:
             _write_last_upload_at(_iso_now())
             return
 
+        sample = metrics.get("first_messages_sample") if isinstance(metrics, dict) else None
+        if not isinstance(sample, list):
+            sample = []
+        inferred_role = classify_role(sample).get("inferred_role") or "engineer"
+
         payload = {
             "device_id": device_id,
             "daily": daily,
-            "inferred_role": metrics.get("inferred_role") or "other",
+            "inferred_role": inferred_role,
         }
 
         try:
@@ -192,25 +199,10 @@ def _write_last_upload_at(ts: str) -> None:
     LAST_UPLOAD_PATH.write_text(ts + "\n")
 
 
-def _compute_scan_days(last_upload_at: datetime | None) -> int:
-    if last_upload_at is None:
-        return MAX_WINDOW_DAYS
-    today = date.today()
-    last_date = last_upload_at.astimezone(timezone.utc).date()
-    delta_days = (today - last_date).days + 1
-    if delta_days < 1:
-        return 1
-    if delta_days > MAX_WINDOW_DAYS:
-        return MAX_WINDOW_DAYS
-    return delta_days
-
-
-def _run_scan(days: int) -> dict:
+def _run_scan() -> dict:
     script = Path(__file__).resolve().parent / "scan_transcripts.py"
-    cutoff_ts = time.time() - (days * 86400)
-    cutoff_iso = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     result = subprocess.run(
-        [sys.executable, str(script), "--days", str(days), "--mtime-after", cutoff_iso],
+        [sys.executable, str(script), "--days", str(MAX_WINDOW_DAYS)],
         capture_output=True,
         text=True,
         check=True,

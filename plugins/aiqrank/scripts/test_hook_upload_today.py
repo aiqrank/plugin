@@ -92,13 +92,20 @@ class HookUploadTests(unittest.TestCase):
                 {"date": "2026-04-19", "metrics": {"sessions": 2}},
                 {"date": "2026-04-20", "metrics": {"sessions": 5}},
             ],
-            "inferred_role": "engineer",
+            "first_messages_sample": [
+                "fix bug in migration",
+                "refactor function and commit",
+                "rebase the branch",
+            ],
         }
 
-        def fake_run_scan(days):
+        def fake_run_scan():
             return fake_scan_output
 
+        captured_requests = []
+
         def fake_urlopen(req, timeout=30):
+            captured_requests.append(req)
             return FakeResp({"teaser_url": "https://x/t", "device_id": "device-abcdef12"})
 
         with mock.patch.object(self.mod, "_run_scan", side_effect=fake_run_scan), \
@@ -108,6 +115,41 @@ class HookUploadTests(unittest.TestCase):
         log = self._log_contents()
         self.assertIn("ok sessions=2 devices=device-a", log)
         self.assertTrue(self.mod.LAST_UPLOAD_PATH.exists())
+
+        # Payload should carry a server-valid role inferred from the sample
+        # (never the old "other" fallback).
+        self.assertEqual(len(captured_requests), 1)
+        payload = json.loads(captured_requests[0].data.decode("utf-8"))
+        self.assertEqual(payload["inferred_role"], "engineer")
+        self.assertNotIn("first_messages_sample", payload)
+
+    def test_empty_sample_defaults_to_engineer(self):
+        self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.mod.DEVICE_PATH.write_text(json.dumps({"device_id": "device-abcdef12"}))
+
+        class FakeResp:
+            def __init__(self, body): self._b = json.dumps(body).encode("utf-8")
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        fake_scan_output = {
+            "daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}],
+            "first_messages_sample": [],
+        }
+
+        captured = []
+
+        def fake_urlopen(req, timeout=30):
+            captured.append(req)
+            return FakeResp({"teaser_url": "https://x/t", "device_id": "device-abcdef12"})
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_scan_output), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self._invoke_silent()
+
+        payload = json.loads(captured[0].data.decode("utf-8"))
+        self.assertEqual(payload["inferred_role"], "engineer")
 
 
 if __name__ == "__main__":
