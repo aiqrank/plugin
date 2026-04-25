@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -143,6 +144,44 @@ class ScanTranscriptsTests(unittest.TestCase):
         r = self.rollup(scan(claude_dir=self.tmp))
         self.assertEqual(r["mcp_server_counts"]["pencil"], 2)
         self.assertEqual(r["mcp_server_counts"]["granola"], 1)
+
+    def test_uuid_shaped_mcp_server_names_are_bucketed(self):
+        # Claude Desktop / cowork sometimes spawns MCP servers under a
+        # per-installation UUID; bucketing keeps the count without leaking IDs.
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_tool_call("mcp__4507b484-062b-4cc6-85ff-0862c2c5567a__search"),
+                make_tool_call("mcp__4507b484-062b-4cc6-85ff-0862c2c5567a__list"),
+                make_tool_call("mcp__6ab117fc-c70c-4338-9eb7-10d11d55df0c__get_meetings"),
+                make_tool_call("mcp__pencil__batch_design"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        # Three UUID-suffixed calls all collapse under "dynamic".
+        self.assertEqual(r["mcp_server_counts"]["dynamic"], 3)
+        self.assertEqual(r["mcp_server_counts"]["pencil"], 1)
+        # Match the production _UUID_RE shape (canonical 8-4-4-4-12 hex,
+        # case-insensitive) so an uppercase UUID would still trip the leak
+        # detector.
+        uuid_re = re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        )
+        for key in r["mcp_server_counts"]:
+            self.assertIsNone(
+                uuid_re.search(key), f"UUID-shaped key leaked: {key}"
+            )
+        # tool_name_counts also has the UUID swapped for the sentinel.
+        self.assertIn("mcp__dynamic__search", r["tool_name_counts"])
+        self.assertIn("mcp__dynamic__list", r["tool_name_counts"])
+        self.assertIn("mcp__dynamic__get_meetings", r["tool_name_counts"])
+        for key in r["tool_name_counts"]:
+            self.assertIsNone(
+                uuid_re.search(key), f"UUID-shaped tool name leaked: {key}"
+            )
 
     def test_detects_orchestration_and_context_leverage_per_session(self):
         write_jsonl(
@@ -621,6 +660,184 @@ class DailyBucketingTests(unittest.TestCase):
 
         result = scan(claude_dir=self.tmp, window_days=365 * 5)
         self.assertEqual(result["rollup"]["max_concurrent_sessions"], 2)
+
+
+class CoworkScannerTests(unittest.TestCase):
+    """Claude Cowork (Local Agent Mode) sandboxed sessions are merged into the
+    claude_code source, but also tagged with cowork_* counters so the profile
+    page can show the autonomous-vs-interactive split.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        # Interactive Claude Code root
+        self.projects = self.tmp / "projects"
+        (self.projects / "proj1").mkdir(parents=True)
+        # Cowork sandbox root mimics the real layout:
+        #   {root}/{account}/{workspace}/local_*/.claude/projects/{proj}/*.jsonl
+        self.cowork_root = self.tmp / "cowork-sessions"
+        self.cowork_projects = (
+            self.cowork_root
+            / "acct-uuid"
+            / "ws-uuid"
+            / "local_sess-uuid"
+            / ".claude"
+            / "projects"
+            / "some-proj"
+        )
+        self.cowork_projects.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _scan(self):
+        return scan(claude_dir=self.tmp, cowork_root=self.cowork_root)
+
+    def test_counts_cowork_sessions_messages_and_queue_events(self):
+        write_jsonl(
+            self.cowork_projects / "conv1.jsonl",
+            [
+                make_user_msg("hello cowork"),
+                make_tool_call("Bash", {"command": "ls"}),
+                {"type": "queue-operation", "operation": "enqueue"},
+                {"type": "queue-operation", "operation": "dequeue"},
+            ],
+        )
+
+        r = self._scan()["rollup"]
+
+        # The two queue-operation events do NOT count as messages.
+        self.assertEqual(r["messages"], 2)
+        # But they do get tallied.
+        self.assertEqual(r["queue_events"], 2)
+        # One cowork session, two cowork messages (user + assistant).
+        self.assertEqual(r["cowork_sessions"], 1)
+        self.assertEqual(r["cowork_messages"], 2)
+        # Still rolls up into the unified session/message totals.
+        self.assertEqual(r["sessions"], 1)
+        # Tool calls from cowork sessions land in the unified tool counts.
+        self.assertEqual(r["tool_name_counts"]["Bash"], 1)
+        self.assertEqual(r["tool_calls"], 1)
+
+    def test_regular_sessions_do_not_increment_cowork_counters(self):
+        write_jsonl(
+            self.projects / "proj1" / "interactive.jsonl",
+            [make_user_msg("hi"), make_tool_call("Bash")],
+        )
+
+        r = self._scan()["rollup"]
+
+        self.assertEqual(r["messages"], 2)
+        self.assertEqual(r["cowork_messages"], 0)
+        self.assertEqual(r["cowork_sessions"], 0)
+        self.assertEqual(r["queue_events"], 0)
+
+    def test_cowork_and_interactive_sessions_merge_in_rollup(self):
+        write_jsonl(
+            self.projects / "proj1" / "interactive.jsonl",
+            [make_user_msg("hi"), make_user_msg("again")],
+        )
+        write_jsonl(
+            self.cowork_projects / "conv1.jsonl",
+            [
+                make_user_msg("autonomous task"),
+                make_tool_call("Read"),
+                {"type": "queue-operation", "operation": "enqueue"},
+            ],
+        )
+
+        r = self._scan()["rollup"]
+
+        # Unified totals: both sources contribute.
+        self.assertEqual(r["sessions"], 2)
+        self.assertEqual(r["messages"], 4)
+        # Cowork-specific subset.
+        self.assertEqual(r["cowork_sessions"], 1)
+        self.assertEqual(r["cowork_messages"], 2)
+        self.assertEqual(r["queue_events"], 1)
+
+    def test_missing_cowork_root_is_silent(self):
+        # No cowork directory present at all — scan must not crash.
+        shutil.rmtree(self.cowork_root)
+        write_jsonl(
+            self.projects / "proj1" / "sess.jsonl",
+            [make_user_msg("hi")],
+        )
+
+        r = self._scan()["rollup"]
+        self.assertEqual(r["sessions"], 1)
+        self.assertEqual(r["cowork_sessions"], 0)
+
+    def test_queue_operation_in_non_cowork_session_is_ignored(self):
+        # Defense against future protocol drift — queue_events is a
+        # cowork-only metric. If a queue-operation event ever appears in
+        # an interactive transcript, it must NOT inflate queue_events.
+        write_jsonl(
+            self.projects / "proj1" / "interactive.jsonl",
+            [
+                make_user_msg("hi"),
+                {"type": "queue-operation", "operation": "enqueue"},
+            ],
+        )
+
+        r = self._scan()["rollup"]
+        self.assertEqual(r["queue_events"], 0)
+        self.assertEqual(r["cowork_sessions"], 0)
+
+    def test_uuid_in_any_mcp_segment_is_normalized(self):
+        # Both server-segment and trailing-segment UUIDs are swept, not just
+        # parts[1]. Defends against tool names of the shape
+        # `mcp__<uuid>__action__<uuid>` where one ID is the server and the
+        # other identifies a per-installation resource.
+        write_jsonl(
+            self.projects / "proj1" / "sess.jsonl",
+            [
+                make_tool_call(
+                    "mcp__4507b484-062b-4cc6-85ff-0862c2c5567a"
+                    "__action__6ab117fc-c70c-4338-9eb7-10d11d55df0c"
+                ),
+            ],
+        )
+
+        r = self._scan()["rollup"]
+
+        uuid_re = re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        )
+        for key in r["tool_name_counts"]:
+            self.assertIsNone(
+                uuid_re.search(key),
+                f"UUID-shaped key leaked into tool_name_counts: {key}",
+            )
+        self.assertIn("mcp__dynamic__action__dynamic", r["tool_name_counts"])
+
+    def test_multiple_cowork_sessions_same_day(self):
+        # Two distinct cowork JSONLs — should count as two cowork sessions.
+        write_jsonl(
+            self.cowork_projects / "conv1.jsonl",
+            [make_user_msg("task A")],
+        )
+        # A second session may live under a second local_* sandbox, simulating
+        # two independent cowork runs.
+        other_sandbox = (
+            self.cowork_root
+            / "acct-uuid"
+            / "ws-uuid"
+            / "local_other"
+            / ".claude"
+            / "projects"
+            / "another-proj"
+        )
+        other_sandbox.mkdir(parents=True)
+        write_jsonl(
+            other_sandbox / "conv2.jsonl",
+            [make_user_msg("task B")],
+        )
+
+        r = self._scan()["rollup"]
+        self.assertEqual(r["cowork_sessions"], 2)
+        self.assertEqual(r["cowork_messages"], 2)
 
 
 if __name__ == "__main__":

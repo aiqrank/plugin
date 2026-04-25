@@ -248,9 +248,15 @@ def _post_by_source(
     inferred_role: str,
     logger: logging.Logger,
 ) -> bool:
-    """POST by_source payload, chunking Codex if payload exceeds PAYLOAD_SIZE_LIMIT_BYTES.
+    """POST by_source payload, chunking either source if payload exceeds PAYLOAD_SIZE_LIMIT_BYTES.
 
-    Claude daily is always sent in full on each POST (assumed small enough).
+    Both `claude_daily` and `codex_daily` can grow large — `claude_daily` now
+    includes Claude Cowork sessions, which can produce dense daily entries.
+    When the combined payload is over the cap, both sources are split into
+    <=CODEX_CHUNK_DAYS-day windows and paired index-wise. The longer source's
+    window count drives the loop; the shorter source's missing windows are
+    sent as an empty list.
+
     On the final successful chunk, caller should update cursors.
 
     Returns True on full success, False on any HTTP/network error.
@@ -272,13 +278,22 @@ def _post_by_source(
             logger.info("error network")
             return False
 
-    # Over limit: chunk Codex daily into <=CODEX_CHUNK_DAYS-day windows.
-    logger.info(f"codex payload {body_bytes}B > limit, chunking")
-    chunks = _chunk_daily(codex_daily, CODEX_CHUNK_DAYS)
+    # Over limit: chunk both daily lists into <=CODEX_CHUNK_DAYS-day windows
+    # and pair them index-wise. Either list can be empty.
+    logger.info(f"payload {body_bytes}B > limit, chunking")
+    claude_chunks = _chunk_daily(claude_daily, CODEX_CHUNK_DAYS)
+    codex_chunks = _chunk_daily(codex_daily, CODEX_CHUNK_DAYS)
+    n_chunks = max(len(claude_chunks), len(codex_chunks))
 
-    for i, chunk in enumerate(chunks):
+    for i in range(n_chunks):
+        claude_chunk = claude_chunks[i] if i < len(claude_chunks) else []
+        codex_chunk = codex_chunks[i] if i < len(codex_chunks) else []
         chunk_payload = _build_by_source_payload(
-            device_id, claude_daily, chunk, unknown_event_types if i == 0 else {}, inferred_role
+            device_id,
+            claude_chunk,
+            codex_chunk,
+            unknown_event_types if i == 0 else {},
+            inferred_role,
         )
         try:
             _post_upload(chunk_payload)

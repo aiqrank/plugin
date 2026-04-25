@@ -294,19 +294,82 @@ class HookUploadTests(unittest.TestCase):
         # Must have posted more than one chunk.
         self.assertGreater(len(posted_bodies), 1, "expected multiple chunks for large Codex backfill")
 
-        # Every chunk must have by_source and the full claude_code daily.
+        # Every chunk must have by_source.
         for body in posted_bodies:
             self.assertIn("by_source", body)
-            self.assertEqual(body["by_source"]["claude_code"]["daily"], fake_claude["daily"])
 
-        # Each chunk's Codex daily must be <= CODEX_CHUNK_DAYS entries.
+        # Each chunk's Claude AND Codex daily must be <= CODEX_CHUNK_DAYS entries.
         for body in posted_bodies:
+            claude_chunk = body["by_source"]["claude_code"]["daily"]
             codex_chunk = body["by_source"]["codex"]["daily"]
+            self.assertLessEqual(len(claude_chunk), self.mod.CODEX_CHUNK_DAYS)
             self.assertLessEqual(len(codex_chunk), self.mod.CODEX_CHUNK_DAYS)
 
-        # Total Codex entries across all chunks must equal original.
-        total_codex = sum(len(b["by_source"]["codex"]["daily"]) for b in posted_bodies)
-        self.assertEqual(total_codex, len(codex_daily))
+        # Union across chunks must equal originals (no entries lost or duplicated).
+        all_claude = [e for b in posted_bodies for e in b["by_source"]["claude_code"]["daily"]]
+        all_codex = [e for b in posted_bodies for e in b["by_source"]["codex"]["daily"]]
+        self.assertEqual(all_claude, fake_claude["daily"])
+        self.assertEqual(len(all_codex), len(codex_daily))
+
+    def test_large_claude_daily_alone_is_chunked(self):
+        """A heavy Claude (cowork) backfill that exceeds 400 KB is split, even
+        when Codex is small or absent. Pre-cowork the claude side never grew
+        large; post-cowork it can.
+        """
+        self._setup_device()
+        self.mod.CODEX_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+        big_metrics = {
+            "sessions": 5,
+            "messages": 100,
+            "cowork_sessions": 4,
+            "cowork_messages": 80,
+            "queue_events": 200,
+            "data": "x" * 8000,
+        }
+        claude_daily = [
+            {"date": f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}", "metrics": big_metrics}
+            for i in range(80)
+        ]
+
+        fake_claude = {"daily": claude_daily, "inferred_role": "engineer"}
+        fake_codex = self._make_fake_codex_metrics(1)
+
+        posted_bodies = []
+
+        class FakeResp:
+            def __init__(self):
+                self._b = json.dumps({"teaser_url": "https://x/t", "device_id": "d"}).encode()
+
+            def read(self):
+                return self._b
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data)
+            posted_bodies.append(body)
+            return FakeResp()
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_claude), mock.patch.object(
+            self.mod, "_maybe_scan_codex", return_value=fake_codex
+        ), mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self._invoke_silent()
+
+        self.assertGreater(len(posted_bodies), 1, "expected multiple chunks for large Claude backfill")
+
+        # Every chunk must respect the per-source size cap.
+        for body in posted_bodies:
+            claude_chunk = body["by_source"]["claude_code"]["daily"]
+            self.assertLessEqual(len(claude_chunk), self.mod.CODEX_CHUNK_DAYS)
+
+        # No entries lost or duplicated.
+        all_claude = [e for b in posted_bodies for e in b["by_source"]["claude_code"]["daily"]]
+        self.assertEqual(len(all_claude), len(claude_daily))
 
     def test_chunk_daily_helper(self):
         """_chunk_daily splits a list into sublists of at most chunk_size."""

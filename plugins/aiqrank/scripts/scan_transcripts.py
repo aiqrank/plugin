@@ -2,10 +2,21 @@
 """
 AIQ Rank transcript scanner.
 
-Walks ~/.claude/projects/* and extracts activity metrics from Claude Code
-transcripts modified in the last 30 days. Buckets every event by its
-local-calendar-day timestamp, emits a `daily` array (one entry per day
-that had activity) plus a `rollup` aggregate over the full window.
+Walks two roots and extracts activity metrics from the last 30 days:
+
+  1. ~/.claude/projects/*              — interactive Claude Code sessions
+  2. ~/Library/Application Support/Claude/local-agent-mode-sessions/
+       {account}/{workspace}/local_*/.claude/projects/*  — Claude Cowork
+       (Local Agent Mode) autonomous sessions
+
+Events from both roots are merged under a single `claude_code` source.
+Cowork events also increment `cowork_sessions` / `cowork_messages` /
+`queue_events` so the profile page can surface the autonomous-vs-
+interactive split without splitting the leaderboard.
+
+Buckets every event by its local-calendar-day timestamp, emits a `daily`
+array (one entry per day that had activity) plus a `rollup` aggregate
+over the full window.
 
 Output JSON:
 
@@ -83,6 +94,35 @@ _CORRECTION_RE = re.compile(
 
 _CORRECTION_SCAN_PREFIX = 120
 
+# Claude Desktop / cowork spawns MCP servers with a per-installation UUID in
+# the tool name, e.g. `mcp__4507b484-062b-4cc6-85ff-0862c2c5567a__search`.
+# Those UUIDs are device-identifying. Bucket them under a single sentinel so
+# we keep the usage signal without shipping IDs.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_DYNAMIC_MCP_SENTINEL = "dynamic"
+
+
+def _normalize_tool_name(name: str) -> str:
+    """Replace UUID-shaped MCP segments with a stable sentinel.
+
+    `mcp__<uuid>__<action>` → `mcp__dynamic__<action>`. Every segment after
+    the `mcp__` prefix is checked, not just the server segment, so any
+    UUID-shaped identifier embedded in the action portion is also
+    bucketed. Non-MCP names pass through unchanged.
+    """
+    if not name.startswith("mcp__"):
+        return name
+    parts = name.split("__")
+    replaced = False
+    for i in range(1, len(parts)):
+        if _UUID_RE.match(parts[i]):
+            parts[i] = _DYNAMIC_MCP_SENTINEL
+            replaced = True
+    return "__".join(parts) if replaced else name
+
 # Field aggregation rules — must match AIQRank.Metrics module attributes.
 _COUNT_FIELDS = (
     "sessions",
@@ -105,6 +145,9 @@ _COUNT_FIELDS = (
     "tokens_cache_read",
     "tokens_cache_creation",
     "tokens_total",
+    "cowork_sessions",
+    "cowork_messages",
+    "queue_events",
 )
 
 _PEAK_FIELDS = (
@@ -142,16 +185,32 @@ def scan(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now_ts: float | None = None,
     mtime_after_ts: float | None = None,
+    cowork_root: Path | None = None,
 ) -> dict:
-    """Scan ~/.claude for transcript data within the last `window_days`.
+    """Scan Claude Code + Claude Cowork transcripts within the last `window_days`.
 
     Returns `{window_days, daily, rollup, first_messages_sample}` where
     `daily` is a date-sorted list of per-day metrics blobs.
+
+    `cowork_root` overrides the default cowork sandbox location; tests use
+    this to point at a synthetic tree.
     """
     home = claude_dir or Path.home() / ".claude"
     projects = home / "projects"
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
+
+    # `cowork_root` resolution:
+    #   - explicit value (tests, custom installs) is always honored
+    #   - production (`claude_dir=None`) walks the real Application Support path
+    #   - tests overriding `claude_dir` without `cowork_root` get a sentinel
+    #     non-existent path so they never accidentally read real user data
+    if cowork_root is None:
+        cowork_root = (
+            _default_cowork_root()
+            if claude_dir is None
+            else home / "__cowork_disabled__"
+        )
 
     daily: dict[date, dict] = {}
     first_messages_sample: list[str] = []
@@ -173,6 +232,7 @@ def scan(
                     custom_skills_seen,
                     intervals_by_day,
                     is_main,
+                    is_cowork=False,
                 )
 
             meta_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
@@ -191,6 +251,23 @@ def scan(
                         )
                 except (json.JSONDecodeError, OSError):
                     continue
+
+    # Cowork root: same Claude Code JSONL format, but nested inside sandboxed
+    # session directories at .../local_*/.claude/projects/<projectDir>/*.jsonl.
+    # Events count toward the same claude_code source; cowork-specific
+    # counters let the profile page surface the split.
+    for jsonl_path in iter_cowork_transcript_files(
+        cowork_root, cutoff_ts, mtime_after_ts
+    ):
+        process_session(
+            jsonl_path,
+            daily,
+            first_messages_sample,
+            custom_skills_seen,
+            intervals_by_day,
+            is_main=True,
+            is_cowork=True,
+        )
 
     # Per-day concurrency from sweep-line over each day's clipped intervals.
     for d, intervals in intervals_by_day.items():
@@ -276,6 +353,43 @@ def _ts_to_date(ts: float | None) -> date | None:
     return datetime.fromtimestamp(ts).date()
 
 
+def _default_cowork_root() -> Path:
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "Claude"
+        / "local-agent-mode-sessions"
+    )
+
+
+def iter_cowork_transcript_files(
+    cowork_root: Path,
+    cutoff_ts: float,
+    mtime_after_ts: float | None = None,
+) -> Iterable[Path]:
+    """Yields cowork transcript JSONL paths within the cutoff.
+
+    Cowork sandboxes live at:
+      {cowork_root}/{account}/{workspace}/local_*/.claude/projects/{proj}/*.jsonl
+
+    Scoped glob guards against wandering into audit logs, sessions/, etc.
+    """
+    if not cowork_root.is_dir():
+        return
+
+    effective_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+
+    for jsonl_path in cowork_root.glob(
+        "*/*/local_*/.claude/projects/*/*.jsonl"
+    ):
+        try:
+            if jsonl_path.stat().st_mtime >= effective_cutoff:
+                yield jsonl_path
+        except OSError:
+            continue
+
+
 def iter_transcript_files(
     project_dir: Path,
     cutoff_ts: float,
@@ -301,16 +415,21 @@ def iter_transcript_files(
 def process_session(
     path: Path,
     daily: dict[date, dict],
-    first_messages_sample: list,
+    first_messages_sample: list[str],
     custom_skills_seen: set[str],
     intervals_by_day: dict[date, list[tuple[float, float]]],
     is_main: bool = True,
+    is_cowork: bool = False,
 ) -> None:
     """Parse a single JSONL transcript and update per-day buckets.
 
     All counts are bucketed by each event's own timestamp date, so a session
     that crosses midnight contributes to two days. Session-level booleans
     (sessions, sessions_with_tools, ...) count once per (session, day).
+
+    When `is_cowork` is True, cowork-specific counters (cowork_messages,
+    queue_events) are also incremented, and days on which the session had
+    activity contribute to cowork_sessions.
     """
     # Per-session-per-day: which days saw which kinds of activity.
     days_seen: set[date] = set()
@@ -353,11 +472,25 @@ def process_session(
                 msg = event.get("message") or {}
                 ts = _parse_timestamp(event.get("timestamp"))
                 d = _ts_to_date(ts) or fallback_date
+                event_type = event.get("type")
+
+                # Cowork emits queue-operation events (enqueue/dequeue) alongside
+                # real messages. They're not conversational turns — count them
+                # separately and skip the message bookkeeping. The is_cowork
+                # guard documents intent: queue_events is a cowork-only metric;
+                # if Claude Code ever emits these events from interactive
+                # sessions, they should not silently inflate this counter.
+                if event_type == "queue-operation":
+                    if is_cowork:
+                        _bucket(daily, d)["queue_events"] += 1
+                    continue
 
                 bucket = _bucket(daily, d)
                 bucket["messages"] += 1
                 msgs_per_day[d] = msgs_per_day.get(d, 0) + 1
                 days_seen.add(d)
+                if is_cowork:
+                    bucket["cowork_messages"] += 1
 
                 if ts is not None:
                     if d not in earliest_per_day or ts < earliest_per_day[d]:
@@ -414,6 +547,8 @@ def process_session(
                         name = tool_use.get("name", "")
                         if not name:
                             continue
+
+                        name = _normalize_tool_name(name)
 
                         bucket["tool_name_counts"][name] = (
                             bucket["tool_name_counts"].get(name, 0) + 1
@@ -479,6 +614,8 @@ def process_session(
         bucket["sessions"] += 1
         if is_main:
             bucket["main_sessions"] += 1
+        if is_cowork:
+            bucket["cowork_sessions"] += 1
     for d in days_with_tools:
         _bucket(daily, d)["sessions_with_tools"] += 1
     for d in days_with_orchestration:
