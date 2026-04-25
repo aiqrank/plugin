@@ -7,11 +7,11 @@
           {
             "type": "command",
             "timeout": 2,
-            "command": "python3 $CLAUDE_PLUGIN_ROOT/scripts/hook_nudge_if_stale.py"
+            "command": "PLUGIN_ROOT=\"${CLAUDE_PLUGIN_ROOT:-$(ls -d ~/.claude/plugins/cache/aiqrank/aiqrank/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')}\"; [ -n \"$PLUGIN_ROOT\" ] && [ -d \"$PLUGIN_ROOT/scripts\" ] || exit 0; python3 \"$PLUGIN_ROOT/scripts/hook_nudge_if_stale.py\""
           },
           {
             "type": "command",
-            "command": "nohup python3 $CLAUDE_PLUGIN_ROOT/scripts/hook_upload_today.py </dev/null >/dev/null 2>&1 &"
+            "command": "PLUGIN_ROOT=\"${CLAUDE_PLUGIN_ROOT:-$(ls -d ~/.claude/plugins/cache/aiqrank/aiqrank/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')}\"; [ -n \"$PLUGIN_ROOT\" ] && [ -d \"$PLUGIN_ROOT/scripts\" ] || exit 0; nohup python3 \"$PLUGIN_ROOT/scripts/hook_upload_today.py\" </dev/null >/dev/null 2>&1 &"
           }
         ]
       }
