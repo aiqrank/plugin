@@ -121,6 +121,7 @@ class HookUploadTests(unittest.TestCase):
         payload = json.loads(captured_requests[0].data.decode("utf-8"))
         self.assertEqual(payload["inferred_role"], "engineer")
         self.assertNotIn("first_messages_sample", payload)
+        self.assertTrue(captured_requests[0].get_header("User-agent", "").startswith("aiqrank-plugin/"))
 
     # --- new tests: Codex absent path ---
 

@@ -59,6 +59,7 @@ class UploadMetricsTests(unittest.TestCase):
         def fake_urlopen(req, timeout=30):
             captured["url"] = req.full_url
             captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["user_agent"] = req.get_header("User-agent", "")
             return FakeResponse(response_body)
 
         argv = ["--metrics", str(self.metrics_path), "--role", "engineer"]
@@ -82,6 +83,7 @@ class UploadMetricsTests(unittest.TestCase):
         self.assertIn("daily", captured["body"])
         self.assertEqual(captured["body"]["inferred_role"], "engineer")
         self.assertNotIn("device_id", captured["body"])
+        self.assertTrue(captured["user_agent"].startswith("aiqrank-plugin/"))
         # Device.json persisted
         self.assertTrue(self.mod.DEVICE_PATH.exists())
         saved = json.loads(self.mod.DEVICE_PATH.read_text())

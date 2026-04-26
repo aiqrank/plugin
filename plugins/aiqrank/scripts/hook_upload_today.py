@@ -24,6 +24,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _version import USER_AGENT  # noqa: E402
 from infer_role import classify_role  # noqa: E402
 
 DEFAULT_BASE_URL = "https://aiqrank.com"
@@ -412,6 +413,7 @@ def _post_upload(payload: dict) -> dict:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )
