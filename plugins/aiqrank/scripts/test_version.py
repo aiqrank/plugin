@@ -22,6 +22,12 @@ class VersionParityTests(unittest.TestCase):
         manifest = json.loads(plugin_json.read_text())
         self.assertEqual(PLUGIN_VERSION, manifest["version"])
 
+    def test_plugin_version_matches_marketplace_json(self):
+        marketplace_json = Path(__file__).resolve().parent.parent.parent.parent / ".claude-plugin" / "marketplace.json"
+        marketplace = json.loads(marketplace_json.read_text())
+        entry = next(p for p in marketplace["plugins"] if p["name"] == "aiqrank")
+        self.assertEqual(PLUGIN_VERSION, entry["version"])
+
     def test_user_agent_well_formed(self):
         self.assertTrue(USER_AGENT.startswith("aiqrank-plugin/"))
         self.assertIn(PLUGIN_VERSION, USER_AGENT)
