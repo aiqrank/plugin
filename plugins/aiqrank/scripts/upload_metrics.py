@@ -58,13 +58,34 @@ def main(argv: list[str]) -> int:
         return 1
 
     daily = metrics.get("daily") if isinstance(metrics, dict) else None
-    if not isinstance(daily, list) or not daily:
+    by_source = metrics.get("by_source") if isinstance(metrics, dict) else None
+
+    has_legacy = isinstance(daily, list) and daily
+    has_by_source = (
+        isinstance(by_source, dict)
+        and any(
+            isinstance(s, dict) and isinstance(s.get("daily"), list) and s["daily"]
+            for s in by_source.values()
+        )
+    )
+
+    if not has_legacy and not has_by_source:
         fail("no daily metrics to upload")
         return 1
 
     device_id = load_device_id()
 
-    payload: dict = {"daily": daily, "inferred_role": args.role}
+    payload: dict = {"inferred_role": args.role}
+    if has_by_source:
+        # Server-side controller prefers `by_source` and ignores `daily`
+        # when both are present, but keep `daily` for older server builds.
+        payload["by_source"] = {
+            source: {"daily": s.get("daily") or []}
+            for source, s in by_source.items()
+            if isinstance(s, dict) and isinstance(s.get("daily"), list) and s["daily"]
+        }
+    if has_legacy:
+        payload["daily"] = daily
     if device_id:
         payload["device_id"] = device_id
 

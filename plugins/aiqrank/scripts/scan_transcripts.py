@@ -2,38 +2,59 @@
 """
 AIQ Rank transcript scanner.
 
-Walks two roots and extracts activity metrics from the last 30 days:
+Walks three roots and extracts activity metrics from the last 30 days:
 
   1. ~/.claude/projects/*              — interactive Claude Code sessions
   2. ~/Library/Application Support/Claude/local-agent-mode-sessions/
        {account}/{workspace}/local_*/.claude/projects/*  — Claude Cowork
        (Local Agent Mode) autonomous sessions
+  3. ~/.codex/sessions/**/rollout-*.jsonl — Codex CLI rollouts (optional)
 
-Events from both roots are merged under a single `claude_code` source.
-Cowork events also increment `cowork_sessions` / `cowork_messages` /
-`queue_events` so the profile page can surface the autonomous-vs-
-interactive split without splitting the leaderboard.
+Events are bucketed into per-source dicts:
+
+  - `claude_code` — interactive sessions under ~/.claude/projects/
+  - `cowork`       — autonomous local-agent-mode sessions, plus any session
+                     whose initialMessage marks it as a scheduled-task run.
+  - `codex`        — Codex CLI rollouts (only emitted when ~/.codex/ exists)
+
+Cowork-specific counters (`cowork_sessions`, `cowork_messages`,
+`queue_events`, `scheduled_task_runs`, `scheduled_tasks_active`) only
+appear in the cowork bucket. All other counters (messages, tool calls,
+tokens, sessions, ...) follow the source they came from.
 
 Buckets every event by its local-calendar-day timestamp, emits a `daily`
-array (one entry per day that had activity) plus a `rollup` aggregate
-over the full window.
+array per source (one entry per day that had activity) plus a `rollup`
+aggregate over the full window per source.
 
 Output JSON:
 
     {
       "window_days": 30,
-      "daily": [
-        {"date": "YYYY-MM-DD", "metrics": { ...fields... }},
-        ...
-      ],
-      "rollup": { ...same fields, summed/maxed/merged across days... },
+      "by_source": {
+        "claude_code": {
+          "daily": [{"date": "YYYY-MM-DD", "metrics": {...}}, ...],
+          "rollup": {...},
+          "intervals_by_day": {"YYYY-MM-DD": [[start_ts, end_ts], ...]}
+        },
+        "cowork": {
+          "daily": [...], "rollup": {...}, "intervals_by_day": {...}
+        },
+        "codex": {
+          "daily": [...], "rollup": {...}, "intervals_by_day": {...}
+        }
+      },
       "first_messages_sample": [...]   # local-only, for role inference
     }
 
-The plugin sends only `daily` (filtered by latest_date cursor) plus role
-metadata to the server. The `first_messages_sample` never leaves the
-machine. The rollup is included so the unauthenticated pair/teaser flow
-can show preview totals without re-aggregating server-side.
+The `codex` source row is omitted when `~/.codex/` does not exist.
+
+The plugin sends each source's `daily` (filtered by latest_date cursor)
+plus role metadata to the server. The `first_messages_sample` never
+leaves the machine. The per-source rollup is included so the
+unauthenticated pair/teaser flow can show preview totals without
+re-aggregating server-side. Per-source `intervals_by_day` is local-only
+— the upload hook unions intervals across sources to compute a combined
+concurrency peak, then strips them before posting to the server.
 
 Python stdlib only (no third-party dependencies).
 """
@@ -53,6 +74,25 @@ from typing import Iterable
 # -- Constants --
 
 DEFAULT_WINDOW_DAYS = 30
+
+# A user's "max concurrent sessions" peak only counts if it held for at least
+# this many seconds within the day. A 30-second freak overlap (one tool
+# finishing as another starts) shouldn't move the metric. 300s (5 min) was
+# chosen by analyzing the per-day distribution of one heavy user: ≥300s lowers
+# the daily peak on ~50% of active days (typically by 1–2), while ≥600s
+# yields diminishing returns. Override via AIQRANK_MIN_SUSTAINED_SECS.
+DEFAULT_MIN_SUSTAINED_SECS = 300
+
+
+def min_sustained_secs() -> int:
+    raw = os.environ.get("AIQRANK_MIN_SUSTAINED_SECS")
+    if raw is None or raw == "":
+        return DEFAULT_MIN_SUSTAINED_SECS
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_MIN_SUSTAINED_SECS
+    return v if v >= 0 else DEFAULT_MIN_SUSTAINED_SECS
 CONTEXT_LEVERAGE_TOOLS = {
     "TaskCreate",
     "TaskUpdate",
@@ -68,6 +108,15 @@ ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
 PLAN_MODE_TOOL = "ExitPlanMode"
 AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
+
+# Codex-specific
+CODEX_TOOL_TYPES = {"function_call", "custom_tool_call", "tool_use", "local_shell_call"}
+CODEX_PATCH_FILE_RE = re.compile(
+    r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE
+)
+CODEX_SKILLS_DIR_FRAGMENT = "/.codex/skills/"
+CODEX_SKILL_NAME_RE = re.compile(r"\.codex/skills/([^/]+)/")
+CODEX_CONFIG_TOML_BASENAMES = ("/.codex/config.toml",)
 
 _CORRECTION_RE = re.compile(
     r"""
@@ -148,12 +197,15 @@ _COUNT_FIELDS = (
     "cowork_sessions",
     "cowork_messages",
     "queue_events",
+    "scheduled_task_runs",
+    "reasoning_blocks",
 )
 
 _PEAK_FIELDS = (
     "max_concurrent_sessions",
     "max_messages_in_session",
     "max_parallel_agents",
+    "scheduled_tasks_active",
 )
 
 _DICT_FIELDS = (
@@ -163,6 +215,11 @@ _DICT_FIELDS = (
     "agent_type_counts",
 )
 
+# List-valued fields that aggregate via set-union across days. Server-side
+# scoring reads `authored_skill_names` for `bespoke_practice` (Claude /
+# Codex / Cowork all share the helper).
+_LIST_FIELDS = ("authored_skill_names",)
+
 
 def _new_day_metrics() -> dict:
     """Empty metrics dict for one calendar day."""
@@ -171,7 +228,15 @@ def _new_day_metrics() -> dict:
         out[f] = 0
     for f in _DICT_FIELDS:
         out[f] = {}
+    for f in _LIST_FIELDS:
+        out[f] = []
     return out
+
+
+SOURCE_CLAUDE_CODE = "claude_code"
+SOURCE_COWORK = "cowork"
+SOURCE_CODEX = "codex"
+ALL_SOURCES = (SOURCE_CLAUDE_CODE, SOURCE_COWORK, SOURCE_CODEX)
 
 
 def _bucket(daily: dict[date, dict], d: date) -> dict:
@@ -186,14 +251,20 @@ def scan(
     now_ts: float | None = None,
     mtime_after_ts: float | None = None,
     cowork_root: Path | None = None,
+    scheduled_root: Path | None = None,
+    codex_dir: Path | None = None,
 ) -> dict:
-    """Scan Claude Code + Claude Cowork transcripts within the last `window_days`.
+    """Scan Claude Code + Claude Cowork + Codex transcripts within the last `window_days`.
 
-    Returns `{window_days, daily, rollup, first_messages_sample}` where
-    `daily` is a date-sorted list of per-day metrics blobs.
+    Returns the per-source envelope described in the module docstring. The
+    `codex` source row is omitted when `~/.codex/` does not exist.
 
     `cowork_root` overrides the default cowork sandbox location; tests use
-    this to point at a synthetic tree.
+    this to point at a synthetic tree. `scheduled_root` overrides the
+    Cowork scheduled-task definition directory (default
+    ~/Documents/Claude/Scheduled). `codex_dir` overrides the default Codex
+    root (~/.codex); pass a non-existent path to disable Codex scanning in
+    tests.
     """
     home = claude_dir or Path.home() / ".claude"
     projects = home / "projects"
@@ -212,13 +283,43 @@ def scan(
             else home / "__cowork_disabled__"
         )
 
-    daily: dict[date, dict] = {}
+    # Same resolution policy for the scheduled-task definitions root: tests
+    # that supply `claude_dir` get a sentinel non-existent path unless they
+    # explicitly opt in via `scheduled_root`.
+    if scheduled_root is None:
+        scheduled_root = (
+            _default_scheduled_root()
+            if claude_dir is None
+            else home / "__scheduled_disabled__"
+        )
+
+    # Codex root resolution: production walks the real ~/.codex; tests that
+    # override `claude_dir` get a sentinel non-existent path unless they
+    # explicitly opt in via `codex_dir`.
+    if codex_dir is None:
+        codex_dir = (
+            Path.home() / ".codex"
+            if claude_dir is None
+            else home / "__codex_disabled__"
+        )
+
+    # Per-source per-day metric buckets and main-session intervals.
+    daily_by_source: dict[str, dict[date, dict]] = {s: {} for s in ALL_SOURCES}
+    intervals_by_source: dict[str, dict[date, list[tuple[float, float]]]] = {
+        s: {} for s in ALL_SOURCES
+    }
     first_messages_sample: list[str] = []
     custom_skills_seen: set[str] = set()
-    # Per-day list of main-session intervals for sweep-line concurrency.
-    intervals_by_day: dict[date, list[tuple[float, float]]] = {}
+
+    # Snapshot the user's locally-owned skills (bare-name slash commands).
+    # Used by process_session to count `<command-name>/<n></command-name>`
+    # invocations that the Skill-tool path doesn't capture.
+    local_skills = _local_claude_skills(home)
 
     if projects.is_dir():
+        claude_daily = daily_by_source[SOURCE_CLAUDE_CODE]
+        claude_intervals = intervals_by_source[SOURCE_CLAUDE_CODE]
+
         for project_dir in sorted(projects.iterdir()):
             if not project_dir.is_dir():
                 continue
@@ -227,12 +328,13 @@ def scan(
                 is_main = "subagents" not in jsonl_path.parts
                 process_session(
                     jsonl_path,
-                    daily,
+                    claude_daily,
                     first_messages_sample,
                     custom_skills_seen,
-                    intervals_by_day,
+                    claude_intervals,
                     is_main,
                     is_cowork=False,
+                    local_skills=local_skills,
                 )
 
             meta_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
@@ -240,7 +342,7 @@ def scan(
                 if meta_path.stat().st_mtime < meta_cutoff:
                     continue
                 meta_date = datetime.fromtimestamp(meta_path.stat().st_mtime).date()
-                bucket = _bucket(daily, meta_date)
+                bucket = _bucket(claude_daily, meta_date)
                 try:
                     with meta_path.open("r") as fh:
                         data = json.load(fh)
@@ -254,40 +356,117 @@ def scan(
 
     # Cowork root: same Claude Code JSONL format, but nested inside sandboxed
     # session directories at .../local_*/.claude/projects/<projectDir>/*.jsonl.
-    # Events count toward the same claude_code source; cowork-specific
-    # counters let the profile page surface the split.
+    # Events land in the cowork source bucket.
+    cowork_daily = daily_by_source[SOURCE_COWORK]
+    cowork_intervals = intervals_by_source[SOURCE_COWORK]
     for jsonl_path in iter_cowork_transcript_files(
         cowork_root, cutoff_ts, mtime_after_ts
     ):
         process_session(
             jsonl_path,
-            daily,
+            cowork_daily,
             first_messages_sample,
             custom_skills_seen,
-            intervals_by_day,
+            cowork_intervals,
             is_main=True,
             is_cowork=True,
+            local_skills=local_skills,
         )
 
-    # Per-day concurrency from sweep-line over each day's clipped intervals.
-    for d, intervals in intervals_by_day.items():
-        bucket = _bucket(daily, d)
-        bucket["max_concurrent_sessions"] = _max_concurrent(intervals)
+    # Cowork scheduled-task runs: walk session manifests at workspace level
+    # (local_*.json siblings of the local_*/ sandbox dirs) and bucket each
+    # run whose initialMessage marks it as a scheduled-task firing. Always
+    # routed to the cowork source.
+    distinct_scheduled_task_ids = _count_scheduled_task_runs(
+        cowork_root, cowork_daily, cutoff_ts, mtime_after_ts
+    )
 
-    # Drop any days that recorded zero activity (a meta-only day with no
-    # parseable agentType, for example).
-    daily = {d: m for d, m in daily.items() if _has_activity(m)}
+    # Active scheduled-task definitions: prefer the on-disk count at
+    # ~/Documents/Claude/Scheduled/<slug>/SKILL.md, but fall back to the
+    # distinct count of schedules that actually fired in the window. macOS
+    # TCC blocks Documents/ iteration unless the host process has Full Disk
+    # Access — without the manifest fallback, FDA-less users score 0 even
+    # with active schedules. Written into the most recent cowork active day
+    # so it shows up in the cowork rollup peak.
+    active_count = _count_active_scheduled_tasks(scheduled_root)
+    if active_count == 0:
+        active_count = len(distinct_scheduled_task_ids)
+    if active_count > 0:
+        if cowork_daily:
+            latest_day = max(cowork_daily.keys())
+            _bucket(cowork_daily, latest_day)["scheduled_tasks_active"] = active_count
+        elif daily_by_source[SOURCE_CLAUDE_CODE]:
+            # Fallback: surface the peak in the cowork bucket attached to
+            # the latest interactive day so the count isn't dropped. The
+            # cowork bucket gains a single-day entry.
+            latest_day = max(daily_by_source[SOURCE_CLAUDE_CODE].keys())
+            _bucket(cowork_daily, latest_day)["scheduled_tasks_active"] = active_count
 
-    daily_list = [
-        {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
-    ]
+    # Codex root: walk ~/.codex/sessions/**/rollout-*.jsonl. Skipped silently
+    # when the directory doesn't exist (user hasn't installed Codex).
+    codex_emit = codex_dir.exists()
+    if codex_emit:
+        codex_daily = daily_by_source[SOURCE_CODEX]
+        codex_intervals = intervals_by_source[SOURCE_CODEX]
+        sessions_root = codex_dir / "sessions"
+        effective_cutoff = (
+            cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+        )
+        if sessions_root.is_dir():
+            for rollout_path in sessions_root.rglob("rollout-*.jsonl"):
+                try:
+                    if rollout_path.stat().st_mtime < effective_cutoff:
+                        continue
+                except OSError:
+                    continue
+                process_codex_session(rollout_path, codex_daily, codex_intervals)
 
-    rollup = _rollup_from_daily(daily.values())
+    # Per-day concurrency from sweep-line over each day's clipped intervals,
+    # computed per source. Only counts a level that held for
+    # >= min_sustained_secs within the day — see DEFAULT_MIN_SUSTAINED_SECS.
+    min_secs = min_sustained_secs()
+    for source in ALL_SOURCES:
+        for d, intervals in intervals_by_source[source].items():
+            bucket = _bucket(daily_by_source[source], d)
+            bucket["max_concurrent_sessions"] = max_concurrent_sustained(
+                intervals, min_secs
+            )
+
+    by_source: dict[str, dict] = {}
+    for source in ALL_SOURCES:
+        # Codex source is suppressed entirely when ~/.codex/ is absent; the
+        # other sources always emit (possibly with empty daily/rollup).
+        if source == SOURCE_CODEX and not codex_emit:
+            continue
+
+        # Drop days that recorded zero activity (a meta-only day with no
+        # parseable agentType, for example).
+        active_daily = {
+            d: m for d, m in daily_by_source[source].items() if _has_activity(m)
+        }
+        daily_list = [
+            {"date": d.isoformat(), "metrics": m}
+            for d, m in sorted(active_daily.items())
+        ]
+        rollup = _rollup_from_daily(active_daily.values())
+
+        # Serialize intervals as ISO-keyed lists so the upload hook can
+        # union them across sources to compute a combined peak. Stays
+        # local — the hook strips them before posting to the server.
+        intervals_serialized = {
+            d.isoformat(): [[s, e] for (s, e) in ivs]
+            for d, ivs in intervals_by_source[source].items()
+        }
+
+        by_source[source] = {
+            "daily": daily_list,
+            "rollup": rollup,
+            "intervals_by_day": intervals_serialized,
+        }
 
     return {
         "window_days": window_days,
-        "daily": daily_list,
-        "rollup": rollup,
+        "by_source": by_source,
         "first_messages_sample": first_messages_sample,
     }
 
@@ -300,12 +479,15 @@ def _has_activity(metrics: dict) -> bool:
         return True
     if any(metrics.get(f) for f in _DICT_FIELDS):
         return True
+    if any(metrics.get(f) for f in _LIST_FIELDS):
+        return True
     return False
 
 
 def _rollup_from_daily(per_day_metrics) -> dict:
     """Aggregate a sequence of daily metrics maps into a single rollup."""
     out = _new_day_metrics()
+    list_accums: dict[str, set[str]] = {f: set() for f in _LIST_FIELDS}
     for m in per_day_metrics:
         for f in _COUNT_FIELDS:
             out[f] = out.get(f, 0) + int(m.get(f, 0) or 0)
@@ -314,11 +496,25 @@ def _rollup_from_daily(per_day_metrics) -> dict:
         for f in _DICT_FIELDS:
             for k, v in (m.get(f) or {}).items():
                 out[f][k] = out[f].get(k, 0) + int(v or 0)
+        for f in _LIST_FIELDS:
+            for v in m.get(f) or []:
+                if isinstance(v, str) and v:
+                    list_accums[f].add(v)
+    for f in _LIST_FIELDS:
+        out[f] = sorted(list_accums[f])
     return out
 
 
-def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
-    """Sweep-line over (start, +1)/(end, -1); max running sum = concurrency."""
+def max_concurrent_sustained(
+    intervals: list[tuple[float, float]], min_secs: int = DEFAULT_MIN_SUSTAINED_SECS
+) -> int:
+    """Highest concurrency level that held for total >= min_secs.
+
+    Sweep-line accumulates time-at-each-level, then walks levels high-to-low
+    summing time-at-or-above. The first level whose cumulative time-at-or-
+    above reaches `min_secs` is the answer. With min_secs=0 this degenerates
+    to the absolute peak.
+    """
     if not intervals:
         return 0
 
@@ -328,13 +524,24 @@ def _max_concurrent(intervals: list[tuple[float, float]]) -> int:
         events.append((end, -1))
     events.sort()
 
+    time_at: dict[int, float] = {}
     current = 0
-    peak = 0
-    for _, delta in events:
+    prev_t: float | None = None
+    for t, delta in events:
+        if prev_t is not None and current > 0 and t > prev_t:
+            time_at[current] = time_at.get(current, 0.0) + (t - prev_t)
         current += delta
-        if current > peak:
-            peak = current
-    return peak
+        prev_t = t
+
+    if not time_at:
+        return 0
+
+    cumulative = 0.0
+    for level in sorted(time_at.keys(), reverse=True):
+        cumulative += time_at[level]
+        if cumulative >= min_secs:
+            return level
+    return 0
 
 
 def _parse_timestamp(value) -> float | None:
@@ -361,6 +568,101 @@ def _default_cowork_root() -> Path:
         / "Claude"
         / "local-agent-mode-sessions"
     )
+
+
+def _default_scheduled_root() -> Path:
+    """Cowork scheduled-task definitions live as one subdirectory per task,
+    each containing a SKILL.md. Convention is ~/Documents/Claude/Scheduled.
+    """
+    return Path.home() / "Documents" / "Claude" / "Scheduled"
+
+
+def _count_active_scheduled_tasks(scheduled_root: Path) -> int:
+    """Snapshot count of distinct scheduled-task definitions on disk.
+
+    Each task lives at {scheduled_root}/{slug}/SKILL.md. Counts subdirectories
+    whose SKILL.md exists. Returns 0 if the root doesn't exist.
+    """
+    if not scheduled_root.is_dir():
+        return 0
+    count = 0
+    try:
+        for entry in scheduled_root.iterdir():
+            if entry.is_dir() and (entry / "SKILL.md").is_file():
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def _count_scheduled_task_runs(
+    cowork_root: Path,
+    daily: dict,
+    cutoff_ts: float,
+    mtime_after_ts: float | None,
+) -> set[str]:
+    """Walk Cowork session manifests and increment scheduled_task_runs per day.
+
+    A session is a scheduled-task firing when its `initialMessage` starts with
+    `<scheduled-task` (the Cowork app prepends this wrapper to the session
+    prompt for scheduled runs). Bucketed by the local-calendar day of
+    `createdAt` (epoch ms).
+
+    Manifests live at {cowork_root}/{account}/{workspace}/local_*.json (a
+    sibling of the local_*/ sandbox directory).
+
+    Returns a set of distinct scheduled-task identifiers seen firing within
+    the window — caller uses its size as the `scheduled_tasks_active` peak
+    when the on-disk dir-scan is unavailable (macOS blocks `~/Documents/`
+    iteration unless the host process has Full Disk Access).
+    """
+    distinct_tasks: set[str] = set()
+    if not cowork_root.is_dir():
+        return distinct_tasks
+
+    effective_cutoff = (
+        cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+    )
+
+    for manifest_path in cowork_root.glob("*/*/local_*.json"):
+        try:
+            if manifest_path.stat().st_mtime < effective_cutoff:
+                continue
+        except OSError:
+            continue
+
+        try:
+            with manifest_path.open("r") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        initial = data.get("initialMessage")
+        if not isinstance(initial, str) or not initial.startswith("<scheduled-task"):
+            continue
+
+        created_ms = data.get("createdAt")
+        if not isinstance(created_ms, (int, float)) or created_ms <= 0:
+            continue
+        created_ts = created_ms / 1000.0
+        if created_ts < cutoff_ts:
+            continue
+
+        d = datetime.fromtimestamp(created_ts).date()
+        _bucket(daily, d)["scheduled_task_runs"] += 1
+
+        # Identify the schedule that fired. Prefer scheduledTaskId (stable
+        # across renames); fall back to parsing `name="..."` from the
+        # <scheduled-task> wrapper. Either uniquely identifies a definition.
+        task_id = data.get("scheduledTaskId")
+        if isinstance(task_id, str) and task_id:
+            distinct_tasks.add(task_id)
+        else:
+            m = _SCHEDULED_TASK_NAME_RE.search(initial)
+            if m:
+                distinct_tasks.add(m.group(1))
+
+    return distinct_tasks
 
 
 def iter_cowork_transcript_files(
@@ -420,16 +722,20 @@ def process_session(
     intervals_by_day: dict[date, list[tuple[float, float]]],
     is_main: bool = True,
     is_cowork: bool = False,
+    local_skills: set[str] | None = None,
 ) -> None:
     """Parse a single JSONL transcript and update per-day buckets.
 
-    All counts are bucketed by each event's own timestamp date, so a session
-    that crosses midnight contributes to two days. Session-level booleans
-    (sessions, sessions_with_tools, ...) count once per (session, day).
+    `daily` and `intervals_by_day` belong to a single source — caller picks
+    the cowork or claude_code dict before invoking. All counts are bucketed
+    by each event's own timestamp date, so a session that crosses midnight
+    contributes to two days. Session-level booleans (sessions,
+    sessions_with_tools, ...) count once per (session, day).
 
-    When `is_cowork` is True, cowork-specific counters (cowork_messages,
-    queue_events) are also incremented, and days on which the session had
-    activity contribute to cowork_sessions.
+    When `is_cowork` is True, the cowork-specific counters (cowork_messages,
+    queue_events, cowork_sessions) are populated alongside the regular
+    counters in the (cowork) source's bucket. When `is_cowork` is False,
+    those counters remain 0.
     """
     # Per-session-per-day: which days saw which kinds of activity.
     days_seen: set[date] = set()
@@ -522,6 +828,20 @@ def process_session(
                             first_messages_sample.append(text[:500])
                             first_user_msg_captured = True
 
+                        # Slash-command invocations of locally-owned skills.
+                        # Plugin skills (containing `:`) are skipped — they
+                        # already register via the Skill tool path. Bare-name
+                        # invocations of skills present on disk count as
+                        # practice for `bespoke_practice` / `practice_depth`.
+                        if local_skills:
+                            for cmd_name in _COMMAND_NAME_RE.findall(text):
+                                if ":" in cmd_name:
+                                    continue
+                                if cmd_name in local_skills:
+                                    bucket["skill_counts"][cmd_name] = (
+                                        bucket["skill_counts"].get(cmd_name, 0) + 1
+                                    )
+
                 if event.get("type") == "assistant":
                     turn_tool_uses = list(extract_tool_uses(msg))
 
@@ -581,6 +901,18 @@ def process_session(
 
                         if name in ("Write", "Edit"):
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
+
+                            # Track authorship: any Write/Edit under
+                            # ~/.claude/skills/<name>/** counts as authoring
+                            # that skill (excluding aiqrank itself).
+                            if (
+                                "/.claude/skills/" in target_path
+                                and AIQRANK_SKILL_DIR_FRAGMENT not in target_path
+                            ):
+                                skill_name = _claude_skill_name_from_path(target_path)
+                                if skill_name and skill_name not in bucket["authored_skill_names"]:
+                                    bucket["authored_skill_names"].append(skill_name)
+
                             if (
                                 target_path.endswith("/SKILL.md")
                                 and AIQRANK_SKILL_DIR_FRAGMENT not in target_path
@@ -638,6 +970,59 @@ def process_session(
             intervals_by_day.setdefault(d, []).append((start, end))
 
 
+def _claude_skill_name_from_path(file_path: str) -> str | None:
+    """Extract `<name>` from a `~/.claude/skills/<name>/...` path."""
+    marker = "/.claude/skills/"
+    idx = file_path.find(marker)
+    if idx < 0:
+        return None
+    rest = file_path[idx + len(marker):]
+    if not rest or "/" not in rest:
+        # Allow paths like /.claude/skills/<name> with no trailing /
+        return rest or None
+    name = rest.split("/", 1)[0]
+    return name or None
+
+
+def _local_claude_skills(home: Path) -> set[str]:
+    """Snapshot of locally-owned Claude skills (bare names, no plugin namespace).
+
+    A "local skill" is a subdirectory of `~/.claude/skills/` containing a
+    SKILL.md file. These are skills the user authored or installed manually
+    on this machine — they're invoked via `/<name>` slash commands and do
+    NOT appear in `skill_counts` via the Skill tool path (that path captures
+    plugin-namespaced skills like `compound-engineering:ce-plan`).
+
+    Returns a set of bare names, or an empty set if `~/.claude/skills/` is
+    missing or unreadable. Excludes the aiqrank self-skill.
+    """
+    skills_dir = home / "skills"
+    if not skills_dir.is_dir():
+        return set()
+    names: set[str] = set()
+    try:
+        for entry in skills_dir.iterdir():
+            if entry.name == "aiqrank":
+                continue
+            if entry.is_dir() and (entry / "SKILL.md").is_file():
+                names.add(entry.name)
+    except OSError:
+        return set()
+    return names
+
+
+# Slash-command marker emitted by Claude Code in the user message body when
+# a `/<name>` invocation fires. Captures both bare names (`/pr-recap`) and
+# plugin-namespaced names (`/compound-engineering:ce-review`). Only the
+# bare-name matches are routed into `skill_counts` here, since plugin
+# invocations already register through the Skill tool path.
+_COMMAND_NAME_RE = re.compile(r"<command-name>/([\w:-]+)</command-name>")
+
+# Extracts the schedule slug from a Cowork manifest's initialMessage prefix:
+#   <scheduled-task name="daily-meeting-briefing" file="...">
+_SCHEDULED_TASK_NAME_RE = re.compile(r'<scheduled-task\s+name="([^"]+)"')
+
+
 def extract_tool_uses(message: dict) -> Iterable[dict]:
     content = message.get("content")
     if isinstance(content, list):
@@ -661,6 +1046,289 @@ def content_to_text(content) -> str:
         return " ".join(parts)
 
     return ""
+
+
+# --- Codex scanner ----------------------------------------------------------
+
+
+def scan_codex(
+    codex_dir: Path,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+    now_ts: float | None = None,
+    mtime_after_ts: float | None = None,
+) -> dict | None:
+    """Scan `codex_dir/sessions/` for Codex CLI transcript data.
+
+    Returns `{daily: [...], rollup: {...}}` or `None` when `codex_dir` does
+    not exist (e.g. the user has not installed Codex). Standalone helper
+    primarily used by tests; the main `scan()` orchestrator inlines this
+    walk so it can share `_LIST_FIELDS` accumulators with the other sources.
+    """
+    if not codex_dir.exists():
+        return None
+
+    sessions_root = codex_dir / "sessions"
+    now_ts = now_ts or time.time()
+    cutoff_ts = now_ts - (window_days * 86400)
+    effective_cutoff = (
+        cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+    )
+
+    daily: dict[date, dict] = {}
+    intervals_by_day: dict[date, list[tuple[float, float]]] = {}
+
+    if sessions_root.is_dir():
+        for rollout_path in sessions_root.rglob("rollout-*.jsonl"):
+            try:
+                if rollout_path.stat().st_mtime < effective_cutoff:
+                    continue
+            except OSError:
+                continue
+            process_codex_session(rollout_path, daily, intervals_by_day)
+
+    min_secs = min_sustained_secs()
+    for d, intervals in intervals_by_day.items():
+        bucket = _bucket(daily, d)
+        bucket["max_concurrent_sessions"] = max_concurrent_sustained(
+            intervals, min_secs
+        )
+
+    daily = {d: m for d, m in daily.items() if _has_activity(m)}
+    daily_list = [
+        {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
+    ]
+    rollup = _rollup_from_daily(daily.values())
+
+    return {"daily": daily_list, "rollup": rollup}
+
+
+def process_codex_session(
+    path: Path,
+    daily: dict[date, dict],
+    intervals_by_day: dict[date, list[tuple[float, float]]],
+) -> None:
+    """Parse one Codex rollout JSONL file into per-day buckets."""
+    days_seen: set[date] = set()
+    days_with_tools: set[date] = set()
+    days_with_orchestration: set[date] = set()
+    days_with_plan_mode: set[date] = set()
+    msgs_per_day: dict[date, int] = {}
+    earliest_per_day: dict[date, float] = {}
+    latest_per_day: dict[date, float] = {}
+
+    try:
+        fallback_date = datetime.fromtimestamp(path.stat().st_mtime).date()
+    except OSError:
+        return
+
+    try:
+        with path.open("r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                ev_type = event.get("type")
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+
+                ts = _parse_timestamp(event.get("timestamp"))
+                d = _ts_to_date(ts) or fallback_date
+
+                if ts is not None:
+                    if d not in earliest_per_day or ts < earliest_per_day[d]:
+                        earliest_per_day[d] = ts
+                    if d not in latest_per_day or ts > latest_per_day[d]:
+                        latest_per_day[d] = ts
+
+                bucket = _bucket(daily, d)
+
+                if ev_type == "response_item":
+                    bucket["messages"] += 1
+                    msgs_per_day[d] = msgs_per_day.get(d, 0) + 1
+                    days_seen.add(d)
+
+                    p_type = payload.get("type")
+                    if p_type == "reasoning":
+                        bucket["reasoning_blocks"] += 1
+                    elif p_type in CODEX_TOOL_TYPES:
+                        _process_codex_tool_call(
+                            payload,
+                            bucket,
+                            days_with_orchestration,
+                            days_with_plan_mode,
+                            d,
+                        )
+                        days_with_tools.add(d)
+                elif ev_type == "event_msg":
+                    p_type = payload.get("type")
+                    if p_type == "token_count":
+                        info = payload.get("info")
+                        if isinstance(info, dict):
+                            usage = info.get("last_token_usage") or {}
+                            if isinstance(usage, dict):
+                                ti = int(usage.get("input_tokens") or 0)
+                                to = int(usage.get("output_tokens") or 0)
+                                tr = int(usage.get("cached_input_tokens") or 0)
+                                # Codex doesn't separately report cache-creation
+                                # tokens; leave that field zero.
+                                bucket["tokens_input"] += ti
+                                bucket["tokens_output"] += to
+                                bucket["tokens_cache_read"] += tr
+                                bucket["tokens_total"] += ti + to + tr
+    except OSError:
+        return
+
+    for d in days_seen:
+        bucket = _bucket(daily, d)
+        bucket["sessions"] += 1
+        bucket["main_sessions"] += 1
+    for d in days_with_tools:
+        _bucket(daily, d)["sessions_with_tools"] += 1
+    for d in days_with_orchestration:
+        _bucket(daily, d)["sessions_with_orchestration"] += 1
+    for d in days_with_plan_mode:
+        _bucket(daily, d)["sessions_with_plan_mode"] += 1
+
+    for d, count in msgs_per_day.items():
+        bucket = _bucket(daily, d)
+        if count > bucket["max_messages_in_session"]:
+            bucket["max_messages_in_session"] = count
+
+    for d, start in earliest_per_day.items():
+        end = latest_per_day.get(d, start)
+        if end == start:
+            end = start + 1.0
+        intervals_by_day.setdefault(d, []).append((start, end))
+
+
+def _process_codex_tool_call(
+    payload: dict,
+    bucket: dict,
+    days_with_orchestration: set[date],
+    days_with_plan_mode: set[date],
+    d: date,
+) -> None:
+    """Apply the field-level effects of one Codex tool-call payload."""
+    name = payload.get("name") or ""
+    bucket["tool_calls"] += 1
+
+    if name:
+        bucket["tool_name_counts"][name] = (
+            bucket["tool_name_counts"].get(name, 0) + 1
+        )
+
+    # MCP-style names map to the same `mcp__<server>__*` convention as
+    # Claude — preserve the helper. (Codex sessions in the wild rarely
+    # produce these today, but the contract is stable.)
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        server = parts[1] if len(parts) >= 3 else ""
+        if server:
+            bucket["mcp_server_counts"][server] = (
+                bucket["mcp_server_counts"].get(server, 0) + 1
+            )
+
+    if name == "spawn_agent":
+        days_with_orchestration.add(d)
+        bucket["parallel_agent_turns"] += 1
+
+        # Optionally bucket spawned agent_type counts (mirrors Claude's
+        # subagent meta.json scan).
+        agent_type = _codex_arg(payload, "agent_type")
+        if isinstance(agent_type, str) and agent_type:
+            bucket["agent_type_counts"][agent_type] = (
+                bucket["agent_type_counts"].get(agent_type, 0) + 1
+            )
+
+    elif name == "wait_agent":
+        targets = _codex_arg(payload, "targets")
+        if isinstance(targets, list):
+            n = len(targets)
+            if n > bucket["max_parallel_agents"]:
+                bucket["max_parallel_agents"] = n
+
+    elif name == "update_plan":
+        days_with_plan_mode.add(d)
+        bucket["plan_mode_invocations"] += 1
+
+    # File-write primitives — Codex's `apply_patch` plus the more general
+    # `Write` / `Edit` names if a custom tool surfaces them.
+    target_paths: list[str] = []
+    if name == "apply_patch":
+        target_paths = _codex_apply_patch_files(payload)
+    elif name in ("Write", "Edit"):
+        fp = _codex_arg(payload, "file_path") or _codex_arg(payload, "path")
+        if isinstance(fp, str) and fp:
+            target_paths = [fp]
+
+    for target_path in target_paths:
+        # Codex skill authorship.
+        if CODEX_SKILLS_DIR_FRAGMENT in target_path:
+            m = CODEX_SKILL_NAME_RE.search(target_path)
+            if m:
+                skill_name = m.group(1)
+                if skill_name and skill_name not in bucket["authored_skill_names"]:
+                    bucket["authored_skill_names"].append(skill_name)
+                if target_path.endswith("/SKILL.md"):
+                    bucket["custom_skill_files_written"] += 1
+
+        # Codex AGENTS.md (Claude's CLAUDE.md equivalent). Tracked under
+        # the same `claude_md_writes` field — server-side scoring is
+        # field-name-agnostic per the dual-source plan.
+        if target_path.endswith("/AGENTS.md") or target_path.endswith("/CLAUDE.md"):
+            bucket["claude_md_writes"] += 1
+
+        # MCP config: `~/.codex/config.toml` plus any `*.mcp.json` style.
+        if any(target_path.endswith(suffix) for suffix in CODEX_CONFIG_TOML_BASENAMES):
+            bucket["custom_mcp_config_writes"] += 1
+        elif target_path.endswith("/.mcp.json") or target_path.endswith("/mcp.json"):
+            bucket["custom_mcp_config_writes"] += 1
+
+
+def _codex_arg(payload: dict, key: str):
+    """Return one argument value from a Codex tool-call payload.
+
+    Codex puts arguments either as a JSON-encoded string on `arguments`
+    (for `function_call`) or under `input` / argument-named keys on
+    other variants. We try both.
+    """
+    raw = payload.get("arguments")
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and key in parsed:
+            return parsed[key]
+
+    if isinstance(payload.get(key), (str, int, float, list, dict)):
+        return payload[key]
+
+    inp = payload.get("input")
+    if isinstance(inp, dict) and key in inp:
+        return inp[key]
+
+    return None
+
+
+def _codex_apply_patch_files(payload: dict) -> list[str]:
+    """Extract file paths from an `apply_patch` payload's patch text.
+
+    Codex emits the patch as `payload.input` (a string starting with
+    `*** Begin Patch`); each affected file is announced with
+    `*** Update File:` / `*** Add File:` / `*** Delete File:`.
+    """
+    inp = payload.get("input")
+    if not isinstance(inp, str) or not inp:
+        return []
+    return CODEX_PATCH_FILE_RE.findall(inp)
 
 
 def main(argv: list[str]) -> int:

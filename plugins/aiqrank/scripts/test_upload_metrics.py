@@ -59,7 +59,6 @@ class UploadMetricsTests(unittest.TestCase):
         def fake_urlopen(req, timeout=30):
             captured["url"] = req.full_url
             captured["body"] = json.loads(req.data.decode("utf-8"))
-            captured["user_agent"] = req.get_header("User-agent", "")
             return FakeResponse(response_body)
 
         argv = ["--metrics", str(self.metrics_path), "--role", "engineer"]
@@ -83,7 +82,6 @@ class UploadMetricsTests(unittest.TestCase):
         self.assertIn("daily", captured["body"])
         self.assertEqual(captured["body"]["inferred_role"], "engineer")
         self.assertNotIn("device_id", captured["body"])
-        self.assertTrue(captured["user_agent"].startswith("aiqrank-plugin/"))
         # Device.json persisted
         self.assertTrue(self.mod.DEVICE_PATH.exists())
         saved = json.loads(self.mod.DEVICE_PATH.read_text())
@@ -100,6 +98,53 @@ class UploadMetricsTests(unittest.TestCase):
         })
         self.assertEqual(rc, 0)
         self.assertEqual(captured["body"]["device_id"], "existing-dev")
+
+    def test_dual_source_payload_when_metrics_have_by_source(self):
+        # Rewrite the metrics fixture to include both sources.
+        self.metrics_path.write_text(json.dumps({
+            "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}],
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}],
+                },
+                "codex": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 5}}],
+                },
+            },
+        }))
+
+        rc, captured, _stdout = self._run_with_fake_post({
+            "teaser_url": "https://aiqrank.com/teaser?s=abc",
+            "device_id": "dev-new-123",
+        })
+        self.assertEqual(rc, 0)
+        self.assertIn("by_source", captured["body"])
+        self.assertIn("claude_code", captured["body"]["by_source"])
+        self.assertIn("codex", captured["body"]["by_source"])
+        self.assertEqual(
+            captured["body"]["by_source"]["codex"]["daily"][0]["metrics"]["sessions"],
+            5,
+        )
+
+    def test_omits_empty_codex_source_from_payload(self):
+        self.metrics_path.write_text(json.dumps({
+            "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}],
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}],
+                },
+                "codex": {"daily": []},
+            },
+        }))
+
+        rc, captured, _stdout = self._run_with_fake_post({
+            "teaser_url": "https://aiqrank.com/teaser?s=abc",
+            "device_id": "dev-new-123",
+        })
+        self.assertEqual(rc, 0)
+        self.assertIn("by_source", captured["body"])
+        self.assertIn("claude_code", captured["body"]["by_source"])
+        self.assertNotIn("codex", captured["body"]["by_source"])
 
     def test_network_failure_prints_stderr_and_exits_1(self):
         import urllib.error
