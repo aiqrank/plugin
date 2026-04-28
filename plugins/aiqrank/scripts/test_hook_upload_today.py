@@ -33,6 +33,7 @@ class HookUploadTests(unittest.TestCase):
         self.mod.LOCK_PATH = cfg / "upload.lock"
         self.mod.DISABLED_FLAG = cfg / "disabled"
         self.mod.LOG_PATH = cfg / "hook.log"
+        self.mod.STALE_VERSION_PATH = cfg / "stale_version"
 
     def tearDown(self) -> None:
         self._env.stop()
@@ -108,6 +109,70 @@ class HookUploadTests(unittest.TestCase):
         log = self._log_contents()
         self.assertIn("ok sessions=2 devices=device-a", log)
         self.assertTrue(self.mod.LAST_UPLOAD_PATH.exists())
+
+    def test_upload_sends_user_agent_header(self):
+        self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.mod.DEVICE_PATH.write_text(json.dumps({"device_id": "device-abcdef12"}))
+        captured = {}
+
+        class FakeResp:
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=30):
+            captured["headers"] = dict(req.headers)
+            return FakeResp()
+
+        fake_scan = {"daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}], "inferred_role": "engineer"}
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_scan), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self._invoke_silent()
+
+        # urllib.request.Request stores headers title-cased.
+        ua = captured["headers"].get("User-agent") or captured["headers"].get("User-Agent")
+        self.assertIsNotNone(ua)
+        self.assertIn("aiqrank-plugin/", ua)
+
+    def test_writes_stale_version_when_local_behind(self):
+        self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.mod.DEVICE_PATH.write_text(json.dumps({"device_id": "device-abcdef12"}))
+
+        class FakeResp:
+            def read(self): return json.dumps({"latest_plugin_version": "9.9.9"}).encode("utf-8")
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        fake_scan = {"daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}], "inferred_role": "engineer"}
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_scan), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", return_value=FakeResp()):
+            self._invoke_silent()
+
+        self.assertTrue(self.mod.STALE_VERSION_PATH.exists())
+        self.assertEqual(self.mod.STALE_VERSION_PATH.read_text().strip(), "9.9.9")
+
+    def test_clears_stale_version_when_local_caught_up(self):
+        self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.mod.DEVICE_PATH.write_text(json.dumps({"device_id": "device-abcdef12"}))
+        self.mod.STALE_VERSION_PATH.write_text("0.0.1\n")  # leftover from earlier run
+
+        outer = self
+
+        class FakeResp:
+            def read(self_inner):
+                return json.dumps({"latest_plugin_version": outer.mod.PLUGIN_VERSION}).encode("utf-8")
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+
+        fake_scan = {"daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}], "inferred_role": "engineer"}
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_scan), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", return_value=FakeResp()):
+            self._invoke_silent()
+
+        self.assertFalse(self.mod.STALE_VERSION_PATH.exists())
 
 
 if __name__ == "__main__":

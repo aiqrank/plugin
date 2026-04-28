@@ -71,6 +71,29 @@ class HookNudgeTests(unittest.TestCase):
         output = self._run()
         self.assertIn("AIQ Rank:", output)
 
+    def test_stale_version_file_prints_update_nudge(self):
+        self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
+        self.mod.STALE_VERSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.mod.STALE_VERSION_PATH.write_text("0.9.1\n")
+        # Fresh upload so the 30-day nudge is silent.
+        self.mod.LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.mod.LAST_UPLOAD_PATH.write_text(fresh + "\n")
+
+        output = self._run()
+        self.assertIn("plugin update available", output)
+        self.assertIn("0.9.1", output)
+        self.assertNotIn("30 days", output)
+
+    def test_no_stale_version_file_silent_when_fresh(self):
+        self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
+        self.mod.LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.mod.LAST_UPLOAD_PATH.write_text(fresh + "\n")
+
+        output = self._run()
+        self.assertEqual(output, "")
+
 
 if __name__ == "__main__":
     unittest.main()

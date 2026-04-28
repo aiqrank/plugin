@@ -14,6 +14,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,6 +24,16 @@ from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _version import PLUGIN_VERSION, USER_AGENT  # noqa: E402
+
+# Server-supplied version strings written to disk and printed by the nudge
+# hook are validated against this shape to block ANSI escapes, control
+# characters, oversized payloads, and embedded newlines from a compromised
+# server / MITM proxy / hostile AIQRANK_BASE_URL override.
+_VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?$")
+_VERSION_MAX_LEN = 32
+
 DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 DEVICE_PATH = CONFIG_DIR / "device.json"
@@ -30,6 +41,9 @@ LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
 LOCK_PATH = CONFIG_DIR / "upload.lock"
 DISABLED_FLAG = CONFIG_DIR / "disabled"
 LOG_PATH = CONFIG_DIR / "hook.log"
+# Server-reported latest version. Written when local < latest, removed when
+# local catches up. Read by hook_nudge_if_stale.py to print one-line nudge.
+STALE_VERSION_PATH = CONFIG_DIR / "stale_version"
 
 GATE_SECONDS = 24 * 60 * 60
 MAX_WINDOW_DAYS = 30
@@ -131,16 +145,24 @@ def _run(logger: logging.Logger) -> None:
         }
 
         try:
-            _post_upload(payload)
+            response = _post_upload(payload)
         except urllib.error.HTTPError as e:
             logger.info(f"error http={e.code}")
             return
         except urllib.error.URLError:
             logger.info("error network")
             return
+        except json.JSONDecodeError:
+            # 200 OK with non-JSON body (CDN error page, proxy interstitial).
+            # Log and bail without advancing the gate so we retry next session.
+            logger.info("error json")
+            return
 
+        # Advance the gate first — best-effort version recording must
+        # never block the next-day upload if it raises unexpectedly.
         logger.info(f"ok sessions={len(daily)} devices={device_id[:8]}")
         _write_last_upload_at(_iso_now())
+        _record_latest_version(response.get("latest_plugin_version") if isinstance(response, dict) else None)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -227,11 +249,56 @@ def _post_upload(payload: dict) -> dict:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
+
+
+def _version_tuple(s: str) -> tuple:
+    """Sortable key for a semver-shaped version string.
+
+    * Splits on the first '-' so prereleases sort BEFORE the matching
+      release: '1.0.0-rc1' < '1.0.0'.
+    * Pads to 4 numeric components so '1.0' compares equal to '1.0.0'.
+    * Compares prerelease suffixes lexically, which is good enough for
+      'rc1' < 'rc2' / 'beta' < 'rc'. Not full semver — we own both
+      sides of the comparison so tighter rules aren't worth the code.
+    """
+    base, sep, suffix = s.partition("-")
+    parts = [int(re.match(r"\d+", c).group(0)) if re.match(r"\d+", c) else 0 for c in base.split(".")]
+    while len(parts) < 4:
+        parts.append(0)
+    is_release = 1 if not sep else 0
+    return tuple(parts) + (is_release, suffix)
+
+
+def _is_safe_version(s: object) -> bool:
+    return (
+        isinstance(s, str)
+        and 0 < len(s) <= _VERSION_MAX_LEN
+        and _VERSION_RE.match(s) is not None
+    )
+
+
+def _record_latest_version(latest: str | None) -> None:
+    """Persist the server-reported latest plugin version when the local
+    install is behind, or clear the stale-version flag when caught up.
+    Silent on bad input or filesystem errors; the nudge is best-effort.
+    Server-supplied strings are validated against a strict semver-like
+    shape to block ANSI / control-character injection."""
+    if not _is_safe_version(latest):
+        return
+    try:
+        if _version_tuple(PLUGIN_VERSION) < _version_tuple(latest):
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            STALE_VERSION_PATH.write_text(latest + "\n")
+        else:
+            STALE_VERSION_PATH.unlink(missing_ok=True)
+    except (ValueError, OSError):
+        pass
 
 
 def _iso_now() -> str:
