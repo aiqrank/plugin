@@ -240,8 +240,8 @@ def confirm(prompt: str, force_yes: bool) -> bool:
     if not sys.stdin.isatty():
         fail("non-interactive shell — pass --yes to skip the consent prompt")
         sys.exit(1)
-    answer = input(f"{prompt} Type 'yes' to confirm: ").strip().lower()
-    return answer == "yes"
+    answer = input(f"{prompt} [y/yes] ").strip().lower()
+    return answer in ("y", "yes")
 
 
 def load_device_id():
