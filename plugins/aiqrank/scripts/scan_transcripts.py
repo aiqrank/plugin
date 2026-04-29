@@ -143,6 +143,7 @@ _CORRECTION_RE = re.compile(
 
 _CORRECTION_SCAN_PREFIX = 120
 
+
 # Claude Desktop / cowork spawns MCP servers with a per-installation UUID in
 # the tool name, e.g. `mcp__4507b484-062b-4cc6-85ff-0862c2c5567a__search`.
 # Those UUIDs are device-identifying. Bucket them under a single sentinel so
@@ -241,6 +242,98 @@ SOURCE_CURSOR = "cursor"
 ALL_SOURCES = (SOURCE_CLAUDE_CODE, SOURCE_COWORK, SOURCE_CODEX, SOURCE_OPENCODE, SOURCE_CURSOR)
 
 
+def _host_homes() -> list[Path]:
+    """Candidate home directories that may contain host AI tool data stores.
+
+    Cowork can mount the user's home into its VM without changing the
+    sandbox process HOME. Try the explicit override first, then a small set
+    of cheap local candidates. This avoids a broad filesystem crawl while
+    making mounted-home Cowork runs work without manual path wiring.
+    """
+    candidates: list[Path] = []
+
+    raw = os.environ.get("AIQRANK_HOST_HOME")
+    if raw:
+        return _unique_paths([Path(raw).expanduser()])
+
+    candidates.append(Path.home())
+    for env_name in ("USERPROFILE",):
+        raw_env = os.environ.get(env_name)
+        if raw_env:
+            candidates.append(Path(raw_env).expanduser())
+    homedrive = os.environ.get("HOMEDRIVE")
+    homepath = os.environ.get("HOMEPATH")
+    if homedrive and homepath:
+        candidates.append(Path(homedrive + homepath).expanduser())
+
+    if sys.platform != "win32":
+        try:
+            import pwd as _pwd
+
+            candidates.append(Path(_pwd.getpwuid(os.getuid()).pw_dir))
+        except Exception:
+            pass
+
+    if sys.platform == "darwin":
+        candidates.extend(_named_user_home_dirs(Path("/Users"), skip={"Shared"}))
+    elif sys.platform == "win32":
+        candidates.extend(_named_user_home_dirs(Path("C:/Users"), skip={"Public", "Default"}))
+        candidates.extend(_named_user_home_dirs(Path("/mnt/c/Users"), skip={"Public", "Default"}))
+    else:
+        candidates.extend(_named_user_home_dirs(Path("/home")))
+        candidates.extend(_named_user_home_dirs(Path("/mnt/c/Users"), skip={"Public", "Default"}))
+
+    return _unique_paths(candidates)
+
+
+def _host_home() -> Path:
+    return _host_homes()[0]
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.expanduser())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path.expanduser())
+    return out
+
+
+def _named_user_home_dirs(root: Path, skip: set[str] | None = None) -> list[Path]:
+    skip = skip or set()
+    names = _candidate_user_names()
+    if not names:
+        return []
+    out: list[Path] = []
+    for name in names:
+        if name in skip or name.startswith("."):
+            continue
+        path = root / name
+        if path.is_dir():
+            out.append(path)
+    return out
+
+
+def _candidate_user_names() -> set[str]:
+    names: set[str] = set()
+    for env_name in ("USER", "LOGNAME", "USERNAME"):
+        raw = os.environ.get(env_name)
+        if raw:
+            names.add(Path(raw).name)
+    for env_name in ("USERPROFILE",):
+        raw = os.environ.get(env_name)
+        if raw:
+            names.add(Path(raw).expanduser().name)
+    try:
+        names.add(Path.home().name)
+    except OSError:
+        pass
+    return {name for name in names if name}
+
+
 def _bucket(daily: dict[date, dict], d: date) -> dict:
     if d not in daily:
         daily[d] = _new_day_metrics()
@@ -268,8 +361,9 @@ def scan(
     root (~/.codex); pass a non-existent path to disable Codex scanning in
     tests.
     """
-    home = claude_dir or Path.home() / ".claude"
-    projects = home / "projects"
+    host_homes = _host_homes()
+    host_home = host_homes[0]
+    homes = [claude_dir] if claude_dir is not None else [h / ".claude" for h in host_homes]
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
 
@@ -284,9 +378,9 @@ def scan(
     #     non-existent path so they never accidentally read real user data
     if cowork_root is None:
         cowork_root = (
-            _default_cowork_roots()
+            _default_cowork_roots_for_homes(host_homes)
             if claude_dir is None
-            else home / "__cowork_disabled__"
+            else homes[0] / "__cowork_disabled__"
         )
 
     # Same resolution policy for the scheduled-task definitions root: tests
@@ -294,9 +388,9 @@ def scan(
     # explicitly opt in via `scheduled_root`.
     if scheduled_root is None:
         scheduled_root = (
-            _default_scheduled_root()
+            _default_scheduled_root_for_homes(host_homes)
             if claude_dir is None
-            else home / "__scheduled_disabled__"
+            else homes[0] / "__scheduled_disabled__"
         )
 
     # Codex root resolution: production walks the real ~/.codex; tests that
@@ -304,9 +398,9 @@ def scan(
     # explicitly opt in via `codex_dir`.
     if codex_dir is None:
         codex_dir = (
-            Path.home() / ".codex"
+            host_home / ".codex"
             if claude_dir is None
-            else home / "__codex_disabled__"
+            else homes[0] / "__codex_disabled__"
         )
 
     # Per-source per-day metric buckets and main-session intervals.
@@ -320,9 +414,16 @@ def scan(
     # Snapshot the user's locally-owned skills (bare-name slash commands).
     # Used by process_session to count `<command-name>/<n></command-name>`
     # invocations that the Skill-tool path doesn't capture.
-    local_skills = _local_claude_skills(home)
+    local_skills: set[str] = set()
+    for home in homes:
+        local_skills |= _local_claude_skills(home)
 
-    if projects.is_dir():
+    seen_claude_transcripts: set[str] = set()
+    for home in homes:
+        projects = home / "projects"
+        if not projects.is_dir():
+            continue
+
         claude_daily = daily_by_source[SOURCE_CLAUDE_CODE]
         claude_intervals = intervals_by_source[SOURCE_CLAUDE_CODE]
 
@@ -331,6 +432,14 @@ def scan(
                 continue
 
             for jsonl_path in iter_transcript_files(project_dir, cutoff_ts, mtime_after_ts):
+                try:
+                    rel = str(jsonl_path.relative_to(home))
+                except ValueError:
+                    rel = str(jsonl_path)
+                if rel in seen_claude_transcripts:
+                    continue
+                seen_claude_transcripts.add(rel)
+
                 is_main = "subagents" not in jsonl_path.parts
                 process_session(
                     jsonl_path,
@@ -430,7 +539,7 @@ def scan(
     # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
     # Skipped silently when the DB is absent.
     _opencode_default_db = (
-        Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+        host_home / ".local" / "share" / "opencode" / "opencode.db"
     )
     opencode_emit = _opencode_default_db.is_file()
     if opencode_emit:
@@ -471,7 +580,7 @@ def scan(
     # Cursor root: read ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
     # via scan_cursor. Skipped silently when the DB is absent.
     _cursor_default_db = (
-        Path.home()
+        host_home
         / "Library"
         / "Application Support"
         / "Cursor"
@@ -724,7 +833,7 @@ def _log_scan_diagnostic(message: str) -> None:
     cross-process invocation from the hook.
     """
     try:
-        log_dir = Path.home() / ".config" / "aiqrank"
+        log_dir = _host_home() / ".config" / "aiqrank"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "hook.log"
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -751,12 +860,23 @@ def _default_cowork_roots() -> list[Path]:
       - Windows: %APPDATA%\\Roaming\\Claude\\
       - Linux:   ~/.config/Claude/   (best-effort; not in pilot scope)
     """
+    return _default_cowork_roots_for_home(_host_home())
+
+
+def _default_cowork_roots_for_homes(homes: list[Path]) -> list[Path]:
+    roots: list[Path] = []
+    for home in homes:
+        roots.extend(_default_cowork_roots_for_home(home))
+    return _unique_paths(roots)
+
+
+def _default_cowork_roots_for_home(home: Path) -> list[Path]:
     if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support" / "Claude"
+        base = home / "Library" / "Application Support" / "Claude"
     elif sys.platform == "win32":
-        base = Path.home() / "AppData" / "Roaming" / "Claude"
+        base = home / "AppData" / "Roaming" / "Claude"
     else:
-        base = Path.home() / ".config" / "Claude"
+        base = home / ".config" / "Claude"
     return [base / "claude-code-sessions", base / "local-agent-mode-sessions"]
 
 
@@ -772,7 +892,15 @@ def _default_scheduled_root() -> Path:
     """Cowork scheduled-task definitions live as one subdirectory per task,
     each containing a SKILL.md. Convention is ~/Documents/Claude/Scheduled.
     """
-    return Path.home() / "Documents" / "Claude" / "Scheduled"
+    return _host_home() / "Documents" / "Claude" / "Scheduled"
+
+
+def _default_scheduled_root_for_homes(homes: list[Path]) -> Path:
+    roots = [home / "Documents" / "Claude" / "Scheduled" for home in homes]
+    for root in roots:
+        if root.is_dir():
+            return root
+    return roots[0]
 
 
 def _count_active_scheduled_tasks(scheduled_root: Path) -> int:
@@ -1584,6 +1712,14 @@ def main(argv: list[str]) -> int:
         except (IndexError, ValueError):
             pass
 
+    host_home_override: str | None = None
+    if "--host-home" in argv:
+        idx = argv.index("--host-home")
+        try:
+            host_home_override = argv[idx + 1]
+        except IndexError:
+            pass
+
     mtime_after_ts: float | None = None
     if "--mtime-after" in argv:
         idx = argv.index("--mtime-after")
@@ -1594,7 +1730,18 @@ def main(argv: list[str]) -> int:
         except (IndexError, ValueError):
             pass
 
-    result = scan(window_days=window_days, mtime_after_ts=mtime_after_ts)
+    prior_host_home = os.environ.get("AIQRANK_HOST_HOME")
+    try:
+        if host_home_override is not None:
+            os.environ["AIQRANK_HOST_HOME"] = host_home_override
+        result = scan(window_days=window_days, mtime_after_ts=mtime_after_ts)
+    finally:
+        if host_home_override is not None:
+            if prior_host_home is None:
+                os.environ.pop("AIQRANK_HOST_HOME", None)
+            else:
+                os.environ["AIQRANK_HOST_HOME"] = prior_host_home
+
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0

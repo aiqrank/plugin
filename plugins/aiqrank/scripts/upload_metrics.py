@@ -40,6 +40,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--metrics", dest="metrics_path", default=None)
     parser.add_argument("--role", required=True)
     parser.add_argument("--scan", action="store_true", help="Run scan_transcripts.py --days 30 first.")
+    parser.add_argument("--no-open", action="store_true", help="Do not open the result URL in a browser.")
     args = parser.parse_args(argv)
 
     base_url = os.environ.get("AIQRANK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
@@ -87,8 +88,11 @@ def main(argv: list[str]) -> int:
     save_device_id(new_device_id)
     save_last_upload_at(iso_now())
 
-    print(f"Opening your rank at {teaser_url}")
-    open_in_browser(teaser_url)
+    if args.no_open:
+        print(f"Rank updated at {teaser_url}")
+    else:
+        print(f"Opening your rank at {teaser_url}")
+        open_in_browser(teaser_url)
     return 0
 
 
