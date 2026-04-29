@@ -12,6 +12,7 @@ Python stdlib only. Must be fast (~5ms).
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
+LOG_PATH = CONFIG_DIR / "hook.log"
 STALE_VERSION_PATH = CONFIG_DIR / "stale_version"
 STALE_SECONDS = 30 * 24 * 60 * 60
 # Defence in depth — even though hook_upload_today.py validates before
@@ -34,7 +36,34 @@ VERSION_NUDGE_FMT = (
 )
 
 
+def _log_hook_fired() -> None:
+    """Append one "hook fired" line for fault-domain triage. Fail-soft.
+
+    Direct file append (not RotatingFileHandler) to keep the synchronous
+    hook fast — this script's budget is ~5ms. Same log file as
+    hook_upload_today.py so the customer's triage scans one location.
+    """
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "<unset>")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        line = (
+            f"{ts} hook fired script=nudge_if_stale "
+            f"plugin_root={plugin_root} platform={sys.platform} "
+            f"python={sys.executable}\n"
+        )
+        with LOG_PATH.open("a") as fh:
+            fh.write(line)
+        try:
+            os.chmod(LOG_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
 def main() -> int:
+    _log_hook_fired()
     try:
         if _is_stale():
             print(NUDGE)

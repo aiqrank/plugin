@@ -12,6 +12,19 @@ proficiency score.
 
 Then run `/aiqrank` to get started.
 
+## Supported tools
+
+The plugin scans and scores activity from all of these tools in a single run:
+
+- Claude Code (interactive sessions)
+- Claude Cowork (autonomous local-agent-mode sessions)
+- OpenAI Codex (CLI rollouts under `~/.codex/`)
+- Cursor (local SQLite store at `~/Library/Application Support/Cursor/...`)
+- OpenCode (local SQLite store at `~/.local/share/opencode/opencode.db`)
+
+Each tool gets its own per-tool leaderboard chip and profile tab. The All-tools
+aggregate combines the seven cross-tool dimensions into a single headline score.
+
 ## How it works
 
 1. You run `/aiqrank`. The plugin opens a browser tab to `aiqrank.com/pair?session=...`.

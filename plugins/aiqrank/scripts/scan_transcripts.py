@@ -236,7 +236,9 @@ def _new_day_metrics() -> dict:
 SOURCE_CLAUDE_CODE = "claude_code"
 SOURCE_COWORK = "cowork"
 SOURCE_CODEX = "codex"
-ALL_SOURCES = (SOURCE_CLAUDE_CODE, SOURCE_COWORK, SOURCE_CODEX)
+SOURCE_OPENCODE = "opencode"
+SOURCE_CURSOR = "cursor"
+ALL_SOURCES = (SOURCE_CLAUDE_CODE, SOURCE_COWORK, SOURCE_CODEX, SOURCE_OPENCODE, SOURCE_CURSOR)
 
 
 def _bucket(daily: dict[date, dict], d: date) -> dict:
@@ -250,7 +252,7 @@ def scan(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now_ts: float | None = None,
     mtime_after_ts: float | None = None,
-    cowork_root: Path | None = None,
+    cowork_root: Path | list[Path] | None = None,
     scheduled_root: Path | None = None,
     codex_dir: Path | None = None,
 ) -> dict:
@@ -272,13 +274,17 @@ def scan(
     cutoff_ts = now_ts - (window_days * 86400)
 
     # `cowork_root` resolution:
-    #   - explicit value (tests, custom installs) is always honored
-    #   - production (`claude_dir=None`) walks the real Application Support path
+    #   - explicit value (tests, custom installs) is always honored; legacy
+    #     single-Path overrides are normalized to a single-element list so
+    #     downstream code uniformly walks a list of candidate roots
+    #   - production (`claude_dir=None`) walks BOTH `claude-code-sessions`
+    #     (post-rename) and `local-agent-mode-sessions` (legacy) under the
+    #     per-OS Application Support / AppData / .config base
     #   - tests overriding `claude_dir` without `cowork_root` get a sentinel
     #     non-existent path so they never accidentally read real user data
     if cowork_root is None:
         cowork_root = (
-            _default_cowork_root()
+            _default_cowork_roots()
             if claude_dir is None
             else home / "__cowork_disabled__"
         )
@@ -421,6 +427,94 @@ def scan(
                     continue
                 process_codex_session(rollout_path, codex_daily, codex_intervals)
 
+    # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
+    # Skipped silently when the DB is absent.
+    _opencode_default_db = (
+        Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    )
+    opencode_emit = _opencode_default_db.is_file()
+    if opencode_emit:
+        # Per-source scanner failures must be local — a corrupt OpenCode DB
+        # must NOT abort the orchestrator's primary Claude scan (plan §452).
+        try:
+            from scan_opencode import scan as _scan_opencode_fn  # noqa: E402
+
+            _oc_result = _scan_opencode_fn(
+                window_days=window_days,
+                now_ts=now_ts,
+                mtime_after_ts=mtime_after_ts,
+            )
+            _oc_daily_by_date = _daily_by_date_with_rollup_only(_oc_result, now_ts)
+            daily_by_source[SOURCE_OPENCODE] = _oc_daily_by_date
+            _oc_ivs = _oc_result.get("intervals_by_day") or {}
+            _oc_intervals: dict[date, list[tuple[float, float]]] = {}
+            for date_str, ivs in _oc_ivs.items():
+                try:
+                    d = date.fromisoformat(date_str)
+                except ValueError:
+                    continue
+                _oc_intervals[d] = (
+                    [
+                        (float(iv[0]), float(iv[1]))
+                        for iv in ivs
+                        if isinstance(iv, (list, tuple)) and len(iv) >= 2
+                    ]
+                    if ivs
+                    else []
+                )
+            intervals_by_source[SOURCE_OPENCODE] = _oc_intervals
+        except Exception as e:
+            sys.stderr.write(
+                f"scan_opencode failed: {type(e).__name__}: {e}\n"
+            )
+
+    # Cursor root: read ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
+    # via scan_cursor. Skipped silently when the DB is absent.
+    _cursor_default_db = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "Cursor"
+        / "User"
+        / "globalStorage"
+        / "state.vscdb"
+    )
+    cursor_emit = _cursor_default_db.is_file()
+    if cursor_emit:
+        # Per-source scanner failures must be local — a corrupt Cursor DB
+        # must NOT abort the orchestrator's primary Claude scan (plan §452).
+        try:
+            from scan_cursor import scan as _scan_cursor_fn  # noqa: E402
+
+            _cur_result = _scan_cursor_fn(
+                window_days=window_days,
+                now_ts=now_ts,
+                mtime_after_ts=mtime_after_ts,
+            )
+            _cur_daily_by_date = _daily_by_date_with_rollup_only(_cur_result, now_ts)
+            daily_by_source[SOURCE_CURSOR] = _cur_daily_by_date
+            _cur_ivs = _cur_result.get("intervals_by_day") or {}
+            _cur_intervals: dict[date, list[tuple[float, float]]] = {}
+            for date_str, ivs in _cur_ivs.items():
+                try:
+                    d = date.fromisoformat(date_str)
+                except ValueError:
+                    continue
+                _cur_intervals[d] = (
+                    [
+                        (float(iv[0]), float(iv[1]))
+                        for iv in ivs
+                        if isinstance(iv, (list, tuple)) and len(iv) >= 2
+                    ]
+                    if ivs
+                    else []
+                )
+            intervals_by_source[SOURCE_CURSOR] = _cur_intervals
+        except Exception as e:
+            sys.stderr.write(
+                f"scan_cursor failed: {type(e).__name__}: {e}\n"
+            )
+
     # Per-day concurrency from sweep-line over each day's clipped intervals,
     # computed per source. Only counts a level that held for
     # >= min_sustained_secs within the day — see DEFAULT_MIN_SUSTAINED_SECS.
@@ -434,9 +528,13 @@ def scan(
 
     by_source: dict[str, dict] = {}
     for source in ALL_SOURCES:
-        # Codex source is suppressed entirely when ~/.codex/ is absent; the
-        # other sources always emit (possibly with empty daily/rollup).
+        # Codex/OpenCode/Cursor sources are suppressed entirely when their data
+        # store is absent; the other sources always emit (possibly empty).
         if source == SOURCE_CODEX and not codex_emit:
+            continue
+        if source == SOURCE_OPENCODE and not opencode_emit:
+            continue
+        if source == SOURCE_CURSOR and not cursor_emit:
             continue
 
         # Drop days that recorded zero activity (a meta-only day with no
@@ -482,6 +580,61 @@ def _has_activity(metrics: dict) -> bool:
     if any(metrics.get(f) for f in _LIST_FIELDS):
         return True
     return False
+
+
+def _daily_by_date_with_rollup_only(result: dict, now_ts: float) -> dict[date, dict]:
+    """Import a sub-scanner daily list and preserve metrics it can only put
+    in rollup, such as local authored skills with no reliable event day."""
+    daily_by_date: dict[date, dict] = {}
+    for entry in result.get("daily") or []:
+        try:
+            d = date.fromisoformat(entry["date"])
+        except (KeyError, ValueError):
+            continue
+        metrics = entry.get("metrics") or {}
+        if isinstance(metrics, dict):
+            daily_by_date[d] = metrics.copy()
+
+    rollup = result.get("rollup") or {}
+    if not isinstance(rollup, dict):
+        return daily_by_date
+
+    target_day = max(daily_by_date.keys(), default=datetime.fromtimestamp(now_ts).date())
+    target = _bucket(daily_by_date, target_day)
+
+    existing_skill_count = sum(
+        int((m or {}).get("custom_skill_files_written", 0) or 0)
+        for m in daily_by_date.values()
+    )
+    rollup_skill_count = int(rollup.get("custom_skill_files_written", 0) or 0)
+    if rollup_skill_count > existing_skill_count:
+        target["custom_skill_files_written"] = (
+            int(target.get("custom_skill_files_written", 0) or 0)
+            + rollup_skill_count
+            - existing_skill_count
+        )
+
+    existing_names = {
+        name
+        for m in daily_by_date.values()
+        for name in ((m or {}).get("authored_skill_names") or [])
+        if isinstance(name, str) and name
+    }
+    rollup_names = {
+        name
+        for name in (rollup.get("authored_skill_names") or [])
+        if isinstance(name, str) and name
+    }
+    missing_names = rollup_names - existing_names
+    if missing_names:
+        names = {
+            name
+            for name in (target.get("authored_skill_names") or [])
+            if isinstance(name, str) and name
+        }
+        target["authored_skill_names"] = sorted(names | missing_names)
+
+    return daily_by_date
 
 
 def _rollup_from_daily(per_day_metrics) -> dict:
@@ -560,14 +713,59 @@ def _ts_to_date(ts: float | None) -> date | None:
     return datetime.fromtimestamp(ts).date()
 
 
+def _log_scan_diagnostic(message: str) -> None:
+    """Append one diagnostic line to ~/.config/aiqrank/hook.log. Fail-soft.
+
+    Used to record per-source path-resolution outcomes (`cowork_root_path
+    resolved=... exists=... file_count=...`) so customer-side triage can
+    tell whether a zero score is a path-resolution issue (root missing)
+    or a content issue (root present but no events parsed). Direct file
+    append (not RotatingFileHandler) so this remains fast and survives
+    cross-process invocation from the hook.
+    """
+    try:
+        log_dir = Path.home() / ".config" / "aiqrank"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "hook.log"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        with log_path.open("a") as fh:
+            fh.write(f"{ts} scan {message}\n")
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _default_cowork_roots() -> list[Path]:
+    """Return the list of candidate Cowork sandbox roots for the current OS.
+
+    Returns BOTH `claude-code-sessions` (the new name Anthropic is migrating
+    to) and `local-agent-mode-sessions` (the legacy name). `claude-code-sessions`
+    is first so post-migration files win the file-relative-path dedup in
+    `iter_cowork_transcript_files`.
+
+    Per-platform base directory:
+      - macOS:   ~/Library/Application Support/Claude/
+      - Windows: %APPDATA%\\Roaming\\Claude\\
+      - Linux:   ~/.config/Claude/   (best-effort; not in pilot scope)
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Claude"
+    elif sys.platform == "win32":
+        base = Path.home() / "AppData" / "Roaming" / "Claude"
+    else:
+        base = Path.home() / ".config" / "Claude"
+    return [base / "claude-code-sessions", base / "local-agent-mode-sessions"]
+
+
 def _default_cowork_root() -> Path:
-    return (
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "Claude"
-        / "local-agent-mode-sessions"
-    )
+    """Backwards-compatible alias returning the *first* candidate root.
+
+    Kept for any external caller; new code should use `_default_cowork_roots`.
+    """
+    return _default_cowork_roots()[0]
 
 
 def _default_scheduled_root() -> Path:
@@ -596,7 +794,7 @@ def _count_active_scheduled_tasks(scheduled_root: Path) -> int:
 
 
 def _count_scheduled_task_runs(
-    cowork_root: Path,
+    cowork_root: Path | list[Path],
     daily: dict,
     cutoff_ts: float,
     mtime_after_ts: float | None,
@@ -611,20 +809,42 @@ def _count_scheduled_task_runs(
     Manifests live at {cowork_root}/{account}/{workspace}/local_*.json (a
     sibling of the local_*/ sandbox directory).
 
+    Accepts either a single root or a list of candidate roots. With multiple
+    roots, dedups by manifest-relative path inside the root, mirroring the
+    dedup in `iter_cowork_transcript_files` so the dual-directory scan
+    survives Anthropic's mid-migration `local-agent-mode-sessions` →
+    `claude-code-sessions` copy.
+
     Returns a set of distinct scheduled-task identifiers seen firing within
     the window — caller uses its size as the `scheduled_tasks_active` peak
     when the on-disk dir-scan is unavailable (macOS blocks `~/Documents/`
     iteration unless the host process has Full Disk Access).
     """
     distinct_tasks: set[str] = set()
-    if not cowork_root.is_dir():
+    roots = [cowork_root] if isinstance(cowork_root, Path) else list(cowork_root)
+    if not any(r.is_dir() for r in roots):
         return distinct_tasks
 
     effective_cutoff = (
         cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
     )
 
-    for manifest_path in cowork_root.glob("*/*/local_*.json"):
+    seen_manifest_relpaths: set[str] = set()
+    manifest_paths: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for manifest_path in root.glob("*/*/local_*.json"):
+            try:
+                rel = str(manifest_path.relative_to(root))
+            except ValueError:
+                rel = str(manifest_path)
+            if rel in seen_manifest_relpaths:
+                continue
+            seen_manifest_relpaths.add(rel)
+            manifest_paths.append(manifest_path)
+
+    for manifest_path in manifest_paths:
         try:
             if manifest_path.stat().st_mtime < effective_cutoff:
                 continue
@@ -666,7 +886,7 @@ def _count_scheduled_task_runs(
 
 
 def iter_cowork_transcript_files(
-    cowork_root: Path,
+    cowork_root: Path | list[Path],
     cutoff_ts: float,
     mtime_after_ts: float | None = None,
 ) -> Iterable[Path]:
@@ -675,21 +895,45 @@ def iter_cowork_transcript_files(
     Cowork sandboxes live at:
       {cowork_root}/{account}/{workspace}/local_*/.claude/projects/{proj}/*.jsonl
 
+    Accepts either a single root (legacy single-path callers) or a list of
+    candidate roots. With multiple roots, dedups by file-relative path
+    inside the root — this catches Anthropic's likely copy-then-delete
+    migration shape (`local-agent-mode-sessions` → `claude-code-sessions`)
+    where the same `<account>/<workspace>/...` tail can appear under both
+    roots transiently. Iteration order matters: the first root in the list
+    wins the dedup, so callers pass `claude-code-sessions` first.
+
     Scoped glob guards against wandering into audit logs, sessions/, etc.
     """
-    if not cowork_root.is_dir():
-        return
-
+    roots = [cowork_root] if isinstance(cowork_root, Path) else list(cowork_root)
     effective_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
 
-    for jsonl_path in cowork_root.glob(
-        "*/*/local_*/.claude/projects/*/*.jsonl"
-    ):
-        try:
-            if jsonl_path.stat().st_mtime >= effective_cutoff:
-                yield jsonl_path
-        except OSError:
+    seen_relpaths: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            _log_scan_diagnostic(
+                f"cowork_root_path resolved={root} exists=False file_count=0"
+            )
             continue
+
+        emitted_count = 0
+        for jsonl_path in root.glob("*/*/local_*/.claude/projects/*/*.jsonl"):
+            try:
+                rel = str(jsonl_path.relative_to(root))
+            except ValueError:
+                rel = str(jsonl_path)
+            if rel in seen_relpaths:
+                continue
+            try:
+                if jsonl_path.stat().st_mtime >= effective_cutoff:
+                    seen_relpaths.add(rel)
+                    emitted_count += 1
+                    yield jsonl_path
+            except OSError:
+                continue
+        _log_scan_diagnostic(
+            f"cowork_root_path resolved={root} exists=True file_count={emitted_count}"
+        )
 
 
 def iter_transcript_files(

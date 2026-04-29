@@ -57,40 +57,17 @@ def main(argv: list[str]) -> int:
         fail(f"could not read metrics ({type(exc).__name__})")
         return 1
 
-    daily = metrics.get("daily") if isinstance(metrics, dict) else None
-    by_source = metrics.get("by_source") if isinstance(metrics, dict) else None
-
-    has_legacy = isinstance(daily, list) and daily
-    has_by_source = (
-        isinstance(by_source, dict)
-        and any(
-            isinstance(s, dict) and isinstance(s.get("daily"), list) and s["daily"]
-            for s in by_source.values()
-        )
-    )
-
-    if not has_legacy and not has_by_source:
+    payload_body = build_payload(metrics, args.role)
+    if payload_body is None:
         fail("no daily metrics to upload")
         return 1
 
     device_id = load_device_id()
-
-    payload: dict = {"inferred_role": args.role}
-    if has_by_source:
-        # Server-side controller prefers `by_source` and ignores `daily`
-        # when both are present, but keep `daily` for older server builds.
-        payload["by_source"] = {
-            source: {"daily": s.get("daily") or []}
-            for source, s in by_source.items()
-            if isinstance(s, dict) and isinstance(s.get("daily"), list) and s["daily"]
-        }
-    if has_legacy:
-        payload["daily"] = daily
     if device_id:
-        payload["device_id"] = device_id
+        payload_body["device_id"] = device_id
 
     try:
-        response = post_upload(base_url, payload)
+        response = post_upload(base_url, payload_body)
     except urllib.error.HTTPError as exc:
         fail(f"http {exc.code}")
         return 1
@@ -124,6 +101,35 @@ def run_scan() -> dict:
         check=True,
     )
     return json.loads(result.stdout)
+
+
+def build_payload(metrics: dict, role: str) -> dict | None:
+    if not isinstance(metrics, dict):
+        return None
+
+    by_source = metrics.get("by_source")
+    if isinstance(by_source, dict):
+        daily = metrics.get("daily")
+        if not isinstance(daily, list):
+            daily = []
+            claude = by_source.get("claude_code")
+            if isinstance(claude, dict) and isinstance(claude.get("daily"), list):
+                daily = claude["daily"]
+
+        has_source_daily = any(
+            isinstance(source_data, dict)
+            and isinstance(source_data.get("daily"), list)
+            and len(source_data["daily"]) > 0
+            for source_data in by_source.values()
+        )
+        if not daily and not has_source_daily:
+            return None
+        return {"daily": daily, "by_source": by_source, "inferred_role": role}
+
+    daily = metrics.get("daily")
+    if not isinstance(daily, list) or not daily:
+        return None
+    return {"daily": daily, "inferred_role": role}
 
 
 def post_upload(base_url: str, payload: dict) -> dict:
