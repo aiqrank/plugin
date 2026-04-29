@@ -6,10 +6,18 @@ allowed-tools: [Bash]
 
 # Join Company
 
-Redeem a join token to add this device's user to a company. The plugin script prints the consent text and asks for confirmation before posting to the server.
+Before running the command, show the user this consent notice:
+
+> Joining means company admins will have access to the names of skills and MCP
+> servers you use, plus your daily activity metrics (sessions, tool calls,
+> scores). They will **not** have access to your transcripts, prompts, or code.
+>
+> You can leave at any time with `/aiqrank:company-leave <slug>`.
+
+Ask the user to reply **"yes"** to confirm. Only run the command below after they do.
 
 ```bash
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d ~/.claude/plugins/cache/aiqrank/aiqrank/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')}"; [ -n "$PLUGIN_ROOT" ] && [ -d "$PLUGIN_ROOT/scripts" ] || { echo "aiqrank plugin scripts not found — set \$CLAUDE_PLUGIN_ROOT or install the plugin via /plugin install aiqrank"; exit 1; }; python3 "$PLUGIN_ROOT/scripts/company_client.py" redeem "$ARGUMENTS"
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d ~/.claude/plugins/cache/aiqrank/aiqrank/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')}"; [ -n "$PLUGIN_ROOT" ] && [ -d "$PLUGIN_ROOT/scripts" ] || { echo "aiqrank plugin scripts not found — set \$CLAUDE_PLUGIN_ROOT or install the plugin via /plugin install aiqrank"; exit 1; }; python3 "$PLUGIN_ROOT/scripts/company_client.py" --yes redeem "$ARGUMENTS"
 ```
 
 Pass the token as the only argument: `/aiqrank:company-join <token>`.

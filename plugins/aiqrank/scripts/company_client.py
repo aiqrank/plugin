@@ -34,9 +34,10 @@ DEVICE_PATH = CONFIG_DIR / "device.json"
 CONSENT_VERSION = "v1"
 
 CONSENT_TEMPLATE = (
-    "Joining a company on AIQ Rank makes your full Claude Code activity\n"
-    "(sessions, tools, scores, history, daily metrics) visible to that\n"
-    "company's admins, regardless of your public-sharing settings.\n"
+    "Joining means company admins will have access to the names of skills\n"
+    "and MCP servers you use, plus your daily activity metrics (sessions,\n"
+    "tool calls, scores). They will not have access to your transcripts,\n"
+    "prompts, or code.\n"
     "\n"
     "You can leave at any time with /aiqrank:company-leave <slug>.\n"
 )
@@ -239,8 +240,8 @@ def confirm(prompt: str, force_yes: bool) -> bool:
     if not sys.stdin.isatty():
         fail("non-interactive shell — pass --yes to skip the consent prompt")
         sys.exit(1)
-    answer = input(f"{prompt} [y/N] ").strip().lower()
-    return answer in ("y", "yes")
+    answer = input(f"{prompt} Type 'yes' to confirm: ").strip().lower()
+    return answer == "yes"
 
 
 def load_device_id():
