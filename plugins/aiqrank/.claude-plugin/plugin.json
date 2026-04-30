@@ -4,6 +4,6 @@
   "description": "Get your AIQ Score — scan your Claude Code, Codex, Cursor, Cowork, and OpenCode activity locally and see how your AI usage ranks against your peers.",
   "homepage": "https://aiqrank.com",
   "repository": "https://github.com/aiqrank/plugin",
-  "license": "MIT",
+  "license": "Elastic-2.0",
   "author": { "name": "AIQ Rank", "url": "https://aiqrank.com" }
 }
