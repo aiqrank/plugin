@@ -35,4 +35,9 @@ code, prompts, or file contents.
 
 ## License
 
-MIT
+[Elastic License 2.0 (ELv2)](LICENSE) — source available, but you may not offer
+this software as a hosted or managed service.
+
+This project has been licensed under Elastic License 2.0 (ELv2) since its first
+formal license. Prior commits listed "MIT" informally but no MIT LICENSE file was
+ever published.
