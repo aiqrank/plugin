@@ -1,7 +1,7 @@
 # AIQ Rank — Claude Code plugin
 
-Analyse your Claude Code transcripts to compute and share your AI
-proficiency score.
+Get your AIQ Score — scan your Claude Code, Codex, Cursor, Cowork, and
+OpenCode activity locally and see how your AI usage ranks against your peers.
 
 ## Install
 
@@ -29,8 +29,8 @@ aggregate combines the seven cross-tool dimensions into a single headline score.
 
 1. You run `/aiqrank`. The plugin opens a browser tab to `aiqrank.com/pair?session=...`.
 2. You sign in with Google or an 8-digit email code.
-3. The plugin scans your Claude Code transcripts from the last 30 days,
-   bucketing activity by calendar day.
+3. The plugin scans your Claude Code, Codex, Cursor, Cowork, and OpenCode
+   activity from the last 30 days, bucketing activity by calendar day.
 4. You see exactly what data will be transmitted, and confirm before
    anything leaves your machine.
 5. The server stores per-day records and computes your tier/score from

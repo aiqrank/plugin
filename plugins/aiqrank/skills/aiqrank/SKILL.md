@@ -1,6 +1,6 @@
 ---
 name: aiqrank
-description: Compute and share your AI proficiency rank from local Claude Code transcripts.
+description: Get your AIQ Score from your local Claude Code, Codex, Cursor, Cowork, and OpenCode activity.
 allowed-tools: [Bash]
 ---
 
