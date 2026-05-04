@@ -1020,8 +1020,17 @@ def iter_cowork_transcript_files(
 ) -> Iterable[Path]:
     """Yields cowork transcript JSONL paths within the cutoff.
 
-    Cowork sandboxes live at:
-      {cowork_root}/{account}/{workspace}/local_*/.claude/projects/{proj}/*.jsonl
+    Two on-disk shapes are supported:
+      VM-bundle (Mac, Linux):
+        {cowork_root}/{account}/{workspace}/local_*/.claude/projects/{proj}/*.jsonl
+      local-agent (Windows, and Mac when no VM bundle is in use):
+        {cowork_root}/{account}/{workspace}/local_*/.audit.jsonl
+
+    The VM-bundle shape exposes Claude Code's transcript files mounted
+    inside Cowork's Linux VM. The local-agent shape is Cowork's own audit
+    log, written natively when no VM is involved. Schemas are compatible
+    enough that `process_session` handles both (see `_audit_timestamp`
+    fallback there).
 
     Accepts either a single root (legacy single-path callers) or a list of
     candidate roots. With multiple roots, dedups by file-relative path
@@ -1031,10 +1040,15 @@ def iter_cowork_transcript_files(
     roots transiently. Iteration order matters: the first root in the list
     wins the dedup, so callers pass `claude-code-sessions` first.
 
-    Scoped glob guards against wandering into audit logs, sessions/, etc.
+    Scoped globs guard against wandering into sessions/, shim-lib/, etc.
     """
     roots = [cowork_root] if isinstance(cowork_root, Path) else list(cowork_root)
     effective_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+
+    patterns = (
+        "*/*/local_*/.claude/projects/*/*.jsonl",
+        "*/*/local_*/.audit.jsonl",
+    )
 
     seen_relpaths: set[str] = set()
     for root in roots:
@@ -1045,20 +1059,21 @@ def iter_cowork_transcript_files(
             continue
 
         emitted_count = 0
-        for jsonl_path in root.glob("*/*/local_*/.claude/projects/*/*.jsonl"):
-            try:
-                rel = str(jsonl_path.relative_to(root))
-            except ValueError:
-                rel = str(jsonl_path)
-            if rel in seen_relpaths:
-                continue
-            try:
-                if jsonl_path.stat().st_mtime >= effective_cutoff:
-                    seen_relpaths.add(rel)
-                    emitted_count += 1
-                    yield jsonl_path
-            except OSError:
-                continue
+        for pattern in patterns:
+            for jsonl_path in root.glob(pattern):
+                try:
+                    rel = str(jsonl_path.relative_to(root))
+                except ValueError:
+                    rel = str(jsonl_path)
+                if rel in seen_relpaths:
+                    continue
+                try:
+                    if jsonl_path.stat().st_mtime >= effective_cutoff:
+                        seen_relpaths.add(rel)
+                        emitted_count += 1
+                        yield jsonl_path
+                except OSError:
+                    continue
         _log_scan_diagnostic(
             f"cowork_root_path resolved={root} exists=True file_count={emitted_count}"
         )
@@ -1148,7 +1163,9 @@ def process_session(
                     continue
 
                 msg = event.get("message") or {}
-                ts = _parse_timestamp(event.get("timestamp"))
+                ts = _parse_timestamp(
+                    event.get("timestamp") or event.get("_audit_timestamp")
+                )
                 d = _ts_to_date(ts) or fallback_date
                 event_type = event.get("type")
 

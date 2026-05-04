@@ -47,7 +47,6 @@ LOG_PATH = CONFIG_DIR / "hook.log"
 # local catches up. Read by hook_nudge_if_stale.py to print one-line nudge.
 STALE_VERSION_PATH = CONFIG_DIR / "stale_version"
 
-GATE_SECONDS = 24 * 60 * 60
 MAX_WINDOW_DAYS = 30
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
@@ -250,10 +249,9 @@ def _run(logger: logging.Logger) -> None:
             return
 
         last_upload_at = _read_last_upload_at()
-        now_ts = time.time()
         if last_upload_at is not None:
-            age = now_ts - last_upload_at.timestamp()
-            if age < GATE_SECONDS:
+            today_utc = datetime.now(timezone.utc).date()
+            if last_upload_at.astimezone(timezone.utc).date() == today_utc:
                 logger.info("gated")
                 return
 
@@ -286,8 +284,11 @@ def _run(logger: logging.Logger) -> None:
             and not codex_daily
             and not any(inline_source_daily.values())
         ):
+            # Don't advance last_upload_at on an empty scan: a degenerate
+            # result (scanner couldn't find sessions, transit cursor glitch,
+            # etc.) must not arm the gate and lock the user out for the rest
+            # of the UTC day.
             logger.info("ok sessions=0 devices=" + device_id[:8])
-            _write_last_upload_at(_iso_now())
             return
 
         claude_intervals = _extract_source_intervals(claude_metrics, "claude_code")
