@@ -1,2 +1,2 @@
-PLUGIN_VERSION = "0.3.3"
+PLUGIN_VERSION = "0.3.4"
 USER_AGENT = f"aiqrank-plugin/{PLUGIN_VERSION} (+https://aiqrank.com)"

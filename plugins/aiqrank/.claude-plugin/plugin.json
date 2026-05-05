@@ -1,6 +1,6 @@
 {
   "name": "aiqrank",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Analyse your Claude Code transcripts and find out your AI tier. Scores computed locally — only metrics are sent to aiqrank.com.",
   "homepage": "https://aiqrank.com",
   "repository": "https://github.com/aiqrank/plugin",
