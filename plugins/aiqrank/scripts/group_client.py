@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Interactive AIQ Rank company client.
+"""Interactive AIQ Rank group client.
 
 Subcommands:
   redeem <token>   Show consent text, prompt to confirm, then POST
-                   /api/plugin/companies/redeem.
-  leave <slug>     POST /api/plugin/companies/leave (self-leave).
-  list             GET /api/plugin/companies/list and print the user's
-                   companies.
+                   /api/plugin/groups/redeem.
+  leave <slug>     POST /api/plugin/groups/leave (self-leave).
+  list             GET /api/plugin/groups/list and print the user's
+                   groups.
 
 Authenticates by `device_id` read from `~/.config/aiqrank/device.json`
 (written by upload_metrics.py during normal pairing).
@@ -31,20 +31,20 @@ from _version import USER_AGENT  # noqa: E402
 DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 DEVICE_PATH = CONFIG_DIR / "device.json"
-CONSENT_VERSION = "v1"
+CONSENT_VERSION = "v3"
 
 CONSENT_TEMPLATE = (
-    "Joining means company admins will have access to the names of skills\n"
-    "and MCP servers you use, plus your daily activity metrics (sessions,\n"
-    "tool calls, scores). They will not have access to your transcripts,\n"
-    "prompts, or code.\n"
+    "Joining means the private leaderboard's admins will have access to the\n"
+    "names of skills and MCP servers you use, plus your daily activity\n"
+    "metrics (sessions, tool calls, scores). They will not have access to\n"
+    "your transcripts, prompts, or code.\n"
     "\n"
-    "You can leave at any time with /aiqrank:company-leave <slug>.\n"
+    "You can leave at any time with /aiqrank:group-leave <slug>.\n"
 )
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="company_client.py")
+    parser = argparse.ArgumentParser(prog="group_client.py")
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -58,9 +58,9 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_redeem = sub.add_parser("redeem", help="Redeem a join token.")
     p_redeem.add_argument("token")
-    p_leave = sub.add_parser("leave", help="Leave a company.")
+    p_leave = sub.add_parser("leave", help="Leave a group.")
     p_leave.add_argument("slug")
-    sub.add_parser("list", help="List your companies.")
+    sub.add_parser("list", help="List your groups.")
 
     args = parser.parse_args(argv)
 
@@ -88,7 +88,7 @@ def main(argv: list[str]) -> int:
 def cmd_redeem(base_url: str, device_id: str, token: str, force_yes: bool) -> int:
     print(CONSENT_TEMPLATE)
 
-    if not confirm("Join this company?", force_yes):
+    if not confirm("Join this group?", force_yes):
         print("Cancelled — no membership created.")
         return 0
 
@@ -105,15 +105,15 @@ def cmd_redeem(base_url: str, device_id: str, token: str, force_yes: bool) -> in
 
     try:
         resp = http_request(
-            base_url + "/api/plugin/companies/redeem", method="POST", payload=payload
+            base_url + "/api/plugin/groups/redeem", method="POST", payload=payload
         )
     except HttpError as exc:
         print_error_for_redeem(exc)
         return 1
 
-    company = resp.get("company") or {}
+    group = resp.get("group") or {}
     already = bool(resp.get("already_member"))
-    name = company.get("name") or company.get("slug") or "the company"
+    name = group.get("name") or group.get("slug") or "the group"
     if already:
         print(f"Already a member of {name}.")
     else:
@@ -156,14 +156,14 @@ def cmd_leave(base_url: str, device_id: str, slug: str, force_yes: bool) -> int:
 
     try:
         http_request(
-            base_url + "/api/plugin/companies/leave", method="POST", payload=payload
+            base_url + "/api/plugin/groups/leave", method="POST", payload=payload
         )
     except HttpError as exc:
         err = exc.body.get("error") if isinstance(exc.body, dict) else None
         if err == "not_a_member":
             fail(f"you are not a member of {slug}")
-        elif err == "company_not_found":
-            fail(f"no company with slug {slug}")
+        elif err == "group_not_found":
+            fail(f"no group with slug {slug}")
         elif err == "last_admin":
             fail("you are the last admin — promote someone else first")
         else:
@@ -180,20 +180,20 @@ def cmd_leave(base_url: str, device_id: str, slug: str, force_yes: bool) -> int:
 def cmd_list(base_url: str, device_id: str) -> int:
     try:
         resp = http_request(
-            base_url + f"/api/plugin/companies/list?device_id={device_id}",
+            base_url + f"/api/plugin/groups/list?device_id={device_id}",
             method="GET",
         )
     except HttpError as exc:
         fail(f"server error ({exc.status})")
         return 1
 
-    companies = resp.get("companies") or []
-    if not companies:
-        print("You have not joined any companies.")
+    groups = resp.get("groups") or []
+    if not groups:
+        print("You have not joined any groups.")
         return 0
 
-    width = max(len(c.get("slug", "")) for c in companies)
-    for c in companies:
+    width = max(len(c.get("slug", "")) for c in groups)
+    for c in groups:
         slug = c.get("slug", "?")
         name = c.get("name", "?")
         role = c.get("role", "?")
