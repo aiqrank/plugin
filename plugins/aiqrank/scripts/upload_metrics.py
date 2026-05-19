@@ -33,6 +33,7 @@ DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 DEVICE_PATH = CONFIG_DIR / "device.json"
 LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
+STANDALONE_SOURCES = {"codex"}
 
 
 def main(argv: list[str]) -> int:
@@ -130,9 +131,16 @@ def build_payload(metrics: dict, role: str) -> dict | None:
             return None
         return {"daily": daily, "by_source": by_source, "inferred_role": role}
 
+    source = metrics.get("source")
     daily = metrics.get("daily")
     if not isinstance(daily, list) or not daily:
         return None
+    if isinstance(source, str) and source in STANDALONE_SOURCES:
+        source_data = {"daily": daily}
+        unknown_event_types = metrics.get("_unknown_event_types")
+        if isinstance(unknown_event_types, dict):
+            source_data["_unknown_event_types"] = unknown_event_types
+        return {"daily": [], "by_source": {source: source_data}, "inferred_role": role}
     return {"daily": daily, "inferred_role": role}
 
 

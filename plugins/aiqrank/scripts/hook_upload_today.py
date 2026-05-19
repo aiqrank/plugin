@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Silent background uploader — SessionStart hook.
+"""Silent background uploader — runs on SessionStart and SessionEnd.
+
+SessionStart detaches and exits so the upload can take longer than the
+hook timeout without blocking the prompt. SessionEnd (used in Claude
+Code on the web, where containers are torn down at session end) runs
+synchronously and relies on the hook timeout to bound runtime.
 
 Never writes to stdout/stderr. Logs to ~/.config/aiqrank/hook.log
 (rotated at ~1MB, mode 0600). Always exits 0 so Claude Code startup
@@ -151,8 +156,15 @@ def _respawn_detached_and_exit() -> None:
     DEVNULL on stdin/stdout/stderr is required on both platforms so the
     detached child does not inherit Claude Code's hook pipes — without
     this, the hook timeout never fires on Windows.
+
+    In Claude Code on the web (CLAUDE_CODE_REMOTE=true), the container
+    is reclaimed as soon as the session ends, so a detached child gets
+    killed mid-upload. Run synchronously instead and rely on the hook's
+    timeout to bound runtime.
     """
     if os.environ.get("AIQRANK_DETACHED") == "1":
+        return
+    if _is_cloud_remote():
         return
     new_env = dict(os.environ)
     new_env["AIQRANK_DETACHED"] = "1"
@@ -232,6 +244,16 @@ def main() -> int:
 
 
 def _run(logger: logging.Logger) -> None:
+    # In Claude Code on the web, SessionStart fires on a fresh container
+    # before the user has done anything, so there's nothing to upload.
+    # SessionEnd owns the cloud upload path. Skip SessionStart entirely
+    # in cloud mode to avoid a wasted scan + POST every session. Local
+    # mode keeps running both hooks (the daily gate makes the second one
+    # a fast `gated` no-op).
+    if _is_cloud_remote() and os.environ.get("AIQRANK_HOOK") == "session_start":
+        logger.info("cloud skip session_start")
+        return
+
     device_id = _read_device_id()
     if not device_id:
         logger.info("no device")
@@ -249,7 +271,10 @@ def _run(logger: logging.Logger) -> None:
             return
 
         last_upload_at = _read_last_upload_at()
-        if last_upload_at is not None:
+        # Cloud containers are ephemeral and each session's data is
+        # distinct, so skip the once-per-UTC-day gate. The server is
+        # idempotent on (device_id, date), so re-uploading is safe.
+        if last_upload_at is not None and not _is_cloud_remote():
             today_utc = datetime.now(timezone.utc).date()
             if last_upload_at.astimezone(timezone.utc).date() == today_utc:
                 logger.info("gated")
@@ -376,7 +401,7 @@ def _maybe_scan_codex(logger: logging.Logger) -> dict | None:
         cmd += ["--mtime-after", cutoff_iso]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_scan_timeout_sec())
         return json.loads(result.stdout)
     except subprocess.TimeoutExpired:
         logger.info("codex scan error TimeoutExpired")
@@ -688,7 +713,19 @@ def _chunk_daily(daily: list, chunk_size: int) -> list[list]:
     return [daily[i : i + chunk_size] for i in range(0, len(daily), chunk_size)]
 
 
+_DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,128}")
+
+
 def _read_device_id() -> str | None:
+    # Env-var fallback so cloud/CI environments can seed identity
+    # without a setup script that writes device.json into an ephemeral
+    # ~/.config/aiqrank. Validate shape because the value lands in log
+    # lines (`device_id[:8]`) and the upload payload — a newline-bearing
+    # value would forge log entries; whitespace or pathological values
+    # would produce a malformed identity.
+    env_id = (os.environ.get("AIQRANK_DEVICE_ID") or "").strip()
+    if env_id and _DEVICE_ID_RE.fullmatch(env_id):
+        return env_id
     if not DEVICE_PATH.exists():
         return None
     try:
@@ -703,6 +740,26 @@ def _is_disabled() -> bool:
     if os.environ.get("HOOK_DISABLED", "").lower() in ("1", "true", "yes"):
         return True
     return DISABLED_FLAG.exists()
+
+
+def _is_cloud_remote() -> bool:
+    # Accept the same truthy spellings _is_disabled does — strict
+    # `== "true"` would silently disable the cloud branches if Claude
+    # Code on the web ever emits "1" / "True" / "yes".
+    return os.environ.get("CLAUDE_CODE_REMOTE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _scan_timeout_sec() -> int:
+    # Cloud SessionEnd is bounded at 60s wall clock by Claude Code (see
+    # hooks.json), and the synchronous pipeline stacks _run_scan +
+    # _maybe_scan_codex + N × _post_upload — so each leg must fit
+    # comfortably inside that ceiling. Local (detached) runs keep the
+    # original generous budget.
+    return 20 if _is_cloud_remote() else 60
+
+
+def _upload_timeout_sec() -> int:
+    return 10 if _is_cloud_remote() else 30
 
 
 def _read_last_upload_at() -> datetime | None:
@@ -748,7 +805,7 @@ def _run_scan() -> dict:
         capture_output=True,
         text=True,
         check=True,
-        timeout=60,
+        timeout=_scan_timeout_sec(),
     )
     return json.loads(result.stdout)
 
@@ -766,7 +823,7 @@ def _post_upload(payload: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=_upload_timeout_sec()) as resp:
         response = json.loads(resp.read())
     if isinstance(response, dict):
         _record_latest_version(response.get("latest_plugin_version"))

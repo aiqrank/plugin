@@ -3,6 +3,8 @@
 Analyse your Claude Code transcripts to compute and share your AI
 proficiency score.
 
+Profiles, leaderboards, and groups live at <https://www.aiqrank.com>.
+
 ## Install
 
 ```
@@ -20,7 +22,7 @@ Install Claude Code (the CLI in Terminal, or the **Code** tab in
 Claude Desktop) and run `/aiqrank` there. It scans both your
 Claude Code _and_ Cowork activity in a single pass.
 
-Full instructions: <https://aiqrank.com/setup>
+Full instructions: <https://www.aiqrank.com/setup>
 
 ## Supported tools
 

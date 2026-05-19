@@ -13,7 +13,21 @@
           {
             "type": "command",
             "shell": "bash",
-            "command": "PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -u \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_upload_today.py\" || true"
+            "timeout": 60,
+            "command": "PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && AIQRANK_HOOK=session_start \"$PY\" -u \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_upload_today.py\" || true"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "timeout": 60,
+            "command": "PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && AIQRANK_HOOK=session_end \"$PY\" -u \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_upload_today.py\" || true"
           }
         ]
       }
