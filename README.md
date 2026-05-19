@@ -12,6 +12,16 @@ proficiency score.
 
 Then run `/aiqrank` to get started.
 
+### Cowork
+
+Cowork chat sessions can't reach your Claude session folders, so
+install AIQ Rank from the Customize menu, then create a schedule
+with **Default user home** as the working directory and set the
+action to **Run /aiqrank**. Trigger the schedule once to compute
+your score.
+
+Full instructions: <https://aiqrank.com/setup>
+
 ## Supported tools
 
 The plugin scans and scores activity from all of these tools in a single run:
