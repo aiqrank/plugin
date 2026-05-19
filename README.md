@@ -12,13 +12,13 @@ proficiency score.
 
 Then run `/aiqrank` to get started.
 
-### Cowork
+### Cowork users
 
-Cowork chat sessions can't reach your Claude session folders, so
-install AIQ Rank from the Customize menu, then create a schedule
-with **Default user home** as the working directory and set the
-action to **Run /aiqrank**. Trigger the schedule once to compute
-your score.
+AIQ Rank can't run from inside Cowork — the chat sandbox (and
+scheduled tasks) can't reach your transcript files on the host.
+Install Claude Code (the CLI in Terminal, or the **Code** tab in
+Claude Desktop) and run `/aiqrank` there. It scans both your
+Claude Code _and_ Cowork activity in a single pass.
 
 Full instructions: <https://aiqrank.com/setup>
 
