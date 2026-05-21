@@ -417,6 +417,7 @@ def scan(
     local_skills: set[str] = set()
     for home in homes:
         local_skills |= _local_claude_skills(home)
+        local_skills |= _project_local_claude_skills(home)
 
     seen_claude_transcripts: set[str] = set()
     for home in homes:
@@ -1386,18 +1387,93 @@ def _local_claude_skills(home: Path) -> set[str]:
     missing or unreadable. Excludes the aiqrank self-skill.
     """
     skills_dir = home / "skills"
-    if not skills_dir.is_dir():
+    return _enumerate_skill_dir(skills_dir)
+
+
+def _project_local_claude_skills(home: Path) -> set[str]:
+    """Snapshot of project-local Claude skills authored under any cwd the user
+    has worked from.
+
+    For each project dir under `<home>/projects/`, extracts the real cwd from
+    the first transcript event that has one, then enumerates
+    `<cwd>/.claude/skills/<name>/SKILL.md`. Returns the union across all
+    visited projects.
+
+    Without this, slash-command invocations of project-local skills like
+    `/prune-branches` are dropped at scan_transcripts.py's `local_skills`
+    membership filter because `_local_claude_skills` only sees
+    `~/.claude/skills/`.
+    """
+    projects = home / "projects"
+    if not projects.is_dir():
         return set()
     names: set[str] = set()
+    seen_cwds: set[Path] = set()
     try:
-        for entry in skills_dir.iterdir():
-            if entry.name == "aiqrank":
-                continue
-            if entry.is_dir() and (entry / "SKILL.md").is_file():
-                names.add(entry.name)
+        project_dirs = list(projects.iterdir())
     except OSError:
         return set()
+    for project_dir in project_dirs:
+        if not project_dir.is_dir():
+            continue
+        cwd = _extract_cwd_from_project(project_dir)
+        if cwd is None or cwd in seen_cwds:
+            continue
+        seen_cwds.add(cwd)
+        names |= _enumerate_skill_dir(cwd / ".claude" / "skills")
     return names
+
+
+def _enumerate_skill_dir(skills_dir: Path) -> set[str]:
+    """Return bare names of skill subdirectories containing SKILL.md,
+    excluding the aiqrank self-skill. Shared helper for global and
+    project-local enumeration."""
+    if not skills_dir.is_dir():
+        return set()
+    try:
+        entries = list(skills_dir.iterdir())
+    except OSError:
+        return set()
+    names: set[str] = set()
+    for entry in entries:
+        if entry.name == "aiqrank":
+            continue
+        try:
+            if entry.is_dir() and (entry / "SKILL.md").is_file():
+                names.add(entry.name)
+        except OSError:
+            continue
+    return names
+
+
+def _extract_cwd_from_project(project_dir: Path) -> Path | None:
+    """Return the first valid `cwd` Path found in any transcript under
+    `project_dir`, or None.
+
+    Scans up to the first 10 events of each jsonl. Early events are usually
+    system bookkeeping (e.g. queue-operation) without `cwd`; the first real
+    session event carries it.
+    """
+    try:
+        jsonls = sorted(project_dir.glob("*.jsonl"))
+    except OSError:
+        return None
+    for jsonl in jsonls:
+        try:
+            with jsonl.open("r", encoding="utf-8") as fh:
+                for i, line in enumerate(fh):
+                    if i >= 10:
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cwd = event.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        return Path(cwd)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
 
 
 # Slash-command marker emitted by Claude Code in the user message body when
