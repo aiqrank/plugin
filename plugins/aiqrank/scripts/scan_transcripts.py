@@ -200,6 +200,9 @@ _COUNT_FIELDS = (
     "queue_events",
     "scheduled_task_runs",
     "reasoning_blocks",
+    "prs_opened",
+    "main_tool_calls",
+    "main_user_messages",
 )
 
 _PEAK_FIELDS = (
@@ -214,6 +217,15 @@ _DICT_FIELDS = (
     "skill_counts",
     "mcp_server_counts",
     "agent_type_counts",
+    # Model usage is captured verbatim (e.g. "claude-opus-4-6") with no
+    # normalization, so future analysis can distinguish model versions and
+    # drift. Display normalizes to families. `model_usage` is main-session
+    # only; `agent_model_usage` holds subagent transcripts (which carry the
+    # subagent's model, not the user's choice). `model_tokens_out` is
+    # per-model output tokens for main sessions.
+    "model_usage",
+    "agent_model_usage",
+    "model_tokens_out",
 )
 
 # List-valued fields that aggregate via set-union across days. Server-side
@@ -1102,6 +1114,26 @@ def iter_transcript_files(
             yield subagent_path
 
 
+# Detect a `gh pr create` invocation in a Bash command. We strip heredoc
+# bodies first, then require `gh pr create` as a command token (start of
+# string or after a shell separator), so a PR whose `--body` text merely
+# mentions the phrase does not count. The command string is tested and
+# discarded — never stored or logged.
+_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?\n.*?\n\s*\1\b", re.DOTALL)
+_PR_CREATE_RE = re.compile(r"(?:^|[\n;&|`(])\s*gh\s+pr\s+create\b")
+
+
+def _command_opens_pr(command: str) -> bool:
+    """True if the Bash command opens a PR via `gh pr create`."""
+    # Cheap reject: every match needs the literal "create" token. Guard on
+    # that (not "gh pr create", which would miss `gh   pr   create`) and cap
+    # length so the heredoc regex can't be a ReDoS lever on a huge command.
+    if not command or "create" not in command or len(command) > 100_000:
+        return False
+    stripped = _HEREDOC_RE.sub(" ", command)
+    return bool(_PR_CREATE_RE.search(stripped))
+
+
 def process_session(
     path: Path,
     daily: dict[date, dict],
@@ -1207,10 +1239,30 @@ def process_session(
                         bucket["tokens_cache_creation"] += tc
                         bucket["tokens_total"] += ti + to + tr + tc
 
+                        # Capture the model verbatim. Subagent transcripts
+                        # carry the subagent's model (a framework default the
+                        # user didn't choose), so keep them in a separate
+                        # histogram and out of the user-facing mix.
+                        model = msg.get("model")
+                        if model:
+                            if is_main:
+                                bucket["model_usage"][model] = (
+                                    bucket["model_usage"].get(model, 0) + 1
+                                )
+                                bucket["model_tokens_out"][model] = (
+                                    bucket["model_tokens_out"].get(model, 0) + to
+                                )
+                            else:
+                                bucket["agent_model_usage"][model] = (
+                                    bucket["agent_model_usage"].get(model, 0) + 1
+                                )
+
                 if event.get("type") == "user":
                     text = content_to_text(msg.get("content"))
                     if text:
                         bucket["user_messages"] += 1
+                        if is_main:
+                            bucket["main_user_messages"] += 1
                         if _CORRECTION_RE.search(text[:_CORRECTION_SCAN_PREFIX]):
                             bucket["user_corrections"] += 1
 
@@ -1253,6 +1305,8 @@ def process_session(
                     for tool_use in turn_tool_uses:
                         bucket["tool_calls"] += 1
                         days_with_tools.add(d)
+                        if is_main:
+                            bucket["main_tool_calls"] += 1
 
                         name = tool_use.get("name", "")
                         if not name:
@@ -1263,6 +1317,14 @@ def process_session(
                         bucket["tool_name_counts"][name] = (
                             bucket["tool_name_counts"].get(name, 0) + 1
                         )
+
+                        # PRs opened via AI: detect `gh pr create` in the Bash
+                        # command. The command string is tested and discarded —
+                        # never stored or logged (it can contain secrets).
+                        if name == "Bash" and _command_opens_pr(
+                            (tool_use.get("input") or {}).get("command", "")
+                        ):
+                            bucket["prs_opened"] += 1
 
                         if name == SKILL_TOOL:
                             skill = (tool_use.get("input") or {}).get("skill")

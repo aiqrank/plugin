@@ -96,9 +96,15 @@ _PEAK_FIELDS = (
     "max_messages_in_session",
 )
 
+# Dict fields must match AIQRank.Metrics @dict_fields (server-side aggregation).
 _DICT_FIELDS = (
     "tool_name_counts",
     "mcp_server_counts",
+    # Captured verbatim from each `turn_context`. Codex switches model/effort
+    # mid-session, so these are per-turn histograms. `effort_usage` is the
+    # reasoning-effort level (low/medium/high) that Claude has no analog for.
+    "model_usage",
+    "effort_usage",
 )
 
 
@@ -251,7 +257,15 @@ def _process_session(
                 continue
 
             if top_type == "turn_context":
-                # Redundant with session_meta for our metrics.
+                # Capture the model and reasoning-effort the user chose for
+                # this turn. Codex names the effort field `effort` (low/medium/
+                # high). Both are stored verbatim.
+                model = payload.get("model")
+                if model:
+                    bucket["model_usage"][model] = bucket["model_usage"].get(model, 0) + 1
+                effort = payload.get("effort")
+                if effort:
+                    bucket["effort_usage"][effort] = bucket["effort_usage"].get(effort, 0) + 1
                 continue
 
             if top_type == "compacted":
