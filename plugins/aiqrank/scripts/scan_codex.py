@@ -63,7 +63,9 @@ from scan_transcripts import (  # noqa: E402  -- shared helpers
     _CORRECTION_RE,
     _CORRECTION_SCAN_PREFIX,
     _parse_timestamp,
+    _serialize_intervals,
     _ts_to_date,
+    _window_active_daily,
 )
 
 
@@ -138,6 +140,7 @@ def scan(
     sessions_root = home / "sessions"
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
+    cutoff_date = datetime.fromtimestamp(cutoff_ts).date()  # see _window_active_daily
     effective_cutoff = (
         cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
     )
@@ -164,17 +167,14 @@ def scan(
     for d, verbs in command_verbs_per_day.items():
         _bucket(daily, d)["command_diversity"] = len(verbs)
 
-    daily = {d: m for d, m in daily.items() if _has_activity(m)}
+    daily = _window_active_daily(daily, cutoff_date, _has_activity)
 
     daily_list = [
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
     rollup = _rollup_from_daily(daily.values())
 
-    intervals_serialized = {
-        d.isoformat(): [[s, e] for (s, e) in ivs]
-        for d, ivs in intervals_by_day.items()
-    }
+    intervals_serialized = _serialize_intervals(intervals_by_day, cutoff_date)
 
     return {
         "source": "codex",

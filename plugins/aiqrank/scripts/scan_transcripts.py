@@ -378,6 +378,7 @@ def scan(
     homes = [claude_dir] if claude_dir is not None else [h / ".claude" for h in host_homes]
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
+    cutoff_date = datetime.fromtimestamp(cutoff_ts).date()  # see _window_active_daily
 
     # `cowork_root` resolution:
     #   - explicit value (tests, custom installs) is always honored; legacy
@@ -659,24 +660,17 @@ def scan(
         if source == SOURCE_CURSOR and not cursor_emit:
             continue
 
-        # Drop days that recorded zero activity (a meta-only day with no
-        # parseable agentType, for example).
-        active_daily = {
-            d: m for d, m in daily_by_source[source].items() if _has_activity(m)
-        }
+        active_daily = _window_active_daily(
+            daily_by_source[source], cutoff_date, _has_activity
+        )
         daily_list = [
             {"date": d.isoformat(), "metrics": m}
             for d, m in sorted(active_daily.items())
         ]
         rollup = _rollup_from_daily(active_daily.values())
-
-        # Serialize intervals as ISO-keyed lists so the upload hook can
-        # union them across sources to compute a combined peak. Stays
-        # local — the hook strips them before posting to the server.
-        intervals_serialized = {
-            d.isoformat(): [[s, e] for (s, e) in ivs]
-            for d, ivs in intervals_by_source[source].items()
-        }
+        intervals_serialized = _serialize_intervals(
+            intervals_by_source[source], cutoff_date
+        )
 
         by_source[source] = {
             "daily": daily_list,
@@ -702,6 +696,39 @@ def _has_activity(metrics: dict) -> bool:
     if any(metrics.get(f) for f in _LIST_FIELDS):
         return True
     return False
+
+
+def _window_active_daily(
+    daily: dict[date, dict], cutoff_date: date, has_activity
+) -> dict[date, dict]:
+    """Keep only in-window days that recorded activity.
+
+    Files are filtered by mtime, but events are bucketed by their own timestamp
+    date, so a recently-touched long or resumed transcript can drag in
+    day-buckets from before the window. Dropping `d < cutoff_date` keeps the
+    emitted window matching `window_days`; `has_activity` also drops
+    zero-activity (meta-only) days. The activity predicate is passed in because
+    each scanner counts a different field set.
+    """
+    return {
+        d: m for d, m in daily.items() if d >= cutoff_date and has_activity(m)
+    }
+
+
+def _serialize_intervals(
+    intervals_by_day: dict[date, list], cutoff_date: date
+) -> dict[str, list]:
+    """ISO-key the in-window session intervals for the upload hook.
+
+    The hook unions these across sources into a combined concurrency peak, then
+    strips them before posting. Bounding by `cutoff_date` keeps that combined
+    source within the window too.
+    """
+    return {
+        d.isoformat(): [[s, e] for (s, e) in ivs]
+        for d, ivs in intervals_by_day.items()
+        if d >= cutoff_date
+    }
 
 
 def _daily_by_date_with_rollup_only(result: dict, now_ts: float) -> dict[date, dict]:
@@ -1597,6 +1624,7 @@ def scan_codex(
     sessions_root = codex_dir / "sessions"
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
+    cutoff_date = datetime.fromtimestamp(cutoff_ts).date()
     effective_cutoff = (
         cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
     )
@@ -1620,7 +1648,7 @@ def scan_codex(
             intervals, min_secs
         )
 
-    daily = {d: m for d, m in daily.items() if _has_activity(m)}
+    daily = _window_active_daily(daily, cutoff_date, _has_activity)
     daily_list = [
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
