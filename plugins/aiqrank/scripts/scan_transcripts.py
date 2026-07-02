@@ -483,6 +483,16 @@ def scan(
                 except (json.JSONDecodeError, OSError):
                     continue
 
+    # Parity with the OpenCode/Cursor scanners: skills present on disk under
+    # ~/.claude/skills/<name>/ (and project-local .claude/skills/) count as
+    # authored even when no Write/Edit for them was captured in the retained
+    # transcript window. Seed them into the most recent Claude day so the
+    # backend's cross-day union picks them up. Only an existing active day is
+    # touched — never a fabricated zero-activity day.
+    claude_daily = daily_by_source[SOURCE_CLAUDE_CODE]
+    if local_skills and claude_daily:
+        _seed_authored_into_latest_day(claude_daily, local_skills, now_ts)
+
     # Cowork root: same Claude Code JSONL format, but nested inside sandboxed
     # session directories at .../local_*/.claude/projects/<projectDir>/*.jsonl.
     # Events land in the cowork source bucket.
@@ -549,6 +559,13 @@ def scan(
                 except OSError:
                     continue
                 process_codex_session(rollout_path, codex_daily, codex_intervals)
+
+        # Parity with Claude Code: skills on disk under ~/.codex/skills/<name>/
+        # count as authored even when no write for them was captured in the
+        # window. Codex authorship was otherwise transcript-write-only.
+        codex_skills = _enumerate_skill_dir(codex_dir / "skills")
+        if codex_skills and codex_daily:
+            _seed_authored_into_latest_day(codex_daily, codex_skills, now_ts)
 
     # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
     # Skipped silently when the DB is absent.
@@ -731,6 +748,40 @@ def _serialize_intervals(
     }
 
 
+def _seed_authored_into_latest_day(
+    daily_by_date: dict[date, dict], names: Iterable[str], now_ts: float
+) -> None:
+    """Union `names` into the most recent day's `authored_skill_names`, adding
+    only names not already present on any day. Mutates `daily_by_date` in place.
+
+    Surfaces skills that exist on disk (or in a sub-scanner rollup) but have no
+    reliable event day of their own. Callers that must not fabricate a
+    zero-activity day should guard on a non-empty `daily_by_date` before calling.
+    """
+    incoming = {name for name in names if isinstance(name, str) and name}
+    if not incoming:
+        return
+    existing = {
+        name
+        for m in daily_by_date.values()
+        for name in ((m or {}).get("authored_skill_names") or [])
+        if isinstance(name, str) and name
+    }
+    missing = incoming - existing
+    if not missing:
+        return
+    target_day = max(
+        daily_by_date.keys(), default=datetime.fromtimestamp(now_ts).date()
+    )
+    target = _bucket(daily_by_date, target_day)
+    current = {
+        name
+        for name in (target.get("authored_skill_names") or [])
+        if isinstance(name, str) and name
+    }
+    target["authored_skill_names"] = sorted(current | missing)
+
+
 def _daily_by_date_with_rollup_only(result: dict, now_ts: float) -> dict[date, dict]:
     """Import a sub-scanner daily list and preserve metrics it can only put
     in rollup, such as local authored skills with no reliable event day."""
@@ -763,25 +814,9 @@ def _daily_by_date_with_rollup_only(result: dict, now_ts: float) -> dict[date, d
             - existing_skill_count
         )
 
-    existing_names = {
-        name
-        for m in daily_by_date.values()
-        for name in ((m or {}).get("authored_skill_names") or [])
-        if isinstance(name, str) and name
-    }
-    rollup_names = {
-        name
-        for name in (rollup.get("authored_skill_names") or [])
-        if isinstance(name, str) and name
-    }
-    missing_names = rollup_names - existing_names
-    if missing_names:
-        names = {
-            name
-            for name in (target.get("authored_skill_names") or [])
-            if isinstance(name, str) and name
-        }
-        target["authored_skill_names"] = sorted(names | missing_names)
+    _seed_authored_into_latest_day(
+        daily_by_date, rollup.get("authored_skill_names") or [], now_ts
+    )
 
     return daily_by_date
 
