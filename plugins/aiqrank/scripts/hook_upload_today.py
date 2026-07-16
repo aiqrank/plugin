@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _version import PLUGIN_VERSION, USER_AGENT  # noqa: E402
 from infer_role import classify_role  # noqa: E402
+from install_codex import install_bundled  # noqa: E402
 from scan_transcripts import max_concurrent_sustained, min_sustained_secs  # noqa: E402
 
 # Server-supplied version strings written to disk and printed by the nudge
@@ -44,7 +45,6 @@ DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 DEVICE_PATH = CONFIG_DIR / "device.json"
 LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
-LAST_UPLOAD_PATH_CODEX = CONFIG_DIR / "last_upload_at_codex"
 LOCK_PATH = CONFIG_DIR / "upload.lock"
 DISABLED_FLAG = CONFIG_DIR / "disabled"
 LOG_PATH = CONFIG_DIR / "hook.log"
@@ -298,7 +298,7 @@ def _run(logger: logging.Logger) -> None:
             sample = []
         inferred_role = classify_role(sample).get("inferred_role") or "engineer"
 
-        codex_data = _maybe_scan_codex(logger)
+        codex_data = _maybe_scan_codex(logger, claude_metrics)
 
         codex_daily = (codex_data or {}).get("daily") or []
         unknown_event_types = (codex_data or {}).get("_unknown_event_types") or {}
@@ -346,8 +346,6 @@ def _run(logger: logging.Logger) -> None:
 
         now_iso = _iso_now()
         _write_last_upload_at(now_iso)
-        if codex_data is not None:
-            _write_codex_upload_at(now_iso)
         logger.info(
             f"ok sessions={len(claude_daily)} cowork_days={len(cowork_daily)} "
             f"codex_days={len(codex_daily)} "
@@ -364,51 +362,42 @@ def _run(logger: logging.Logger) -> None:
             pass
 
 
-def _install_codex_prompt() -> None:
-    """Copy the /aiqrank Codex prompt to ~/.codex/prompts/ if not already installed."""
-    codex_prompts_dir = Path.home() / ".codex" / "prompts"
-    dest = codex_prompts_dir / "aiqrank.md"
-    if dest.exists():
-        return
-    source = Path(__file__).resolve().parent.parent / "codex_prompts" / "aiqrank.md"
-    if not source.exists():
-        return
-    try:
-        codex_prompts_dir.mkdir(parents=True, exist_ok=True)
-        dest.write_text(source.read_text())
-    except OSError:
-        pass
+def _maybe_scan_codex(logger: logging.Logger, full_scan: dict) -> dict | None:
+    """Return the canonical Codex block already produced by the full scan.
 
-
-def _maybe_scan_codex(logger: logging.Logger) -> dict | None:
-    """Return Codex scan results if ~/.codex/sessions/ exists, else None."""
+    `partial` results are upload-safe because the scanner has removed every
+    localized bad date. A `failed` result has an unlocalizable failure, so the
+    Codex source is omitted while other complete sources can still upload.
+    """
     if not CODEX_SESSIONS_DIR.is_dir():
         return None
 
-    # Opportunistically install the Codex /aiqrank prompt on first discovery.
-    _install_codex_prompt()
-
-    last_codex_at = _read_codex_upload_at()
-    script = Path(__file__).resolve().parent / "scan_codex.py"
-
-    cmd = [sys.executable, str(script)]
-    if last_codex_at is None:
-        # First run: 30-day backfill, no --mtime-after.
-        cmd += ["--days", str(MAX_WINDOW_DAYS)]
-    else:
-        cmd += ["--days", str(MAX_WINDOW_DAYS)]
-        cutoff_iso = last_codex_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        cmd += ["--mtime-after", cutoff_iso]
-
+    plugin_root = Path(__file__).resolve().parent.parent
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_scan_timeout_sec())
-        return json.loads(result.stdout)
-    except subprocess.TimeoutExpired:
-        logger.info("codex scan error TimeoutExpired")
+        install_bundled(plugin_root, warn=logger.info)
+    except Exception as exc:
+        logger.info(f"codex managed install error {type(exc).__name__}")
+
+    by_source = full_scan.get("by_source") if isinstance(full_scan, dict) else None
+    codex = by_source.get("codex") if isinstance(by_source, dict) else None
+    if not isinstance(codex, dict):
         return None
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as e:
-        logger.info(f"codex scan error {type(e).__name__}")
+
+    completeness = codex.get("completeness")
+    status = completeness.get("status") if isinstance(completeness, dict) else "complete"
+    failure_count = completeness.get("failure_count", 0) if isinstance(completeness, dict) else 0
+    failure_count = failure_count if isinstance(failure_count, int) and failure_count >= 0 else 0
+    omitted_dates = completeness.get("omitted_dates", []) if isinstance(completeness, dict) else []
+    omitted_count = len(omitted_dates) if isinstance(omitted_dates, list) else 0
+
+    if status == "failed":
+        logger.info(f"codex completeness failed failures={failure_count}")
         return None
+    if status == "partial":
+        logger.info(
+            f"codex completeness partial failures={failure_count} omitted_dates={omitted_count}"
+        )
+    return codex
 
 
 def _post_by_source(
@@ -681,14 +670,14 @@ def _build_by_source_payload(
     so older servers that haven't added "cowork" to their allow-list don't
     reject the payload when the user has no autonomous activity.
     """
-    codex_source: dict = {"daily": codex_daily}
-    if unknown_event_types:
-        codex_source["_unknown_event_types"] = unknown_event_types
-
     by_source: dict = {
         "claude_code": {"daily": claude_daily},
-        "codex": codex_source,
     }
+    if codex_daily or unknown_event_types:
+        codex_source: dict = {"daily": codex_daily}
+        if unknown_event_types:
+            codex_source["_unknown_event_types"] = unknown_event_types
+        by_source["codex"] = codex_source
     if cowork_daily:
         by_source["cowork"] = {"daily": cowork_daily}
     for source, daily in (extra_sources_daily or {}).items():
@@ -766,10 +755,6 @@ def _read_last_upload_at() -> datetime | None:
     return _read_timestamp_file(LAST_UPLOAD_PATH)
 
 
-def _read_codex_upload_at() -> datetime | None:
-    return _read_timestamp_file(LAST_UPLOAD_PATH_CODEX)
-
-
 def _read_timestamp_file(path: Path) -> datetime | None:
     if not path.exists():
         return None
@@ -791,11 +776,6 @@ def _read_timestamp_file(path: Path) -> datetime | None:
 def _write_last_upload_at(ts: str) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     LAST_UPLOAD_PATH.write_text(ts + "\n")
-
-
-def _write_codex_upload_at(ts: str) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    LAST_UPLOAD_PATH_CODEX.write_text(ts + "\n")
 
 
 def _run_scan() -> dict:

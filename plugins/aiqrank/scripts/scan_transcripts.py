@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from datetime import date, datetime
@@ -117,6 +118,13 @@ CODEX_PATCH_FILE_RE = re.compile(
 CODEX_SKILLS_DIR_FRAGMENT = "/.codex/skills/"
 CODEX_SKILL_NAME_RE = re.compile(r"\.codex/skills/([^/]+)/")
 CODEX_CONFIG_TOML_BASENAMES = ("/.codex/config.toml",)
+CODEX_MAX_LABEL_LENGTH = 100
+CODEX_MAX_DICT_KEYS = 50
+CODEX_OTHER_LABEL = "__other__"
+_CODEX_LABEL_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+_CODEX_MALFORMED_TIMESTAMP_RE = re.compile(
+    r'["\']timestamp["\']\s*:\s*["\']([^"\']+)["\']'
+)
 
 _CORRECTION_RE = re.compile(
     r"""
@@ -200,6 +208,9 @@ _COUNT_FIELDS = (
     "queue_events",
     "scheduled_task_runs",
     "reasoning_blocks",
+    "command_diversity",
+    "file_changes",
+    "agents_md_writes",
     "prs_opened",
     "main_tool_calls",
     "main_user_messages",
@@ -226,6 +237,7 @@ _DICT_FIELDS = (
     "model_usage",
     "agent_model_usage",
     "model_tokens_out",
+    "effort_usage",
 )
 
 # List-valued fields that aggregate via set-union across days. Server-side
@@ -423,6 +435,7 @@ def scan(
     }
     first_messages_sample: list[str] = []
     custom_skills_seen: set[str] = set()
+    codex_result: dict | None = None
 
     # Snapshot the user's locally-owned skills (bare-name slash commands).
     # Used by process_session to count `<command-name>/<n></command-name>`
@@ -545,27 +558,23 @@ def scan(
     # when the directory doesn't exist (user hasn't installed Codex).
     codex_emit = codex_dir.exists()
     if codex_emit:
-        codex_daily = daily_by_source[SOURCE_CODEX]
-        codex_intervals = intervals_by_source[SOURCE_CODEX]
-        sessions_root = codex_dir / "sessions"
-        effective_cutoff = (
-            cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
+        codex_result = scan_codex(
+            codex_dir,
+            window_days=window_days,
+            now_ts=now_ts,
+            mtime_after_ts=mtime_after_ts,
         )
-        if sessions_root.is_dir():
-            for rollout_path in sessions_root.rglob("rollout-*.jsonl"):
+        if codex_result is not None:
+            for date_str, intervals in codex_result.get("intervals_by_day", {}).items():
                 try:
-                    if rollout_path.stat().st_mtime < effective_cutoff:
-                        continue
-                except OSError:
+                    d = date.fromisoformat(date_str)
+                except (TypeError, ValueError):
                     continue
-                process_codex_session(rollout_path, codex_daily, codex_intervals)
-
-        # Parity with Claude Code: skills on disk under ~/.codex/skills/<name>/
-        # count as authored even when no write for them was captured in the
-        # window. Codex authorship was otherwise transcript-write-only.
-        codex_skills = _enumerate_skill_dir(codex_dir / "skills")
-        if codex_skills and codex_daily:
-            _seed_authored_into_latest_day(codex_daily, codex_skills, now_ts)
+                intervals_by_source[SOURCE_CODEX][d] = [
+                    (float(interval[0]), float(interval[1]))
+                    for interval in intervals
+                    if isinstance(interval, (list, tuple)) and len(interval) >= 2
+                ]
 
     # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
     # Skipped silently when the DB is absent.
@@ -660,6 +669,8 @@ def scan(
     # >= min_sustained_secs within the day — see DEFAULT_MIN_SUSTAINED_SECS.
     min_secs = min_sustained_secs()
     for source in ALL_SOURCES:
+        if source == SOURCE_CODEX and codex_result is not None:
+            continue
         for d, intervals in intervals_by_source[source].items():
             bucket = _bucket(daily_by_source[source], d)
             bucket["max_concurrent_sessions"] = max_concurrent_sustained(
@@ -675,6 +686,9 @@ def scan(
         if source == SOURCE_OPENCODE and not opencode_emit:
             continue
         if source == SOURCE_CURSOR and not cursor_emit:
+            continue
+        if source == SOURCE_CODEX and codex_result is not None:
+            by_source[source] = codex_result
             continue
 
         active_daily = _window_active_daily(
@@ -1646,12 +1660,12 @@ def scan_codex(
     now_ts: float | None = None,
     mtime_after_ts: float | None = None,
 ) -> dict | None:
-    """Scan `codex_dir/sessions/` for Codex CLI transcript data.
+    """Canonical Codex scanner used by every integrated and standalone path.
 
-    Returns `{daily: [...], rollup: {...}}` or `None` when `codex_dir` does
-    not exist (e.g. the user has not installed Codex). Standalone helper
-    primarily used by tests; the main `scan()` orchestrator inlines this
-    walk so it can share `_LIST_FIELDS` accumulators with the other sources.
+    Completeness is fail-closed because server rows use replacement upserts.
+    A malformed record with a recoverable timestamp omits only that date. A
+    stat/read/change failure (or malformed record without a date) marks the
+    source failed and clears `daily`, preventing a partial replacement upload.
     """
     if not codex_dir.exists():
         return None
@@ -1660,21 +1674,103 @@ def scan_codex(
     now_ts = now_ts or time.time()
     cutoff_ts = now_ts - (window_days * 86400)
     cutoff_date = datetime.fromtimestamp(cutoff_ts).date()
-    effective_cutoff = (
-        cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
-    )
+    # Codex rows are replacement upserts, so an mtime cursor would turn this
+    # into an unsafe partial snapshot. Retain the argument for caller/CLI
+    # compatibility but always scan the complete rolling window.
+    effective_cutoff = cutoff_ts
 
     daily: dict[date, dict] = {}
     intervals_by_day: dict[date, list[tuple[float, float]]] = {}
+    command_verbs_by_day: dict[date, set[str]] = {}
+    unknown_event_types: dict[str, int] = {}
+    launches_by_day: dict[date, set[str]] = {}
+    activity_by_identity: dict[
+        str, tuple[date, tuple[int, int, str, str, str]]
+    ] = {}
+    seen_launches: set[str] = set()
+    seen_mcp_completions: set[str] = set()
+    incomplete_dates: set[date] = set()
+    unlocalizable_failures = 0
+    failure_count = 0
 
     if sessions_root.is_dir():
-        for rollout_path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            rollout_paths = list(sessions_root.rglob("rollout-*.jsonl"))
+        except OSError:
+            rollout_paths = []
+            unlocalizable_failures += 1
+            failure_count += 1
+
+        for rollout_path in sorted(rollout_paths):
             try:
                 if rollout_path.stat().st_mtime < effective_cutoff:
                     continue
             except OSError:
+                unlocalizable_failures += 1
+                failure_count += 1
                 continue
-            process_codex_session(rollout_path, daily, intervals_by_day)
+            outcome = process_codex_session(
+                rollout_path,
+                daily,
+                intervals_by_day,
+                command_verbs_by_day,
+                unknown_event_types,
+                seen_mcp_completions,
+            )
+            incomplete_dates.update(outcome["incomplete_dates"])
+            unlocalizable_failures += outcome["unlocalizable_failures"]
+            failure_count += outcome["failure_count"]
+            for d, identities in outcome["launches_by_day"].items():
+                unique_launches = identities - seen_launches
+                seen_launches.update(unique_launches)
+                launches_by_day.setdefault(d, set()).update(unique_launches)
+            for d, activity in outcome["activity_by_day"].items():
+                for item in activity:
+                    identity = item[2]
+                    current = activity_by_identity.get(identity)
+                    if current is None or abs(item[0] - item[1]) < abs(
+                        current[1][0] - current[1][1]
+                    ):
+                        activity_by_identity[identity] = (d, item)
+
+    for d, launch_ids in launches_by_day.items():
+        if launch_ids:
+            _bucket(daily, d)["parallel_agent_turns"] += len(launch_ids)
+
+    activity_by_day: dict[date, list[tuple[int, int, str, str, str]]] = {}
+    for d, item in activity_by_identity.values():
+        activity_by_day.setdefault(d, []).append(item)
+
+    for d, activity in activity_by_day.items():
+        started_by_batch: dict[int, set[str]] = {}
+        for batch_timestamp, _occurred, _identity, agent_thread_id, kind in activity:
+            if kind == "started":
+                started_by_batch.setdefault(batch_timestamp, set()).add(agent_thread_id)
+        peak = max((len(agent_ids) for agent_ids in started_by_batch.values()), default=0)
+        if peak:
+            bucket = _bucket(daily, d)
+            bucket["max_parallel_agents"] = max(bucket["max_parallel_agents"], peak)
+
+    for d, verbs in command_verbs_by_day.items():
+        _bucket(daily, d)["command_diversity"] = len(verbs)
+
+    for d in incomplete_dates:
+        daily.pop(d, None)
+        intervals_by_day.pop(d, None)
+
+    if unlocalizable_failures:
+        daily.clear()
+        intervals_by_day.clear()
+
+    codex_skills = {
+        _normalize_codex_label(name)
+        for name in _enumerate_skill_dir(codex_dir / "skills")
+    }
+    if codex_skills and daily:
+        _seed_authored_into_latest_day(daily, codex_skills, now_ts)
+
+    for metrics in daily.values():
+        _finalize_codex_metric_dicts(metrics)
 
     min_secs = min_sustained_secs()
     for d, intervals in intervals_by_day.items():
@@ -1688,16 +1784,40 @@ def scan_codex(
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
     rollup = _rollup_from_daily(daily.values())
+    if unlocalizable_failures:
+        completeness_status = "failed"
+    elif incomplete_dates:
+        completeness_status = "partial"
+    else:
+        completeness_status = "complete"
 
-    return {"daily": daily_list, "rollup": rollup}
+    return {
+        "daily": daily_list,
+        "rollup": rollup,
+        "intervals_by_day": _serialize_intervals(intervals_by_day, cutoff_date),
+        "_unknown_event_types": _cap_codex_dictionary(unknown_event_types),
+        "completeness": {
+            "status": completeness_status,
+            "omitted_dates": sorted(d.isoformat() for d in incomplete_dates),
+            "failure_count": failure_count,
+        },
+    }
 
 
 def process_codex_session(
     path: Path,
     daily: dict[date, dict],
     intervals_by_day: dict[date, list[tuple[float, float]]],
-) -> None:
-    """Parse one Codex rollout JSONL file into per-day buckets."""
+    command_verbs_by_day: dict[date, set[str]] | None = None,
+    unknown_event_types: dict[str, int] | None = None,
+    seen_mcp_completions: set[str] | None = None,
+) -> dict:
+    """Parse one Codex rollout and return aggregate-only completeness facts."""
+    command_verbs_by_day = command_verbs_by_day if command_verbs_by_day is not None else {}
+    unknown_event_types = unknown_event_types if unknown_event_types is not None else {}
+    seen_mcp_completions = (
+        seen_mcp_completions if seen_mcp_completions is not None else set()
+    )
     days_seen: set[date] = set()
     days_with_tools: set[date] = set()
     days_with_orchestration: set[date] = set()
@@ -1705,75 +1825,315 @@ def process_codex_session(
     msgs_per_day: dict[date, int] = {}
     earliest_per_day: dict[date, float] = {}
     latest_per_day: dict[date, float] = {}
+    launches_by_day: dict[date, set[str]] = {}
+    activity_by_day: dict[date, list[tuple[int, int, str, str, str]]] = {}
+    incomplete_dates: set[date] = set()
+    unlocalizable_failures = 0
+    failure_count = 0
 
     try:
-        fallback_date = datetime.fromtimestamp(path.stat().st_mtime).date()
+        before_stat = path.stat()
+        fallback_date = datetime.fromtimestamp(before_stat.st_mtime).date()
     except OSError:
-        return
+        return {
+            "incomplete_dates": set(),
+            "unlocalizable_failures": 1,
+            "failure_count": 1,
+            "launches_by_day": {},
+            "activity_by_day": {},
+        }
 
-    try:
-        with path.open("r") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
+    read_errors = 0
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    def parsed_events(*, record_parse_failures: bool):
+        nonlocal failure_count, read_errors, unlocalizable_failures
+        try:
+            fh = path.open("r")
+        except OSError:
+            read_errors += 1
+            return
 
-                ev_type = event.get("type")
-                payload = event.get("payload")
-                if not isinstance(payload, dict):
-                    payload = {}
+        try:
+            with fh:
+                for ordinal, raw_line in enumerate(fh):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
 
-                ts = _parse_timestamp(event.get("timestamp"))
-                d = _ts_to_date(ts) or fallback_date
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        if record_parse_failures:
+                            failure_count += 1
+                            hinted_date = _codex_malformed_line_date(line)
+                            if hinted_date is None:
+                                unlocalizable_failures += 1
+                            else:
+                                incomplete_dates.add(hinted_date)
+                        continue
+                    if not isinstance(event, dict):
+                        if record_parse_failures:
+                            failure_count += 1
+                            unlocalizable_failures += 1
+                        continue
 
-                if ts is not None:
-                    if d not in earliest_per_day or ts < earliest_per_day[d]:
-                        earliest_per_day[d] = ts
-                    if d not in latest_per_day or ts > latest_per_day[d]:
-                        latest_per_day[d] = ts
+                    ts = _parse_timestamp(event.get("timestamp"))
+                    d = _ts_to_date(ts) or fallback_date
+                    yield ordinal, event, d, ts
+        except OSError:
+            read_errors += 1
 
-                bucket = _bucket(daily, d)
+    output_success: dict[str, bool] = {}
+    mcp_completion_ids: set[str] = set()
+    for ordinal, event, _d, _ts in parsed_events(record_parse_failures=True):
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        p_type = payload.get("type")
+        call_id = payload.get("call_id")
+        if p_type in ("function_call_output", "custom_tool_call_output") and isinstance(call_id, str):
+            output_success[call_id] = output_success.get(call_id, False) or _codex_output_succeeded(payload)
+        elif event.get("type") == "event_msg" and p_type == "exec_command_end" and isinstance(call_id, str):
+            output_success[call_id] = int(payload.get("exit_code") or 0) == 0
+        elif event.get("type") == "event_msg" and p_type == "mcp_tool_call_end":
+            mcp_completion_ids.add(
+                call_id if isinstance(call_id, str) and call_id else f"mcp-event-{ordinal}"
+            )
 
-                if ev_type == "response_item":
+    if read_errors:
+        return {
+            "incomplete_dates": incomplete_dates,
+            "unlocalizable_failures": unlocalizable_failures + 1,
+            "failure_count": failure_count + 1,
+            "launches_by_day": {},
+            "activity_by_day": {},
+        }
+
+    seen_direct_calls: set[str] = set()
+    seen_activity_events: set[str] = set()
+    skill_candidates: list[tuple[date, dict, str]] = []
+
+    for ordinal, event, d, ts in parsed_events(record_parse_failures=False):
+        if ts is not None:
+            if d not in earliest_per_day or ts < earliest_per_day[d]:
+                earliest_per_day[d] = ts
+            if d not in latest_per_day or ts > latest_per_day[d]:
+                latest_per_day[d] = ts
+
+        days_seen.add(d)
+        bucket = _bucket(daily, d)
+        ev_type = event.get("type")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        p_type = payload.get("type")
+
+        if ev_type == "session_meta" or ev_type == "compacted":
+            continue
+
+        if ev_type == "turn_context":
+            _increment_codex_dict(bucket, "model_usage", payload.get("model"))
+            _increment_codex_dict(bucket, "effort_usage", payload.get("effort"))
+            continue
+
+        if ev_type == "event_msg":
+            if p_type == "user_message":
+                text = payload.get("message")
+                if isinstance(text, str) and text:
+                    bucket["user_messages"] += 1
+                    bucket["main_user_messages"] += 1
                     bucket["messages"] += 1
                     msgs_per_day[d] = msgs_per_day.get(d, 0) + 1
-                    days_seen.add(d)
+                    if _CORRECTION_RE.search(text[:_CORRECTION_SCAN_PREFIX]):
+                        bucket["user_corrections"] += 1
+                continue
 
-                    p_type = payload.get("type")
-                    if p_type == "reasoning":
-                        bucket["reasoning_blocks"] += 1
-                    elif p_type in CODEX_TOOL_TYPES:
-                        _process_codex_tool_call(
-                            payload,
+            if p_type == "agent_message":
+                bucket["messages"] += 1
+                msgs_per_day[d] = msgs_per_day.get(d, 0) + 1
+                continue
+
+            if p_type == "agent_reasoning":
+                bucket["reasoning_blocks"] += 1
+                continue
+
+            if p_type == "token_count":
+                info = payload.get("info")
+                usage = info.get("last_token_usage") if isinstance(info, dict) else None
+                if isinstance(usage, dict):
+                    ti = _codex_int(usage.get("input_tokens"))
+                    to = _codex_int(usage.get("output_tokens"))
+                    tr = _codex_int(usage.get("cached_input_tokens"))
+                    bucket["tokens_input"] += ti
+                    bucket["tokens_output"] += to
+                    bucket["tokens_cache_read"] += tr
+                    bucket["tokens_total"] += _codex_int(
+                        usage.get("total_tokens"), default=ti + to + tr
+                    )
+                continue
+
+            if p_type == "sub_agent_activity":
+                event_id = payload.get("event_id")
+                identity = (
+                    event_id
+                    if isinstance(event_id, str) and event_id
+                    else f"activity-event-{ordinal}"
+                )
+                if identity in seen_activity_events:
+                    continue
+                seen_activity_events.add(identity)
+                agent_thread_id = payload.get("agent_thread_id")
+                kind = payload.get("kind")
+                if isinstance(agent_thread_id, str) and isinstance(kind, str):
+                    occurred = _codex_int(payload.get("occurred_at_ms"), default=ordinal)
+                    activity_date = _ts_to_date(occurred / 1000) or d
+                    batch_timestamp = int(ts * 1000) if ts is not None else occurred
+                    activity_by_day.setdefault(activity_date, []).append(
+                        (
+                            batch_timestamp,
+                            occurred,
+                            identity,
+                            agent_thread_id,
+                            kind.lower(),
+                        )
+                    )
+                    if kind.lower() == "started":
+                        launches_by_day.setdefault(activity_date, set()).add(identity)
+                continue
+
+            if p_type == "mcp_tool_call_end":
+                identity = payload.get("call_id")
+                if not isinstance(identity, str) or not identity:
+                    identity = f"mcp-event-{ordinal}"
+                if identity in seen_mcp_completions:
+                    continue
+                seen_mcp_completions.add(identity)
+                invocation = payload.get("invocation")
+                if isinstance(invocation, dict):
+                    server = invocation.get("server")
+                    tool = invocation.get("tool")
+                    if isinstance(server, str) and server:
+                        tool_name = f"mcp__{server}__{tool or 'call'}"
+                        _apply_codex_tool_effects(
                             bucket,
+                            tool_name,
+                            payload,
+                            d,
+                            identity,
                             days_with_orchestration,
                             days_with_plan_mode,
-                            d,
+                            launches_by_day,
+                            command_verbs_by_day,
                         )
                         days_with_tools.add(d)
-                elif ev_type == "event_msg":
-                    p_type = payload.get("type")
-                    if p_type == "token_count":
-                        info = payload.get("info")
-                        if isinstance(info, dict):
-                            usage = info.get("last_token_usage") or {}
-                            if isinstance(usage, dict):
-                                ti = int(usage.get("input_tokens") or 0)
-                                to = int(usage.get("output_tokens") or 0)
-                                tr = int(usage.get("cached_input_tokens") or 0)
-                                # Codex doesn't separately report cache-creation
-                                # tokens; leave that field zero.
-                                bucket["tokens_input"] += ti
-                                bucket["tokens_output"] += to
-                                bucket["tokens_cache_read"] += tr
-                                bucket["tokens_total"] += ti + to + tr
+                continue
+
+            if p_type in {
+                "task_started", "task_complete", "turn_aborted", "context_compacted",
+                "exec_command_begin", "exec_command_end", "exec_command_output_delta",
+                "patch_apply_begin", "patch_apply_end", "agent_message_delta",
+                "agent_reasoning_delta", "agent_reasoning_raw_content",
+                "agent_reasoning_raw_content_delta", "agent_reasoning_section_break",
+                "mcp_tool_call_begin",
+            }:
+                continue
+
+            _record_codex_unknown(unknown_event_types, ev_type, p_type)
+            continue
+
+        if ev_type == "response_item":
+            if p_type == "reasoning":
+                bucket["reasoning_blocks"] += 1
+                continue
+
+            if p_type in CODEX_TOOL_TYPES or p_type == "web_search_call":
+                call_id = payload.get("call_id")
+                identity = (
+                    call_id
+                    if isinstance(call_id, str) and call_id
+                    else f"response-item-{ordinal}"
+                )
+                if identity in seen_direct_calls:
+                    continue
+                seen_direct_calls.add(identity)
+                name = "web_search" if p_type == "web_search_call" else payload.get("name")
+                if isinstance(name, str) and name.startswith("mcp__") and identity in mcp_completion_ids:
+                    continue
+                if not isinstance(name, str) or not name:
+                    continue
+
+                _apply_codex_tool_effects(
+                    bucket,
+                    name,
+                    payload,
+                    d,
+                    identity,
+                    days_with_orchestration,
+                    days_with_plan_mode,
+                    launches_by_day,
+                    command_verbs_by_day,
+                )
+                days_with_tools.add(d)
+
+                if isinstance(call_id, str) and call_id:
+                    skill_candidates.append((d, payload, call_id))
+
+                code = payload.get("input")
+                if isinstance(code, str):
+                    for nested_index, nested_name in enumerate(_extract_nested_codex_tools(code)):
+                        if nested_name.startswith("mcp__"):
+                            continue
+                        nested_identity = f"{identity}:nested:{nested_index}"
+                        _apply_codex_tool_effects(
+                            bucket,
+                            nested_name,
+                            {"input": code},
+                            d,
+                            nested_identity,
+                            days_with_orchestration,
+                            days_with_plan_mode,
+                            launches_by_day,
+                            command_verbs_by_day,
+                            nested=True,
+                        )
+                continue
+
+            if p_type in {
+                "function_call_output", "custom_tool_call_output", "message",
+                "tool_search_output",
+            }:
+                continue
+
+            _record_codex_unknown(unknown_event_types, ev_type, p_type)
+            continue
+
+        _record_codex_unknown(unknown_event_types, ev_type, p_type)
+
+    if read_errors:
+        failure_count += read_errors
+        unlocalizable_failures += read_errors
+
+    try:
+        after_stat = path.stat()
+        if (
+            before_stat.st_mtime_ns != after_stat.st_mtime_ns
+            or before_stat.st_size != after_stat.st_size
+        ):
+            failure_count += 1
+            unlocalizable_failures += 1
     except OSError:
-        return
+        failure_count += 1
+        unlocalizable_failures += 1
+
+    skill_names_seen: set[str] = set()
+    for d, payload, call_id in skill_candidates:
+        if not output_success.get(call_id, False):
+            continue
+        for skill_path in _codex_successful_skill_reads(payload):
+            skill_name = _codex_skill_name(skill_path)
+            if skill_name and skill_name not in skill_names_seen:
+                skill_names_seen.add(skill_name)
+                _increment_codex_dict(_bucket(daily, d), "skill_counts", skill_name)
 
     for d in days_seen:
         bucket = _bucket(daily, d)
@@ -1788,8 +2148,9 @@ def process_codex_session(
 
     for d, count in msgs_per_day.items():
         bucket = _bucket(daily, d)
-        if count > bucket["max_messages_in_session"]:
-            bucket["max_messages_in_session"] = count
+        bucket["max_messages_in_session"] = max(
+            bucket["max_messages_in_session"], count
+        )
 
     for d, start in earliest_per_day.items():
         end = latest_per_day.get(d, start)
@@ -1797,45 +2158,49 @@ def process_codex_session(
             end = start + 1.0
         intervals_by_day.setdefault(d, []).append((start, end))
 
+    return {
+        "incomplete_dates": incomplete_dates,
+        "unlocalizable_failures": unlocalizable_failures,
+        "failure_count": failure_count,
+        "launches_by_day": launches_by_day,
+        "activity_by_day": activity_by_day,
+    }
 
-def _process_codex_tool_call(
-    payload: dict,
+
+def _apply_codex_tool_effects(
     bucket: dict,
+    name: str,
+    payload: dict,
+    d: date,
+    identity: str,
     days_with_orchestration: set[date],
     days_with_plan_mode: set[date],
-    d: date,
+    launches_by_day: dict[date, set[str]],
+    command_verbs_by_day: dict[date, set[str]],
+    *,
+    nested: bool = False,
 ) -> None:
-    """Apply the field-level effects of one Codex tool-call payload."""
-    name = payload.get("name") or ""
+    """Apply one direct, nested, or MCP-completion tool signal."""
+    name = _normalize_tool_name(_normalize_codex_label(name))
+    if not name:
+        return
     bucket["tool_calls"] += 1
+    bucket["main_tool_calls"] += 1
+    _increment_codex_dict(bucket, "tool_name_counts", name)
 
-    if name:
-        bucket["tool_name_counts"][name] = (
-            bucket["tool_name_counts"].get(name, 0) + 1
-        )
-
-    # MCP-style names map to the same `mcp__<server>__*` convention as
-    # Claude — preserve the helper. (Codex sessions in the wild rarely
-    # produce these today, but the contract is stable.)
     if name.startswith("mcp__"):
         parts = name.split("__")
         server = parts[1] if len(parts) >= 3 else ""
         if server:
-            bucket["mcp_server_counts"][server] = (
-                bucket["mcp_server_counts"].get(server, 0) + 1
-            )
+            _increment_codex_dict(bucket, "mcp_server_counts", server)
 
     if name == "spawn_agent":
         days_with_orchestration.add(d)
-        bucket["parallel_agent_turns"] += 1
+        launches_by_day.setdefault(d, set()).add(identity)
 
-        # Optionally bucket spawned agent_type counts (mirrors Claude's
-        # subagent meta.json scan).
         agent_type = _codex_arg(payload, "agent_type")
         if isinstance(agent_type, str) and agent_type:
-            bucket["agent_type_counts"][agent_type] = (
-                bucket["agent_type_counts"].get(agent_type, 0) + 1
-            )
+            _increment_codex_dict(bucket, "agent_type_counts", agent_type)
 
     elif name == "wait_agent":
         targets = _codex_arg(payload, "targets")
@@ -1848,11 +2213,22 @@ def _process_codex_tool_call(
         days_with_plan_mode.add(d)
         bucket["plan_mode_invocations"] += 1
 
-    # File-write primitives — Codex's `apply_patch` plus the more general
-    # `Write` / `Edit` names if a custom tool surfaces them.
+    if name in {"shell", "exec_command"}:
+        verb = _shell_verb(payload.get("arguments"))
+        if verb:
+            command_verbs_by_day.setdefault(d, set()).add(verb)
+
     target_paths: list[str] = []
     if name == "apply_patch":
+        bucket["file_changes"] += 1
         target_paths = _codex_apply_patch_files(payload)
+        if nested and not target_paths:
+            code = payload.get("input")
+            if isinstance(code, str):
+                target_paths = re.findall(
+                    r"(?:^|\\n|\n)\*\*\* (?:Update|Add|Delete) File: ([^\\\n]+)",
+                    code,
+                )
     elif name in ("Write", "Edit"):
         fp = _codex_arg(payload, "file_path") or _codex_arg(payload, "path")
         if isinstance(fp, str) and fp:
@@ -1872,14 +2248,300 @@ def _process_codex_tool_call(
         # Codex AGENTS.md (Claude's CLAUDE.md equivalent). Tracked under
         # the same `claude_md_writes` field — server-side scoring is
         # field-name-agnostic per the dual-source plan.
-        if target_path.endswith("/AGENTS.md") or target_path.endswith("/CLAUDE.md"):
+        if (
+            target_path == "AGENTS.md"
+            or target_path == "CLAUDE.md"
+            or target_path.endswith("/AGENTS.md")
+            or target_path.endswith("/CLAUDE.md")
+        ):
             bucket["claude_md_writes"] += 1
+            if target_path.endswith("/AGENTS.md") or target_path == "AGENTS.md":
+                bucket["agents_md_writes"] += 1
 
         # MCP config: `~/.codex/config.toml` plus any `*.mcp.json` style.
         if any(target_path.endswith(suffix) for suffix in CODEX_CONFIG_TOML_BASENAMES):
             bucket["custom_mcp_config_writes"] += 1
         elif target_path.endswith("/.mcp.json") or target_path.endswith("/mcp.json"):
             bucket["custom_mcp_config_writes"] += 1
+
+
+def _codex_malformed_line_date(line: str) -> date | None:
+    match = _CODEX_MALFORMED_TIMESTAMP_RE.search(line)
+    if not match:
+        return None
+    return _ts_to_date(_parse_timestamp(match.group(1)))
+
+
+def _record_codex_unknown(store: dict[str, int], top_type, payload_type) -> None:
+    key = _normalize_codex_label(
+        f"{top_type or '<no-type>'}:{payload_type or '<no-payload-type>'}"
+    )
+    store[key] = store.get(key, 0) + 1
+
+
+def _codex_int(value, default: int = 0) -> int:
+    try:
+        return int(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_codex_label(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    label = _CODEX_LABEL_RE.sub("_", value.strip()).strip("_")
+    return label[:CODEX_MAX_LABEL_LENGTH]
+
+
+def _increment_codex_dict(bucket: dict, field: str, raw_label, amount: int = 1) -> None:
+    label = _normalize_codex_label(raw_label)
+    if not label:
+        return
+    target = bucket[field]
+    target[label] = target.get(label, 0) + amount
+
+
+def _cap_codex_dictionary(values: dict) -> dict:
+    clean: dict[str, int] = {}
+    for key, value in values.items():
+        label = _normalize_codex_label(key)
+        count = _codex_int(value)
+        if label and count > 0:
+            clean[label] = clean.get(label, 0) + count
+    if len(clean) <= CODEX_MAX_DICT_KEYS:
+        return clean
+    ordered = sorted(clean.items(), key=lambda item: (-item[1], item[0]))
+    kept = dict(ordered[: CODEX_MAX_DICT_KEYS - 1])
+    kept[CODEX_OTHER_LABEL] = sum(value for _key, value in ordered[CODEX_MAX_DICT_KEYS - 1 :])
+    return kept
+
+
+def _finalize_codex_metric_dicts(metrics: dict) -> None:
+    for field in ("tool_name_counts", "skill_counts", "mcp_server_counts", "agent_type_counts"):
+        metrics[field] = _cap_codex_dictionary(metrics.get(field) or {})
+
+
+def _codex_output_succeeded(payload: dict) -> bool:
+    status = payload.get("status")
+    if isinstance(status, str) and status.lower() in {"failed", "error", "cancelled"}:
+        return False
+    output = payload.get("output")
+    try:
+        text = output if isinstance(output, str) else json.dumps(output)
+    except (TypeError, ValueError):
+        text = ""
+    lowered = text[:500].lower()
+    return not any(
+        marker in lowered
+        for marker in (
+            "script failed",
+            "error: command failed",
+            "no such file or directory",
+            '"exit_code": 1',
+        )
+    )
+
+
+def _codex_successful_skill_reads(payload: dict) -> list[Path]:
+    name = payload.get("name")
+    if not isinstance(name, str):
+        return []
+    text = _codex_call_text(payload)
+    if not text:
+        return []
+    return [
+        path
+        for path in _codex_skill_paths(text)
+        if path.is_file() and _codex_path_was_read(name, text, path)
+    ]
+
+
+def _codex_call_text(payload: dict) -> str:
+    raw = payload.get("arguments")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            command = parsed.get("cmd") or parsed.get("command")
+            if isinstance(command, list):
+                return " ".join(str(part) for part in command)
+            if isinstance(command, str):
+                return command
+            for key in ("path", "file_path"):
+                if isinstance(parsed.get(key), str):
+                    return parsed[key]
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        return raw_input
+    return ""
+
+
+def _codex_path_was_read(name: str, text: str, path: Path) -> bool:
+    if name.lower() in {"read", "read_file"}:
+        return True
+    if name not in {"shell", "exec_command", "exec"}:
+        return False
+    path_forms = {str(path), str(path).replace(str(Path.home()), "~", 1)}
+    for path_form in path_forms:
+        for match in re.finditer(re.escape(path_form), text):
+            # Modern Codex wraps nested exec_command calls in JavaScript, so
+            # delimiters such as `;` surround the outer call rather than the
+            # shell command. Inspect a bounded window around the concrete path
+            # instead of assuming a plain shell command line.
+            segment = text[max(0, match.start() - 300) : match.end() + 80]
+            lowered = segment.lower()
+            if re.search(
+                r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|\bchmod\b|\bsed\s+-i\b)",
+                lowered,
+            ):
+                continue
+            if re.search(r"\b(?:cat|sed|head|tail|bat|less)\b", lowered):
+                return True
+    return False
+
+
+def _codex_skill_paths(text: str) -> list[Path]:
+    candidates: set[str] = set()
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    for token in tokens:
+        cleaned = token.strip("'\"(){}[],;:")
+        if cleaned.endswith("/SKILL.md") and (cleaned.startswith("/") or cleaned.startswith("~/")):
+            candidates.add(cleaned)
+
+    # JavaScript orchestration embeds the shell command inside an object
+    # literal, so shlex tokens include JSON/JS punctuation around the path.
+    # Extract absolute or home-relative paths directly without retaining any
+    # surrounding command text in scanner output.
+    candidates.update(
+        match.group(1).rstrip()
+        for match in re.finditer(
+            r"((?:~|/)[^\"'`\\\n\r{}()\[\],;]*?/SKILL\.md)",
+            text,
+        )
+    )
+    return [Path(candidate).expanduser() for candidate in sorted(candidates)]
+
+
+def _codex_skill_name(path: Path) -> str | None:
+    try:
+        with path.open("r") as fh:
+            for _ in range(30):
+                line = fh.readline()
+                if not line:
+                    break
+                match = re.match(r"\s*name:\s*['\"]?([^'\"\n]+)", line)
+                if match:
+                    name = _normalize_codex_label(match.group(1))
+                    return name or None
+    except OSError:
+        return None
+    name = _normalize_codex_label(path.parent.name)
+    return name or None
+
+
+def _extract_nested_codex_tools(code: str) -> list[str]:
+    """Lexically find `tools.<name>(...)` outside JS strings/comments."""
+    names: list[str] = []
+    i = 0
+    state = "normal"
+    quote = ""
+    while i < len(code):
+        char = code[i]
+        nxt = code[i + 1] if i + 1 < len(code) else ""
+        if state == "line_comment":
+            if char == "\n":
+                state = "normal"
+            i += 1
+            continue
+        if state == "block_comment":
+            if char == "*" and nxt == "/":
+                state = "normal"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state == "string":
+            if char == "\\":
+                i += 2
+            elif char == quote:
+                state = "normal"
+                i += 1
+            else:
+                i += 1
+            continue
+        if char == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if char == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if char in {"'", '"', "`"}:
+            state = "string"
+            quote = char
+            i += 1
+            continue
+        if code.startswith("tools.", i):
+            start = i + len("tools.")
+            match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", code[start:])
+            if match:
+                end = start + len(match.group(0))
+                cursor = end
+                while cursor < len(code) and code[cursor].isspace():
+                    cursor += 1
+                if cursor < len(code) and code[cursor] == "(":
+                    names.append(match.group(0))
+                    i = cursor + 1
+                    continue
+        i += 1
+    return names
+
+
+def _shell_verb(arguments) -> str | None:
+    if not isinstance(arguments, str) or not arguments:
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    command = parsed.get("cmd")
+    if isinstance(command, str) and command.strip():
+        return _first_meaningful_word(command)
+    command = parsed.get("command")
+    if not isinstance(command, list) or not command:
+        return None
+    first = command[0] if isinstance(command[0], str) else None
+    if not first:
+        return None
+    base = os.path.basename(first)
+    if base in {"bash", "sh", "zsh", "env"}:
+        for candidate in reversed(command):
+            if isinstance(candidate, str) and candidate and not candidate.startswith("-"):
+                return _first_meaningful_word(candidate)
+    return base
+
+
+def _first_meaningful_word(command: str) -> str | None:
+    for token in command.split():
+        if "=" in token and token.split("=", 1)[0].isupper():
+            continue
+        return os.path.basename(token)
+    return None
+
+
+def _patch_touches_agents_md(patch_input: str) -> bool:
+    return any(
+        Path(path).name.lower() == "agents.md"
+        for path in _codex_apply_patch_files({"input": patch_input})
+    )
 
 
 def _codex_arg(payload: dict, key: str):

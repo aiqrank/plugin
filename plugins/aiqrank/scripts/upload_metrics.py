@@ -114,22 +114,39 @@ def build_payload(metrics: dict, role: str) -> dict | None:
 
     by_source = metrics.get("by_source")
     if isinstance(by_source, dict):
+        upload_sources = {}
+        for source, source_data in by_source.items():
+            if not isinstance(source, str) or not isinstance(source_data, dict):
+                continue
+            completeness = source_data.get("completeness")
+            if (
+                source == "codex"
+                and isinstance(completeness, dict)
+                and completeness.get("status") == "failed"
+            ):
+                continue
+            source_daily = source_data.get("daily")
+            if not isinstance(source_daily, list):
+                continue
+            upload_source = {"daily": source_daily}
+            unknown_event_types = source_data.get("_unknown_event_types")
+            if source == "codex" and isinstance(unknown_event_types, dict):
+                upload_source["_unknown_event_types"] = unknown_event_types
+            upload_sources[source] = upload_source
+
         daily = metrics.get("daily")
         if not isinstance(daily, list):
             daily = []
-            claude = by_source.get("claude_code")
+            claude = upload_sources.get("claude_code")
             if isinstance(claude, dict) and isinstance(claude.get("daily"), list):
                 daily = claude["daily"]
 
         has_source_daily = any(
-            isinstance(source_data, dict)
-            and isinstance(source_data.get("daily"), list)
-            and len(source_data["daily"]) > 0
-            for source_data in by_source.values()
+            source_data["daily"] for source_data in upload_sources.values()
         )
         if not daily and not has_source_daily:
             return None
-        return {"daily": daily, "by_source": by_source, "inferred_role": role}
+        return {"daily": daily, "by_source": upload_sources, "inferred_role": role}
 
     source = metrics.get("source")
     daily = metrics.get("daily")
