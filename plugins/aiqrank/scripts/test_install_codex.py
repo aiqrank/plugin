@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -267,6 +269,20 @@ class InstallCodexTests(unittest.TestCase):
         self.assertEqual(artifacts["scripts/example.py"].destination.read_bytes(), old_script)
         self.assertEqual(artifacts["prompts/aiqrank.md"].destination.read_bytes(), old_prompt)
         self.assertEqual(manifest.read_bytes(), before_manifest)
+
+    def test_main_prints_codex_skill_invocation(self):
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(install_codex, "download_artifacts", return_value={}),
+            mock.patch.object(install_codex, "install_artifacts", return_value=True),
+            redirect_stdout(stdout),
+        ):
+            result = install_codex.main(["--base", "https://example.test"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("$aiqrank:aiqrank", stdout.getvalue())
+        self.assertNotIn("Run /aiqrank", stdout.getvalue())
 
 
 if __name__ == "__main__":

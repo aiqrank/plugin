@@ -112,6 +112,7 @@ CONTEXT_LEVERAGE_TOOLS = {
 ORCHESTRATION_TOOLS = {"Agent"}
 SKILL_TOOL = "Skill"
 PLAN_MODE_TOOL = "ExitPlanMode"
+CLAUDE_PLAN_AGENT_TOOLS = {"Agent", "Task"}
 AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 
 # Codex-specific
@@ -1494,6 +1495,16 @@ def process_session(
                             days_with_plan_mode.add(d)
                             bucket["plan_mode_invocations"] += 1
 
+                        tool_input = tool_use.get("input")
+                        if (
+                            is_main
+                            and name in CLAUDE_PLAN_AGENT_TOOLS
+                            and isinstance(tool_input, dict)
+                            and tool_input.get("subagent_type") == "Plan"
+                        ):
+                            days_with_plan_mode.add(d)
+                            bucket["plan_mode_invocations"] += 1
+
                         if name in ("Write", "Edit"):
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
 
@@ -2001,6 +2012,12 @@ def process_codex_session(
         if ev_type == "turn_context":
             _increment_codex_dict(bucket, "model_usage", payload.get("model"))
             _increment_codex_dict(bucket, "effort_usage", payload.get("effort"))
+            collaboration_mode = payload.get("collaboration_mode")
+            if (
+                isinstance(collaboration_mode, dict)
+                and collaboration_mode.get("mode") == "plan"
+            ):
+                days_with_plan_mode.add(d)
             continue
 
         if ev_type == "event_msg":

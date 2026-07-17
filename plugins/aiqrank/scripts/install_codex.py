@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-BUNDLED_VERSION = "0.3.13"
+BUNDLED_VERSION = "0.3.14"
 MANIFEST_NAME = "managed_artifacts.json"
 
 # Hashes from 0.3.10, the release immediately preceding managed upgrades.
@@ -294,7 +294,7 @@ def main(argv: list[str]) -> int:
         print("AIQ Rank setup preserved one or more modified files; review the warnings above.", file=sys.stderr)
         return 1
     print("AIQ Rank is set up for Codex.")
-    print("Run /aiqrank in any Codex session to see your score.")
+    print("Run $aiqrank:aiqrank in a new Codex session to see your score.")
     return 0
 
 

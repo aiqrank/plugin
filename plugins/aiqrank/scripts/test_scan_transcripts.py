@@ -688,6 +688,75 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(r["plan_mode_invocations"], 2)
         self.assertEqual(r["sessions_with_plan_mode"], 1)
 
+    def test_counts_exact_main_session_plan_agents_as_planning(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan-agents.jsonl",
+            [
+                make_tool_call(
+                    "Agent",
+                    {
+                        "subagent_type": "Plan",
+                        "prompt": "private-agent-prompt",
+                        "description": "private-agent-description",
+                    },
+                ),
+                make_tool_call("Task", {"subagent_type": "Plan"}),
+                make_tool_call("ExitPlanMode", {"plan": "private-plan-content"}),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["plan_mode_invocations"], 3)
+        self.assertEqual(r["sessions_with_plan_mode"], 1)
+        self.assertEqual(r["sessions_with_orchestration"], 1)
+        self.assertEqual(r["tool_name_counts"]["Agent"], 1)
+        self.assertEqual(r["tool_name_counts"]["Task"], 1)
+
+    def test_rejects_non_structural_or_nested_claude_plan_agents(self):
+        write_jsonl(
+            self.projects / "proj1" / "not-plan-agents.jsonl",
+            [
+                make_tool_call(
+                    "Agent",
+                    {
+                        "subagent_type": "general-purpose",
+                        "prompt": "Please plan this work",
+                    },
+                ),
+                make_tool_call("Agent", {"subagent_type": "plan"}),
+                make_tool_call("Agent", {"subagent_type": "PLAN"}),
+                make_tool_call("Agent", {"subagent_type": "Custom:Plan"}),
+                make_tool_call("Agent", {"prompt": "Use the Plan agent"}),
+                make_tool_call("Task", {"description": "Plan carefully"}),
+                make_tool_call("Agent", "not-a-map"),
+                make_tool_call("Task", ["not", "a", "map"]),
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "tool_use", "name": "Agent"}]
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            self.projects
+            / "proj1"
+            / "not-plan-agents"
+            / "subagents"
+            / "agent-plan.jsonl",
+            [
+                make_tool_call("Agent", {"subagent_type": "Plan"}),
+                make_tool_call("Task", {"subagent_type": "Plan"}),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["plan_mode_invocations"], 0)
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+        self.assertEqual(r["sessions_with_orchestration"], 2)
+
 
 class DailyBucketingTests(unittest.TestCase):
     def setUp(self):
@@ -1643,6 +1712,105 @@ class CodexOrchestrationTests(unittest.TestCase):
         self.assertEqual(rollup["skill_counts"], {"review": 1})
         self.assertEqual(rollup["file_changes"], 1)
         self.assertEqual(rollup["agents_md_writes"], 1)
+
+    def test_native_plan_mode_marks_only_qualifying_dates_without_invocation_inflation(self):
+        plan_context = self._codex_event({
+            "model": "gpt-5",
+            "effort": "high",
+            "collaboration_mode": {"mode": "plan"},
+        }, event_type="turn_context")
+        repeated_plan_context = dict(plan_context)
+        repeated_plan_context["timestamp"] = "2026-04-20T13:00:00.000Z"
+        default_context = self._codex_event({
+            "collaboration_mode": {"mode": "default"},
+        }, event_type="turn_context")
+        default_context["timestamp"] = "2026-04-19T12:00:00.000Z"
+        malformed_context = self._codex_event({
+            "collaboration_mode": "plan",
+        }, event_type="turn_context")
+        malformed_context["timestamp"] = "2026-04-19T13:00:00.000Z"
+        self._write_codex_session(
+            "native-plan",
+            [
+                default_context,
+                malformed_context,
+                plan_context,
+                repeated_plan_context,
+            ],
+        )
+
+        result = scan_codex(self.codex_dir, now_ts=self._CODEX_NOW)
+        rollup = result["rollup"]
+        metrics_by_date = {row["date"]: row["metrics"] for row in result["daily"]}
+
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(rollup["plan_mode_invocations"], 0)
+        self.assertEqual(metrics_by_date["2026-04-20"]["sessions_with_plan_mode"], 1)
+        self.assertEqual(metrics_by_date["2026-04-19"]["sessions_with_plan_mode"], 0)
+
+    def test_native_plan_mode_and_update_plan_share_session_credit(self):
+        native_plan = self._codex_event({
+            "collaboration_mode": {"mode": "plan"},
+        }, event_type="turn_context")
+        update_plan = self._codex_event({
+            "type": "function_call",
+            "name": "update_plan",
+            "call_id": "plan-1",
+            "arguments": json.dumps({"plan": [{"step": "private", "status": "pending"}]}),
+        })
+        self._write_codex_session(
+            "native-plan-with-tool",
+            [native_plan, update_plan, update_plan],
+        )
+
+        rollup = scan_codex(self.codex_dir, now_ts=self._CODEX_NOW)["rollup"]
+
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(rollup["plan_mode_invocations"], 1)
+
+    def test_structured_planning_signals_remain_aggregate_only(self):
+        sentinels = {
+            "prompt": "private-plan-agent-prompt-sentinel",
+            "description": "private-plan-agent-description-sentinel",
+            "plan": "private-exit-plan-content-sentinel",
+            "collaboration": "private-collaboration-setting-sentinel",
+            "developer": "private-developer-instruction-sentinel",
+        }
+        write_jsonl(
+            self.claude_dir / "projects" / "proj1" / "planning-privacy.jsonl",
+            [
+                make_tool_call(
+                    "Agent",
+                    {
+                        "subagent_type": "Plan",
+                        "prompt": sentinels["prompt"],
+                        "description": sentinels["description"],
+                    },
+                ),
+                make_tool_call("ExitPlanMode", {"plan": sentinels["plan"]}),
+            ],
+        )
+        self._write_codex_session("planning-privacy", [
+            self._codex_event({
+                "model": "gpt-5",
+                "collaboration_mode": {
+                    "mode": "plan",
+                    "settings": sentinels["collaboration"],
+                },
+                "developer_instructions": sentinels["developer"],
+            }, event_type="turn_context")
+        ])
+
+        blob = json.dumps(
+            scan(
+                claude_dir=self.claude_dir,
+                codex_dir=self.codex_dir,
+                now_ts=self._CODEX_NOW,
+            )
+        )
+
+        for sentinel in sentinels.values():
+            self.assertNotIn(sentinel, blob)
 
     def test_broadcast_sub_agent_activity_is_deduplicated_across_sessions(self):
         spawn = self._codex_event({
