@@ -33,6 +33,7 @@ The plugin scans and scores activity from all of these tools in a single run:
 - OpenAI Codex (CLI rollouts under `~/.codex/`)
 - Cursor (local SQLite store at `~/Library/Application Support/Cursor/...`)
 - OpenCode (local SQLite store at `~/.local/share/opencode/opencode.db`)
+- Pi (local JSONL sessions under `~/.pi/agent/sessions` or Pi's configured session root)
 
 Each tool gets its own per-tool leaderboard chip and profile tab. The All-tools
 aggregate combines the seven cross-tool dimensions into a single headline score.
@@ -41,7 +42,7 @@ aggregate combines the seven cross-tool dimensions into a single headline score.
 
 1. You run `/aiqrank`. The plugin opens a browser tab to `aiqrank.com/pair?session=...`.
 2. You sign in with Google or an 8-digit email code.
-3. The plugin scans your Claude Code transcripts from the last 30 days,
+3. The plugin scans supported local coding-agent history from the last 30 days,
    bucketing activity by calendar day.
 4. You see exactly what data will be transmitted, and confirm before
    anything leaves your machine.

@@ -33,7 +33,7 @@ DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 DEVICE_PATH = CONFIG_DIR / "device.json"
 LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
-STANDALONE_SOURCES = {"codex"}
+STANDALONE_SOURCES = {"codex", "pi"}
 
 
 def main(argv: list[str]) -> int:

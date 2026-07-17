@@ -55,11 +55,9 @@ STALE_VERSION_PATH = CONFIG_DIR / "stale_version"
 MAX_WINDOW_DAYS = 30
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
-# Payload size guard: if the serialized JSON exceeds this, chunk Codex daily
-# into <=7-day windows and POST sequentially.
+# Payload size guard: every serialized request must stay below this threshold.
 PAYLOAD_SIZE_LIMIT_BYTES = 400 * 1024
-CODEX_CHUNK_DAYS = 7
-INLINE_SCAN_SOURCES = ("opencode", "cursor")
+INLINE_SCAN_SOURCES = ("opencode", "cursor", "pi")
 
 
 def _setup_logger() -> logging.Logger:
@@ -351,6 +349,7 @@ def _run(logger: logging.Logger) -> None:
             f"codex_days={len(codex_daily)} "
             f"opencode_days={len(inline_source_daily.get('opencode') or [])} "
             f"cursor_days={len(inline_source_daily.get('cursor') or [])} "
+            f"pi_days={len(inline_source_daily.get('pi') or [])} "
             f"devices={device_id[:8]}"
         )
 
@@ -411,138 +410,77 @@ def _post_by_source(
     combined_daily: list | None = None,
     extra_sources_daily: dict[str, list] | None = None,
 ) -> bool:
-    """POST by_source payload, chunking sources if payload exceeds PAYLOAD_SIZE_LIMIT_BYTES.
-
-    All daily lists (claude_code, codex, cowork, and inline scanner sources)
-    can grow large.
-    When the combined payload is over the cap, every source is split into
-    <=CODEX_CHUNK_DAYS-day windows and paired index-wise. The longest
-    source's window count drives the loop; missing windows for shorter
-    sources are sent as an empty list. `combined_daily` is small (only
-    carries the peak int per day) so it ships in full on the first chunk.
-
-    On the final successful chunk, caller should update cursors.
-
-    Returns True on full success, False on any HTTP/network error.
-    """
-    # Try a single full POST first.
-    payload = _build_by_source_payload(
-        device_id,
-        claude_daily,
-        codex_daily,
-        cowork_daily,
-        unknown_event_types,
-        inferred_role,
-        combined_daily=combined_daily,
-        extra_sources_daily=extra_sources_daily,
-    )
-    body_bytes = len(json.dumps(payload).encode("utf-8"))
-
-    if body_bytes <= PAYLOAD_SIZE_LIMIT_BYTES:
-        try:
-            _post_upload(payload)
-            return True
-        except urllib.error.HTTPError as e:
-            # If the server rejected an unknown source (older server that
-            # hasn't deployed support for a newer source yet), drop it and
-            # retry once. Without this, cursors never advance and the next
-            # session re-sends the same rejected payload — pinning users on
-            # older servers in a permanent rejection loop.
-            unknown_source = _unknown_source_from_error(e)
-            if combined_daily and unknown_source == "combined":
-                logger.info("server rejected combined source, retrying without it")
-                return _post_by_source(
-                    device_id,
-                    claude_daily,
-                    codex_daily,
-                    cowork_daily,
-                    unknown_event_types,
-                    inferred_role,
-                    logger,
-                    combined_daily=None,
-                    extra_sources_daily=extra_sources_daily,
-                )
-            if cowork_daily and unknown_source == "cowork":
-                logger.info("server rejected cowork source, retrying without it")
-                return _post_by_source(
-                    device_id,
-                    claude_daily,
-                    codex_daily,
-                    [],
-                    unknown_event_types,
-                    inferred_role,
-                    logger,
-                    combined_daily=combined_daily,
-                    extra_sources_daily=extra_sources_daily,
-                )
-            extra_sources_daily = extra_sources_daily or {}
-            if unknown_source in extra_sources_daily and extra_sources_daily.get(unknown_source):
-                logger.info(f"server rejected {unknown_source} source, retrying without it")
-                retry_extra = dict(extra_sources_daily)
-                retry_extra[unknown_source] = []
-                return _post_by_source(
-                    device_id,
-                    claude_daily,
-                    codex_daily,
-                    cowork_daily,
-                    unknown_event_types,
-                    inferred_role,
-                    logger,
-                    combined_daily=None,
-                    extra_sources_daily=retry_extra,
-                )
-            logger.info(f"error http={e.code}")
-            return False
-        except urllib.error.URLError:
-            logger.info("error network")
-            return False
-        except json.JSONDecodeError:
-            # 200 OK with non-JSON body (CDN error page, proxy interstitial).
-            # Log and bail without advancing the gate so we retry next session.
-            logger.info("error json")
-            return False
-
-    # Over limit: chunk each source's daily list into <=CODEX_CHUNK_DAYS-day
-    # windows and pair them index-wise. Any list can be empty.
-    logger.info(f"payload {body_bytes}B > limit, chunking")
-    claude_chunks = _chunk_daily(claude_daily, CODEX_CHUNK_DAYS)
-    codex_chunks = _chunk_daily(codex_daily, CODEX_CHUNK_DAYS)
-    cowork_chunks = _chunk_daily(cowork_daily, CODEX_CHUNK_DAYS)
+    """POST byte-bounded source snapshots with compatibility retries."""
     extra_sources_daily = extra_sources_daily or {}
-    extra_chunks = {
-        source: _chunk_daily(daily, CODEX_CHUNK_DAYS)
-        for source, daily in extra_sources_daily.items()
+    source_daily = {
+        "claude_code": list(claude_daily),
+        "codex": list(codex_daily),
+        "cowork": list(cowork_daily),
+        **{source: list(daily) for source, daily in extra_sources_daily.items()},
+        "combined": list(combined_daily or []),
     }
-    n_chunks = max(
-        [len(claude_chunks), len(codex_chunks), len(cowork_chunks)]
-        + [len(chunks) for chunks in extra_chunks.values()]
-    )
-
-    for i in range(n_chunks):
-        claude_chunk = claude_chunks[i] if i < len(claude_chunks) else []
-        codex_chunk = codex_chunks[i] if i < len(codex_chunks) else []
-        cowork_chunk = cowork_chunks[i] if i < len(cowork_chunks) else []
-        extra_chunk = {
-            source: chunks[i] if i < len(chunks) else []
-            for source, chunks in extra_chunks.items()
-        }
-        chunk_payload = _build_by_source_payload(
+    retryable_sources = {"cowork", "combined", *extra_sources_daily.keys()}
+    try:
+        chunks = _build_byte_bounded_chunks(
             device_id,
-            claude_chunk,
-            codex_chunk,
-            cowork_chunk,
-            unknown_event_types if i == 0 else {},
+            source_daily,
+            unknown_event_types,
             inferred_role,
-            combined_daily=combined_daily if i == 0 else [],
-            extra_sources_daily=extra_chunk,
+        )
+    except ValueError:
+        logger.info("error payload entry exceeds limit")
+        return False
+
+    accepted_sources: set[str] = set()
+    rejected_sources: set[str] = set()
+    index = 0
+    while index < len(chunks):
+        chunk = chunks[index]
+        for source in rejected_sources:
+            chunk["sources"].pop(source, None)
+        if not _chunk_has_content(chunk):
+            index += 1
+            continue
+
+        payload = _payload_from_source_map(
+            device_id,
+            chunk["sources"],
+            chunk["unknown_event_types"],
+            inferred_role,
         )
         try:
-            _post_upload(chunk_payload)
+            _post_upload(payload)
+            accepted_sources.update(
+                source for source, daily in chunk["sources"].items() if daily
+            )
+            index += 1
         except urllib.error.HTTPError as e:
-            logger.info(f"error chunk={i} http={e.code}")
-            return False
+            unknown_source = _unknown_source_from_error(e)
+            if (
+                unknown_source not in retryable_sources
+                or unknown_source not in chunk["sources"]
+                or not chunk["sources"].get(unknown_source)
+            ):
+                logger.info(f"error chunk={index} http={e.code}")
+                return False
+            if unknown_source in accepted_sources:
+                logger.info(
+                    f"error chunk={index} source={unknown_source} partial snapshot"
+                )
+                return False
+            logger.info(
+                f"server rejected {unknown_source} source, retrying without it"
+            )
+            rejected_sources.add(unknown_source)
+            for remaining in chunks[index:]:
+                remaining["sources"].pop(unknown_source, None)
+            # Retry this chunk if supported data or metadata remains.
+            continue
         except urllib.error.URLError:
-            logger.info(f"error chunk={i} network")
+            logger.info(f"error chunk={index} network")
+            return False
+        except json.JSONDecodeError:
+            logger.info(f"error chunk={index} json")
             return False
 
     return True
@@ -565,6 +503,8 @@ def _unknown_source_from_error(err: urllib.error.HTTPError) -> str | None:
         body = json.loads(err.read())
     except (json.JSONDecodeError, OSError, ValueError):
         return None
+    finally:
+        err.close()
     if not isinstance(body, dict) or body.get("error") != "unknown source":
         return None
     source = body.get("source")
@@ -695,11 +635,106 @@ def _build_by_source_payload(
     }
 
 
-def _chunk_daily(daily: list, chunk_size: int) -> list[list]:
-    """Split a daily list into chunks of at most chunk_size entries each."""
-    if not daily:
-        return [[]]
-    return [daily[i : i + chunk_size] for i in range(0, len(daily), chunk_size)]
+def _payload_from_source_map(
+    device_id: str,
+    sources: dict[str, list],
+    unknown_event_types: dict,
+    inferred_role: str,
+) -> dict:
+    extras = {
+        source: daily
+        for source, daily in sources.items()
+        if source not in {"claude_code", "codex", "cowork", "combined"}
+    }
+    return _build_by_source_payload(
+        device_id,
+        sources.get("claude_code", []),
+        sources.get("codex", []),
+        sources.get("cowork", []),
+        unknown_event_types,
+        inferred_role,
+        combined_daily=sources.get("combined", []),
+        extra_sources_daily=extras,
+    )
+
+
+def _build_byte_bounded_chunks(
+    device_id: str,
+    source_daily: dict[str, list],
+    unknown_event_types: dict,
+    inferred_role: str,
+) -> list[dict]:
+    """Partition source rows without ever producing an oversized request."""
+    source_order = list(source_daily)
+    full = {
+        "sources": {source: list(daily) for source, daily in source_daily.items()},
+        "unknown_event_types": dict(unknown_event_types),
+    }
+    if _encoded_payload_size(device_id, full, inferred_role) <= PAYLOAD_SIZE_LIMIT_BYTES:
+        return [full]
+
+    metadata_only = {
+        "sources": {},
+        "unknown_event_types": dict(unknown_event_types),
+    }
+    if (
+        _encoded_payload_size(device_id, metadata_only, inferred_role)
+        > PAYLOAD_SIZE_LIMIT_BYTES
+    ):
+        raise ValueError("upload metadata exceeds payload size limit")
+
+    items = []
+    max_rows = max((len(rows) for rows in source_daily.values()), default=0)
+    for row_index in range(max_rows):
+        for source in source_order:
+            rows = source_daily[source]
+            if row_index < len(rows):
+                items.append((source, rows[row_index]))
+
+    chunks = []
+    current = metadata_only
+    for source, row in items:
+        candidate = _copy_chunk(current)
+        candidate["sources"].setdefault(source, []).append(row)
+        if _encoded_payload_size(device_id, candidate, inferred_role) <= PAYLOAD_SIZE_LIMIT_BYTES:
+            current = candidate
+            continue
+
+        if _chunk_has_content(current):
+            chunks.append(current)
+            current = {"sources": {}, "unknown_event_types": {}}
+        candidate = _copy_chunk(current)
+        candidate["sources"].setdefault(source, []).append(row)
+        if _encoded_payload_size(device_id, candidate, inferred_role) > PAYLOAD_SIZE_LIMIT_BYTES:
+            raise ValueError("single source row exceeds payload size limit")
+        current = candidate
+
+    if _chunk_has_content(current):
+        chunks.append(current)
+    return chunks
+
+
+def _encoded_payload_size(device_id: str, chunk: dict, inferred_role: str) -> int:
+    payload = _payload_from_source_map(
+        device_id,
+        chunk["sources"],
+        chunk["unknown_event_types"],
+        inferred_role,
+    )
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _copy_chunk(chunk: dict) -> dict:
+    return {
+        "sources": {
+            source: list(daily) for source, daily in chunk["sources"].items()
+        },
+        "unknown_event_types": dict(chunk["unknown_event_types"]),
+    }
+
+
+def _chunk_has_content(chunk: dict) -> bool:
+    return bool(chunk["unknown_event_types"]) or any(chunk["sources"].values())
 
 
 _DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,128}")

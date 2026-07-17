@@ -1,12 +1,12 @@
 ---
 name: aiqrank
-description: Compute and share your AI proficiency rank from local Claude Code transcripts.
+description: Compute and share your AI proficiency rank from supported local coding-agent history, including Pi when present.
 allowed-tools: [Bash]
 ---
 
 # AIQ Rank
 
-AIQ Rank takes privacy seriously. Transcripts are scanned locally — only aggregate metrics (session counts, token totals, and tool names used) are sent to aiqrank as part of your profile. Conversation text never leaves your device.
+AIQ Rank takes privacy seriously. Supported coding-agent sessions, including Pi when present, are scanned locally — only aggregate metrics (session counts, token totals, and tool names used) are sent to aiqrank as part of your profile. Conversation text never leaves your device.
 
 Each command below resolves the plugin root robustly: it prefers `$CLAUDE_PLUGIN_ROOT`, then falls back to the highest installed semver under `~/.claude/plugins/cache/aiqrank/aiqrank/*/`, and aborts with a clear message if neither is found.
 

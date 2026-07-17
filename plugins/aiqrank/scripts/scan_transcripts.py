@@ -2,13 +2,15 @@
 """
 AIQ Rank transcript scanner.
 
-Walks three roots and extracts activity metrics from the last 30 days:
+Walks supported local coding-agent stores and extracts activity metrics from
+the last 30 days, including:
 
   1. ~/.claude/projects/*              — interactive Claude Code sessions
   2. ~/Library/Application Support/Claude/local-agent-mode-sessions/
        {account}/{workspace}/local_*/.claude/projects/*  — Claude Cowork
        (Local Agent Mode) autonomous sessions
   3. ~/.codex/sessions/**/rollout-*.jsonl — Codex CLI rollouts (optional)
+  4. ~/.pi/agent/sessions/**/*.jsonl      — Pi sessions (optional)
 
 Events are bucketed into per-source dicts:
 
@@ -16,6 +18,8 @@ Events are bucketed into per-source dicts:
   - `cowork`       — autonomous local-agent-mode sessions, plus any session
                      whose initialMessage marks it as a scheduled-task run.
   - `codex`        — Codex CLI rollouts (only emitted when ~/.codex/ exists)
+  - `pi`           — Pi main and child sessions (only emitted when its session
+                     root exists)
 
 Cowork-specific counters (`cowork_sessions`, `cowork_messages`,
 `queue_events`, `scheduled_task_runs`, `scheduled_tasks_active`) only
@@ -46,7 +50,7 @@ Output JSON:
       "first_messages_sample": [...]   # local-only, for role inference
     }
 
-The `codex` source row is omitted when `~/.codex/` does not exist.
+Optional source rows are omitted when their local data store does not exist.
 
 The plugin sends each source's `daily` (filtered by latest_date cursor)
 plus role metadata to the server. The `first_messages_sample` never
@@ -263,7 +267,15 @@ SOURCE_COWORK = "cowork"
 SOURCE_CODEX = "codex"
 SOURCE_OPENCODE = "opencode"
 SOURCE_CURSOR = "cursor"
-ALL_SOURCES = (SOURCE_CLAUDE_CODE, SOURCE_COWORK, SOURCE_CODEX, SOURCE_OPENCODE, SOURCE_CURSOR)
+SOURCE_PI = "pi"
+ALL_SOURCES = (
+    SOURCE_CLAUDE_CODE,
+    SOURCE_COWORK,
+    SOURCE_CODEX,
+    SOURCE_OPENCODE,
+    SOURCE_CURSOR,
+    SOURCE_PI,
+)
 
 
 def _host_homes() -> list[Path]:
@@ -372,8 +384,9 @@ def scan(
     cowork_root: Path | list[Path] | None = None,
     scheduled_root: Path | None = None,
     codex_dir: Path | None = None,
+    pi_dir: Path | None = None,
 ) -> dict:
-    """Scan Claude Code + Claude Cowork + Codex transcripts within the last `window_days`.
+    """Scan supported coding-agent transcripts within the last `window_days`.
 
     Returns the per-source envelope described in the module docstring. The
     `codex` source row is omitted when `~/.codex/` does not exist.
@@ -427,6 +440,19 @@ def scan(
             if claude_dir is None
             else homes[0] / "__codex_disabled__"
         )
+
+    # Pi root resolution follows Pi's documented environment precedence in
+    # production. Tests overriding Claude's root get an isolated sentinel
+    # unless they explicitly opt in with `pi_dir`.
+    if pi_dir is None:
+        if claude_dir is None:
+            try:
+                pi_dir = _resolve_default_pi_dir(host_home)
+            except Exception as e:
+                pi_dir = None
+                sys.stderr.write(f"scan_pi resolver failed: {type(e).__name__}: {e}\n")
+        else:
+            pi_dir = homes[0] / "__pi_disabled__"
 
     # Per-source per-day metric buckets and main-session intervals.
     daily_by_source: dict[str, dict[date, dict]] = {s: {} for s in ALL_SOURCES}
@@ -664,6 +690,39 @@ def scan(
                 f"scan_cursor failed: {type(e).__name__}: {e}\n"
             )
 
+    # Pi root: scan the resolved session directory. A malformed Pi store is
+    # isolated to this source so the other source snapshots still upload.
+    pi_emit = pi_dir is not None and pi_dir.is_dir()
+    if pi_emit:
+        try:
+            from scan_pi import scan as _scan_pi_fn  # noqa: E402
+
+            _pi_result = _scan_pi_fn(
+                session_dir=pi_dir,
+                home=host_home,
+                window_days=window_days,
+                now_ts=now_ts,
+                mtime_after_ts=mtime_after_ts,
+            )
+            daily_by_source[SOURCE_PI] = _daily_by_date_with_rollup_only(
+                _pi_result, now_ts
+            )
+            _pi_intervals: dict[date, list[tuple[float, float]]] = {}
+            for date_str, ivs in (_pi_result.get("intervals_by_day") or {}).items():
+                try:
+                    d = date.fromisoformat(date_str)
+                except ValueError:
+                    continue
+                _pi_intervals[d] = [
+                    (float(iv[0]), float(iv[1]))
+                    for iv in (ivs or [])
+                    if isinstance(iv, (list, tuple)) and len(iv) >= 2
+                ]
+            intervals_by_source[SOURCE_PI] = _pi_intervals
+        except Exception as e:
+            pi_emit = False
+            sys.stderr.write(f"scan_pi failed: {type(e).__name__}: {e}\n")
+
     # Per-day concurrency from sweep-line over each day's clipped intervals,
     # computed per source. Only counts a level that held for
     # >= min_sustained_secs within the day — see DEFAULT_MIN_SUSTAINED_SECS.
@@ -679,13 +738,15 @@ def scan(
 
     by_source: dict[str, dict] = {}
     for source in ALL_SOURCES:
-        # Codex/OpenCode/Cursor sources are suppressed entirely when their data
+        # Optional sources are suppressed entirely when their data
         # store is absent; the other sources always emit (possibly empty).
         if source == SOURCE_CODEX and not codex_emit:
             continue
         if source == SOURCE_OPENCODE and not opencode_emit:
             continue
         if source == SOURCE_CURSOR and not cursor_emit:
+            continue
+        if source == SOURCE_PI and not pi_emit:
             continue
         if source == SOURCE_CODEX and codex_result is not None:
             by_source[source] = codex_result
@@ -714,6 +775,12 @@ def scan(
         "by_source": by_source,
         "first_messages_sample": first_messages_sample,
     }
+
+
+def _resolve_default_pi_dir(home: Path) -> Path:
+    from scan_pi import resolve_session_dir
+
+    return resolve_session_dir(home=home)
 
 
 def _has_activity(metrics: dict) -> bool:
