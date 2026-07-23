@@ -2556,6 +2556,30 @@ class ModelAndPrSignalTests(unittest.TestCase):
         r = self.rollup(scan(claude_dir=self.tmp))
         self.assertEqual(r["prs_opened"], 1)
 
+    def test_worktree_spawns_counts_add_ignores_near_miss(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("fan out the squad"),
+                make_tool_call("Bash", {"command": "git worktree add ../wt-issue-42 -b issue-42"}),
+                make_tool_call("Bash", {"command": "git worktree list"}),
+                make_tool_call("Bash", {"command": "echo git worktree add in a comment"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["worktree_spawns"], 1)
+
+    def test_worktree_spawns_matches_whitespace_padded_invocation(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("fan out"),
+                make_tool_call("Bash", {"command": "git   worktree   add ./wt"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["worktree_spawns"], 1)
+
     def test_main_only_autonomy_counters_exclude_subagent(self):
         write_jsonl(
             self.projects / "proj1" / "sessA.jsonl",

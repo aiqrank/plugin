@@ -217,6 +217,7 @@ _COUNT_FIELDS = (
     "file_changes",
     "agents_md_writes",
     "prs_opened",
+    "worktree_spawns",
     "main_tool_calls",
     "main_user_messages",
 )
@@ -1265,6 +1266,7 @@ def iter_transcript_files(
 # discarded — never stored or logged.
 _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?\n.*?\n\s*\1\b", re.DOTALL)
 _PR_CREATE_RE = re.compile(r"(?:^|[\n;&|`(])\s*gh\s+pr\s+create\b")
+_WORKTREE_ADD_RE = re.compile(r"(?:^|[\n;&|`(])\s*git\s+worktree\s+add\b")
 
 
 def _command_opens_pr(command: str) -> bool:
@@ -1276,6 +1278,24 @@ def _command_opens_pr(command: str) -> bool:
         return False
     stripped = _HEREDOC_RE.sub(" ", command)
     return bool(_PR_CREATE_RE.search(stripped))
+
+
+def _command_spawns_worktree(command: str) -> bool:
+    """True if the Bash command creates a git worktree via `git worktree add`.
+
+    A `git worktree add` is a strong signal of cross-process agent
+    orchestration: the worktree-per-issue pattern gives each parallel agent an
+    isolated checkout so concurrent squads do not collide on the same files.
+    That orchestration is otherwise invisible to a single transcript, because
+    each spawned agent runs as its own top-level session. The command string is
+    tested and discarded — never stored or logged (it can contain secrets).
+    """
+    # Cheap reject mirrors _command_opens_pr: require the literal "worktree"
+    # token and cap length so the heredoc regex cannot be a ReDoS lever.
+    if not command or "worktree" not in command or len(command) > 100_000:
+        return False
+    stripped = _HEREDOC_RE.sub(" ", command)
+    return bool(_WORKTREE_ADD_RE.search(stripped))
 
 
 def process_session(
@@ -1465,10 +1485,15 @@ def process_session(
                         # PRs opened via AI: detect `gh pr create` in the Bash
                         # command. The command string is tested and discarded —
                         # never stored or logged (it can contain secrets).
-                        if name == "Bash" and _command_opens_pr(
-                            (tool_use.get("input") or {}).get("command", "")
-                        ):
-                            bucket["prs_opened"] += 1
+                        if name == "Bash":
+                            command = (tool_use.get("input") or {}).get("command", "")
+                            if _command_opens_pr(command):
+                                bucket["prs_opened"] += 1
+                            # `git worktree add` marks cross-process agent
+                            # orchestration (worktree-per-issue) that separate
+                            # top-level sub-sessions otherwise hide. See #2.
+                            if _command_spawns_worktree(command):
+                                bucket["worktree_spawns"] += 1
 
                         if name == SKILL_TOOL:
                             skill = (tool_use.get("input") or {}).get("skill")
