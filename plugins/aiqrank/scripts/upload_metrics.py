@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _version import USER_AGENT  # noqa: E402
+import check_update  # noqa: E402
 
 DEFAULT_BASE_URL = "https://aiqrank.com"
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
@@ -88,6 +89,7 @@ def main(argv: list[str]) -> int:
 
     save_device_id(new_device_id)
     save_last_upload_at(iso_now())
+    check_update.record_latest_version(response.get("latest_plugin_version"))
 
     if args.no_open:
         print(f"Rank updated at {teaser_url}")

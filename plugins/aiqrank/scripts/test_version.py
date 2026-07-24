@@ -18,8 +18,8 @@ from install_codex import BUNDLED_VERSION, SCRIPT_NAMES
 
 
 class VersionParityTests(unittest.TestCase):
-    def test_structured_planning_signals_prepare_the_0_3_14_release(self):
-        self.assertEqual(PLUGIN_VERSION, "0.3.14")
+    def test_codex_update_guidance_prepares_the_0_3_15_release(self):
+        self.assertEqual(PLUGIN_VERSION, "0.3.15")
 
     def test_plugin_version_matches_plugin_json(self):
         plugin_json = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
@@ -42,6 +42,9 @@ class VersionParityTests(unittest.TestCase):
     def test_codex_installer_bundles_pi_scanner_dependency(self):
         self.assertIn("scan_pi.py", SCRIPT_NAMES)
 
+    def test_codex_installer_bundles_the_update_notice_helper(self):
+        self.assertIn("check_update.py", SCRIPT_NAMES)
+
     def test_codex_prompt_uses_canonical_scan_upload_path(self):
         prompt = (Path(__file__).resolve().parent.parent / "codex_prompts" / "aiqrank.md").read_text()
         self.assertIn("upload_metrics.py --scan", prompt)
@@ -57,6 +60,18 @@ class VersionParityTests(unittest.TestCase):
         for content in instructions:
             self.assertIn("including Pi when present", content)
             self.assertIn("only aggregate metrics", content)
+
+    def test_codex_instructions_explain_how_to_refresh_the_plugin(self):
+        plugin_root = Path(__file__).resolve().parent.parent
+        instructions = [
+            (plugin_root / "codex_prompts" / "aiqrank.md").read_text(),
+            (plugin_root / "skills" / "aiqrank" / "SKILL.md").read_text(),
+        ]
+
+        for content in instructions:
+            self.assertIn("curl -sSL https://aiqrank.com/setup/codex | bash", content)
+            self.assertIn("$aiqrank:aiqrank", content)
+            self.assertIn("check_update.py", content)
 
 
 if __name__ == "__main__":

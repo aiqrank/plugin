@@ -8,8 +8,8 @@
     {
       "name": "aiqrank",
       "source": "./plugins/aiqrank",
-      "description": "Compute and share your AI proficiency score from your Claude Code transcripts.",
-      "version": "0.3.14",
+      "description": "Compute and share your AI proficiency score from supported local coding-agent history.",
+      "version": "0.3.15",
       "category": "productivity",
       "tags": ["ai-proficiency", "metrics", "social"]
     }

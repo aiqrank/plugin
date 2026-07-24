@@ -1266,7 +1266,12 @@ def iter_transcript_files(
 # discarded — never stored or logged.
 _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?\n.*?\n\s*\1\b", re.DOTALL)
 _PR_CREATE_RE = re.compile(r"(?:^|[\n;&|`(])\s*gh\s+pr\s+create\b")
-_WORKTREE_ADD_RE = re.compile(r"(?:^|[\n;&|`(])\s*git\s+worktree\s+add\b")
+_WORKTREE_ADD_RE = re.compile(
+    r"(?:^|[\n;&|`(])\s*(?:(?:do|then)\s+)?"
+    r"(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]+\s+)*"
+    r"git(?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+))?"
+    r"\s+worktree\s+add\b"
+)
 
 
 def _command_opens_pr(command: str) -> bool:
@@ -1281,17 +1286,13 @@ def _command_opens_pr(command: str) -> bool:
 
 
 def _command_spawns_worktree(command: str) -> bool:
-    """True if the Bash command creates a git worktree via `git worktree add`.
+    """True when a Bash call directly invokes `git worktree add`.
 
-    A `git worktree add` is a strong signal of cross-process agent
-    orchestration: the worktree-per-issue pattern gives each parallel agent an
-    isolated checkout so concurrent squads do not collide on the same files.
-    That orchestration is otherwise invisible to a single transcript, because
-    each spawned agent runs as its own top-level session. The command string is
-    tested and discarded — never stored or logged (it can contain secrets).
+    This deliberately counts tool calls containing a supported invocation,
+    not the number of worktrees a shell program may create. It is a weak proxy
+    for cross-process orchestration, not proof that a separate agent started.
+    The command string is tested and discarded because it can contain secrets.
     """
-    # Cheap reject mirrors _command_opens_pr: require the literal "worktree"
-    # token and cap length so the heredoc regex cannot be a ReDoS lever.
     if not command or "worktree" not in command or len(command) > 100_000:
         return False
     stripped = _HEREDOC_RE.sub(" ", command)
@@ -1482,16 +1483,12 @@ def process_session(
                             bucket["tool_name_counts"].get(name, 0) + 1
                         )
 
-                        # PRs opened via AI: detect `gh pr create` in the Bash
-                        # command. The command string is tested and discarded —
-                        # never stored or logged (it can contain secrets).
                         if name == "Bash":
+                            # Command strings are tested and discarded — never
+                            # stored or logged because they can contain secrets.
                             command = (tool_use.get("input") or {}).get("command", "")
                             if _command_opens_pr(command):
                                 bucket["prs_opened"] += 1
-                            # `git worktree add` marks cross-process agent
-                            # orchestration (worktree-per-issue) that separate
-                            # top-level sub-sessions otherwise hide. See #2.
                             if _command_spawns_worktree(command):
                                 bucket["worktree_spawns"] += 1
 
@@ -2323,9 +2320,13 @@ def _apply_codex_tool_effects(
         bucket["plan_mode_invocations"] += 1
 
     if name in {"shell", "exec_command"}:
-        verb = _shell_verb(payload.get("arguments"))
-        if verb:
-            command_verbs_by_day.setdefault(d, set()).add(verb)
+        command = _shell_command(payload.get("arguments"))
+        if command:
+            verb = _first_meaningful_word(command)
+            if verb:
+                command_verbs_by_day.setdefault(d, set()).add(verb)
+            if _command_spawns_worktree(command):
+                bucket["worktree_spawns"] += 1
 
     target_paths: list[str] = []
     if name == "apply_patch":
@@ -2612,7 +2613,7 @@ def _extract_nested_codex_tools(code: str) -> list[str]:
     return names
 
 
-def _shell_verb(arguments) -> str | None:
+def _shell_command(arguments) -> str | None:
     if not isinstance(arguments, str) or not arguments:
         return None
     try:
@@ -2623,7 +2624,7 @@ def _shell_verb(arguments) -> str | None:
         return None
     command = parsed.get("cmd")
     if isinstance(command, str) and command.strip():
-        return _first_meaningful_word(command)
+        return command
     command = parsed.get("command")
     if not isinstance(command, list) or not command:
         return None
@@ -2631,11 +2632,19 @@ def _shell_verb(arguments) -> str | None:
     if not first:
         return None
     base = os.path.basename(first)
-    if base in {"bash", "sh", "zsh", "env"}:
+    if base in {"bash", "sh", "zsh"}:
         for candidate in reversed(command):
             if isinstance(candidate, str) and candidate and not candidate.startswith("-"):
-                return _first_meaningful_word(candidate)
-    return base
+                return candidate
+    parts = [part for part in command if isinstance(part, str) and part]
+    if base == "env":
+        parts = parts[1:]
+    return " ".join(parts) or None
+
+
+def _shell_verb(arguments) -> str | None:
+    command = _shell_command(arguments)
+    return _first_meaningful_word(command) if command else None
 
 
 def _first_meaningful_word(command: str) -> str | None:

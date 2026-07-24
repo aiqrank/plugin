@@ -262,6 +262,63 @@ class ScanCodexTests(unittest.TestCase):
         self.assertIsNone(_shell_verb('{"command":[]}'))
         self.assertIsNone(_shell_verb('{"cmd":""}'))
 
+    def test_worktree_spawns_from_shell_and_exec_command(self):
+        sessions = self.tmp / "sessions" / "2026" / "04" / "20"
+        sessions.mkdir(parents=True, exist_ok=True)
+        path = sessions / "rollout-worktrees.jsonl"
+        events = [
+            {
+                "timestamp": "2026-04-20T12:00:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": json.dumps(
+                        {
+                            "command": [
+                                "bash",
+                                "-lc",
+                                "git worktree add ../shell-worktree",
+                            ]
+                        }
+                    ),
+                    "call_id": "shell-worktree",
+                },
+            },
+            {
+                "timestamp": "2026-04-20T12:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps(
+                        {
+                            "cmd": "FOO=bar git -C repo worktree add ../exec-worktree",
+                            "workdir": "/tmp",
+                        }
+                    ),
+                    "call_id": "exec-worktree",
+                },
+            },
+            {
+                "timestamp": "2026-04-20T12:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "git worktree list"}),
+                    "call_id": "worktree-list",
+                },
+            },
+        ]
+        with path.open("w") as fh:
+            for event in events:
+                fh.write(json.dumps(event) + "\n")
+        now = time.time()
+        os.utime(path, (now, now))
+
+        self.assertEqual(scan(codex_dir=self.tmp)["rollup"]["worktree_spawns"], 2)
+
     def test_patch_touches_agents_md(self):
         self.assertTrue(
             _patch_touches_agents_md(

@@ -32,7 +32,8 @@ _VERSION_MAX_LEN = 32
 NUDGE = "AIQ Rank: it's been 30 days — run /aiqrank to refresh your rank."
 VERSION_NUDGE_FMT = (
     "AIQ Rank: plugin update available (v{latest}). "
-    "Run: claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank"
+    "Claude Code: claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank. "
+    "Codex: curl -sSL https://aiqrank.com/setup/codex | bash; then start a new session and run $aiqrank:aiqrank."
 )
 
 

@@ -42,6 +42,8 @@ class UploadMetricsTests(unittest.TestCase):
         self.mod.CONFIG_DIR = self.tmp_path / ".config" / "aiqrank"
         self.mod.DEVICE_PATH = self.mod.CONFIG_DIR / "device.json"
         self.mod.LAST_UPLOAD_PATH = self.mod.CONFIG_DIR / "last_upload_at"
+        self.mod.check_update.CONFIG_DIR = self.mod.CONFIG_DIR
+        self.mod.check_update.STALE_VERSION_PATH = self.mod.CONFIG_DIR / "stale_version"
 
         # Write a minimal metrics file.
         self.metrics_path = self.tmp_path / "metrics.json"
@@ -91,6 +93,18 @@ class UploadMetricsTests(unittest.TestCase):
         self.assertEqual(saved["device_id"], "dev-new-123")
         # last_upload_at persisted
         self.assertTrue(self.mod.LAST_UPLOAD_PATH.exists())
+
+    def test_records_server_update_for_the_next_codex_prompt(self):
+        rc, _captured, _stdout = self._run_with_fake_post({
+            "teaser_url": "https://aiqrank.com/teaser?s=update",
+            "device_id": "dev-update",
+            "latest_plugin_version": "9.9.9",
+        })
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            self.mod.check_update.STALE_VERSION_PATH.read_text(), "9.9.9\n"
+        )
 
     def test_returning_device_sends_device_id(self):
         self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
