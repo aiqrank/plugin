@@ -95,9 +95,10 @@ class HookNudgeTests(unittest.TestCase):
         output = self._run()
         self.assertIn("plugin update available", output)
         self.assertIn("0.9.1", output)
-        self.assertIn("Claude Code:", output)
-        self.assertIn("curl -sSL https://aiqrank.com/setup/codex | bash", output)
-        self.assertIn("$aiqrank:aiqrank", output)
+        # The nudge points at /aiqrank, which now updates itself, rather than
+        # asking the user to run the update commands by hand.
+        self.assertIn("/aiqrank", output)
+        self.assertNotIn("curl -sSL", output)
         self.assertNotIn("30 days", output)
 
     def test_no_stale_version_file_silent_when_fresh(self):

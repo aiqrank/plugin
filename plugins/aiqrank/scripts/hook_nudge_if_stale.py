@@ -31,9 +31,7 @@ _VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?$")
 _VERSION_MAX_LEN = 32
 NUDGE = "AIQ Rank: it's been 30 days — run /aiqrank to refresh your rank."
 VERSION_NUDGE_FMT = (
-    "AIQ Rank: plugin update available (v{latest}). "
-    "Claude Code: claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank. "
-    "Codex: curl -sSL https://aiqrank.com/setup/codex | bash; then start a new session and run $aiqrank:aiqrank."
+    "AIQ Rank: plugin update available (v{latest}) — run /aiqrank and it installs itself."
 )
 
 
