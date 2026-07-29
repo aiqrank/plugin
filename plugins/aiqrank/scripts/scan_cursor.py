@@ -59,7 +59,6 @@ from urllib.parse import unquote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scan_transcripts import (  # noqa: E402  -- shared helpers
-    _local_claude_skills,
     _ts_to_date,
     max_concurrent_sustained,
 )
@@ -150,8 +149,7 @@ def scan(
         Where ``workspaceStorage/*/workspace.json`` lives. Used to
         discover per-project folders for rules + per-project MCP.
     home : Path | None
-        Override ``~`` (used by ``_local_claude_skills`` which expects
-        ``~/.claude``). Defaults to ``Path.home()``.
+        Override ``~``. Defaults to ``Path.home()``.
     """
     home = home or Path.home()
     cursor_user_dir = cursor_user_dir or (
@@ -216,22 +214,12 @@ def scan(
         if peak > bucket["max_concurrent_sessions"]:
             bucket["max_concurrent_sessions"] = peak
 
-    # Local skill snapshot — applied to rollup once (no per-day attribution),
-    # mirroring scan_opencode.
-    skill_names = _local_claude_skills(home / ".claude")
-
     daily = {d: m for d, m in daily.items() if _has_activity(m)}
 
     daily_list = [
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
     rollup = _rollup_from_daily(daily.values())
-
-    if skill_names:
-        rollup["custom_skill_files_written"] += len(skill_names)
-        existing = set(rollup.get("authored_skill_names") or [])
-        existing.update(skill_names)
-        rollup["authored_skill_names"] = sorted(existing)
 
     intervals_serialized = {
         d.isoformat(): [[s, e] for (s, e) in ivs]

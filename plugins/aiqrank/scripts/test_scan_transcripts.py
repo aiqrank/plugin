@@ -53,6 +53,37 @@ def make_user_msg(text: str) -> dict:
     return {"type": "user", "message": {"content": text}}
 
 
+def make_tool_call_with_id(
+    name: str, input_data: dict | None, tool_id: str, ts: str | None = None
+) -> dict:
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": name,
+                    "input": input_data or {},
+                },
+            ]
+        },
+    }
+    if ts is not None:
+        event["timestamp"] = ts
+    return event
+
+
+def make_tool_result(tool_id: str, is_error: bool = False, ts: str | None = None) -> dict:
+    block: dict = {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}
+    if is_error:
+        block["is_error"] = True
+    event = {"type": "user", "message": {"content": [block]}}
+    if ts is not None:
+        event["timestamp"] = ts
+    return event
+
+
 def claude_block(result):
     return result["by_source"]["claude_code"]
 
@@ -182,9 +213,10 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(r["skill_counts"]["commit"], 2)
         self.assertEqual(r["skill_counts"]["review"], 1)
 
-    def test_seeds_authored_skill_names_from_on_disk_skills(self):
-        # A skill that exists on disk but was never written inside a captured
-        # transcript should still count as authored (parity with OpenCode/Cursor).
+    def test_on_disk_skill_inventory_never_seeds_authorship(self):
+        # Repository/disk presence alone is not authorship — the inventory
+        # scan only detects invocable bare slash commands, so installed
+        # skills keep their usage credit without gaining authored credit.
         for name in ("my-skill", "aiqrank"):
             skill_dir = self.tmp / "skills" / name
             skill_dir.mkdir(parents=True)
@@ -199,11 +231,9 @@ class ScanTranscriptsTests(unittest.TestCase):
         )
 
         r = self.rollup(scan(claude_dir=self.tmp))
-        # Authored from disk (even with no skills-dir Write event captured), and
-        # only that skill — the aiqrank self-skill is never credited as authored.
-        self.assertEqual(r["authored_skill_names"], ["my-skill"])
+        self.assertEqual(r["authored_skill_names"], [])
         # Usage is still recorded, so bespoke_practice (authored AND used >=2)
-        # can fire server-side.
+        # can fire server-side once authorship is observed elsewhere.
         self.assertEqual(r["skill_counts"]["my-skill"], 2)
 
     def test_on_disk_skills_do_not_fabricate_a_day_without_activity(self):
@@ -669,7 +699,7 @@ class ScanTranscriptsTests(unittest.TestCase):
         r = self.rollup(scan(claude_dir=self.tmp))
         self.assertEqual(r["claude_md_writes"], 2)
 
-    def test_counts_plan_mode_invocations_and_sessions(self):
+    def test_plan_mode_activation_alone_keeps_diagnostics_but_no_session_credit(self):
         write_jsonl(
             self.projects / "proj1" / "plan.jsonl",
             [
@@ -685,10 +715,12 @@ class ScanTranscriptsTests(unittest.TestCase):
         )
 
         r = self.rollup(scan(claude_dir=self.tmp))
+        # Raw activation diagnostics survive; the scored session counter
+        # requires structural follow-through, which this session lacks.
         self.assertEqual(r["plan_mode_invocations"], 2)
-        self.assertEqual(r["sessions_with_plan_mode"], 1)
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
 
-    def test_counts_exact_main_session_plan_agents_as_planning(self):
+    def test_exact_main_session_plan_agents_count_as_signals_only(self):
         write_jsonl(
             self.projects / "proj1" / "plan-agents.jsonl",
             [
@@ -708,7 +740,8 @@ class ScanTranscriptsTests(unittest.TestCase):
         r = self.rollup(scan(claude_dir=self.tmp))
 
         self.assertEqual(r["plan_mode_invocations"], 3)
-        self.assertEqual(r["sessions_with_plan_mode"], 1)
+        # Signals without a later successful mutation earn no session credit.
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
         self.assertEqual(r["sessions_with_orchestration"], 1)
         self.assertEqual(r["tool_name_counts"]["Agent"], 1)
         self.assertEqual(r["tool_name_counts"]["Task"], 1)
@@ -756,6 +789,570 @@ class ScanTranscriptsTests(unittest.TestCase):
         self.assertEqual(r["plan_mode_invocations"], 0)
         self.assertEqual(r["sessions_with_plan_mode"], 0)
         self.assertEqual(r["sessions_with_orchestration"], 2)
+
+
+class StructuralPlanningOutcomeTests(unittest.TestCase):
+    """`sessions_with_plan_mode` credits structural planning outcomes: a
+    planning signal followed in event order by a successful Write/Edit on the
+    same main session and local date, or a successful write to a recognized
+    plan artifact path."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.projects = self.tmp / "projects"
+        (self.projects / "proj1").mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def rollup(self, result):
+        return claude_block(result)["rollup"]
+
+    def test_signal_followed_by_successful_mutation_qualifies_once(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_user_msg("plan this"),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                make_tool_result("w1"),
+                make_tool_call_with_id("Edit", {"file_path": "/repo/lib/bar.ex"}, "w2"),
+                make_tool_result("w2"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 1)
+        self.assertEqual(r["plan_mode_invocations"], 1)
+
+    def test_plan_agent_signal_with_follow_through_qualifies(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan-agent.jsonl",
+            [
+                make_tool_call("Agent", {"subagent_type": "Plan", "prompt": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 1)
+
+    def test_signal_followed_by_failed_mutation_earns_no_credit(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                make_tool_result("w1", is_error=True),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_signal_with_unpaired_mutation_fails_closed(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_malformed_tool_result_fails_closed(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": 42}]}},
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_signal_followed_only_by_shell_work_earns_no_credit(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Bash", {"command": "mix test"}, "b1"),
+                make_tool_result("b1"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_mutation_before_signal_does_not_qualify(self):
+        write_jsonl(
+            self.projects / "proj1" / "plan.jsonl",
+            [
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                make_tool_result("w1"),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_corrective_replanning_with_later_success_qualifies(self):
+        write_jsonl(
+            self.projects / "proj1" / "replan.jsonl",
+            [
+                make_tool_call_with_id("Write", {"file_path": "/repo/lib/foo.ex"}, "w1"),
+                make_tool_result("w1"),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Edit", {"file_path": "/repo/lib/foo.ex"}, "w2"),
+                make_tool_result("w2"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 1)
+
+    def test_plan_artifact_writes_qualify_without_later_implementation(self):
+        artifact_paths = [
+            "/repo/docs/plans/2026-07-29-001-fix-example-plan.md",
+            "/repo/docs/plans/nested/deeper/notes.md",
+            "/repo/.context/plans/idea.md",
+            "/repo/sub/PLAN.md",
+            "/repo/feature-plan.md",
+        ]
+        for i, artifact_path in enumerate(artifact_paths):
+            write_jsonl(
+                self.projects / "proj1" / f"artifact{i}.jsonl",
+                [
+                    make_tool_call_with_id("Write", {"file_path": artifact_path}, "w1"),
+                    make_tool_result("w1"),
+                ],
+            )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], len(artifact_paths))
+        self.assertEqual(r["plan_mode_invocations"], 0)
+
+    def test_generic_document_writes_earn_no_artifact_credit(self):
+        near_miss_paths = [
+            "/repo/README.md",
+            "/repo/spec.md",
+            "/repo/plan.md",
+            "/repo/replan.md",
+            "/repo/mydocs/plans/notes.md",
+            "/repo/docs/planning/notes.md",
+            "/repo/docs/plans/data.txt",
+        ]
+        for i, near_miss in enumerate(near_miss_paths):
+            write_jsonl(
+                self.projects / "proj1" / f"nearmiss{i}.jsonl",
+                [
+                    make_tool_call_with_id("Write", {"file_path": near_miss}, "w1"),
+                    make_tool_result("w1"),
+                ],
+            )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_failed_artifact_write_earns_no_credit(self):
+        write_jsonl(
+            self.projects / "proj1" / "artifact.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write", {"file_path": "/repo/docs/plans/x-plan.md"}, "w1"
+                ),
+                make_tool_result("w1", is_error=True),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_same_day_repetition_dedupes_per_session(self):
+        write_jsonl(
+            self.projects / "proj1" / "repeat.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/a.ex"}, "w1"),
+                make_tool_result("w1"),
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/docs/plans/b-plan.md"}, "w2"),
+                make_tool_result("w2"),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "second-session.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/c.ex"}, "w1"),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        # Once per session+date: 1 for each qualifying session.
+        self.assertEqual(r["sessions_with_plan_mode"], 2)
+
+    def test_cross_midnight_follow_through_does_not_qualify(self):
+        write_jsonl(
+            self.projects / "proj1" / "cross.jsonl",
+            [
+                make_tool_call_with_id(
+                    "ExitPlanMode", {"plan": "..."}, "p1", ts="2026-04-01T08:00:00Z"
+                ),
+                make_tool_call_with_id(
+                    "Write", {"file_path": "/repo/lib/foo.ex"}, "w1", ts="2026-04-02T14:00:00Z"
+                ),
+                make_tool_result("w1", ts="2026-04-02T14:00:01Z"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp, now_ts=_FIXTURE_NOW + 86400))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+
+    def test_cross_midnight_artifact_write_credits_its_own_date(self):
+        write_jsonl(
+            self.projects / "proj1" / "cross-artifact.jsonl",
+            [
+                make_tool_call_with_id(
+                    "ExitPlanMode", {"plan": "..."}, "p1", ts="2026-04-01T08:00:00Z"
+                ),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/repo/docs/plans/late-plan.md"},
+                    "w1",
+                    ts="2026-04-02T14:00:00Z",
+                ),
+                make_tool_result("w1", ts="2026-04-02T14:00:01Z"),
+            ],
+        )
+
+        daily = claude_block(scan(claude_dir=self.tmp, now_ts=_FIXTURE_NOW + 86400))["daily"]
+        self.assertEqual(len(daily), 2)
+        # Oldest-first: the signal-only day earns nothing; the artifact day
+        # credits itself.
+        self.assertEqual(daily[0]["metrics"]["sessions_with_plan_mode"], 0)
+        self.assertEqual(daily[1]["metrics"]["sessions_with_plan_mode"], 1)
+
+    def test_completion_after_midnight_fails_closed(self):
+        # The Write is invoked on day one but its successful tool_result only
+        # lands the next day — same-date follow-through is not proven, so
+        # neither planning credit nor authorship is earned.
+        write_jsonl(
+            self.projects / "proj1" / "late-completion.jsonl",
+            [
+                make_tool_call_with_id(
+                    "ExitPlanMode", {"plan": "..."}, "p1", ts="2026-04-01T08:00:00Z"
+                ),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/repo/skills/late-skill/SKILL.md"},
+                    "w1",
+                    ts="2026-04-01T09:00:00Z",
+                ),
+                make_tool_result("w1", ts="2026-04-02T15:00:00Z"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp, now_ts=_FIXTURE_NOW + 86400))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+        self.assertEqual(r["authored_skill_names"], [])
+
+    def test_subagent_only_planning_and_mutation_never_qualify(self):
+        write_jsonl(
+            self.projects / "proj1" / "main.jsonl",
+            [make_user_msg("hi")],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "main" / "subagents" / "agent-001.jsonl",
+            [
+                make_tool_call("ExitPlanMode", {"plan": "..."}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/docs/plans/a-plan.md"}, "w1"),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["sessions_with_plan_mode"], 0)
+        # Raw activation diagnostics still count the subagent invocation.
+        self.assertEqual(r["plan_mode_invocations"], 1)
+
+    def test_daily_rows_and_rollup_carry_planning_measurement_version(self):
+        write_jsonl(
+            self.projects / "proj1" / "sess.jsonl",
+            [make_user_msg("hi")],
+        )
+
+        claude = claude_block(scan(claude_dir=self.tmp))
+        self.assertEqual(len(claude["daily"]), 1)
+        self.assertEqual(
+            claude["daily"][0]["metrics"]["planning_measurement_version"], 1
+        )
+        self.assertEqual(claude["rollup"]["planning_measurement_version"], 1)
+
+    def test_serialized_envelope_contains_no_planning_sentinels(self):
+        plan_path = "/Users/me/secret-project/docs/plans/2026-07-29-042-secret-initiative-plan.md"
+        write_jsonl(
+            self.projects / "proj1" / "privacy.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "sessionId": "session-id-sentinel-1234",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "secret-plan-phrase-sentinel"}
+                        ]
+                    },
+                },
+                make_tool_call("ExitPlanMode", {"plan": "secret-plan-phrase-sentinel"}),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": plan_path, "content": "secret-plan-phrase-sentinel"},
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp)
+        # The fixture qualifies structurally...
+        self.assertEqual(self.rollup(result)["sessions_with_plan_mode"], 1)
+        # ...but no artifact path, plan text, or session identifier appears
+        # anywhere in the serialized envelope.
+        blob = json.dumps(result)
+        for sentinel in (
+            plan_path,
+            "secret-project",
+            "secret-initiative",
+            "secret-plan-phrase-sentinel",
+            "session-id-sentinel-1234",
+        ):
+            self.assertNotIn(sentinel, blob)
+
+
+class PluginSkillAuthorshipTests(unittest.TestCase):
+    """Bare-name skill authorship from successful `skills/<name>/SKILL.md`
+    mutations — including plugin repositories — plus the names-only local
+    registry that carries authorship past the transcript window."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.projects = self.tmp / "projects"
+        (self.projects / "proj1").mkdir(parents=True)
+        self.registry = self.tmp / "registry.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _scan(self):
+        return scan(claude_dir=self.tmp, authored_registry_path=self.registry)
+
+    def rollup(self, result):
+        return claude_block(result)["rollup"]
+
+    def test_successful_plugin_repo_skill_write_establishes_authorship(self):
+        write_jsonl(
+            self.projects / "proj1" / "plugin.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/scott-cc/skills/acceptance-criteria/SKILL.md"},
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], ["acceptance-criteria"])
+
+    def test_home_dir_skill_md_write_still_establishes_authorship(self):
+        write_jsonl(
+            self.projects / "proj1" / "home.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Edit",
+                    {"file_path": "/Users/me/.claude/skills/my-tool/SKILL.md"},
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], ["my-tool"])
+
+    def test_failed_or_unpaired_skill_mutations_never_author(self):
+        write_jsonl(
+            self.projects / "proj1" / "failed.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/plug/skills/failed-skill/SKILL.md"},
+                    "w1",
+                ),
+                make_tool_result("w1", is_error=True),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "unpaired.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/plug/skills/unpaired-skill/SKILL.md"},
+                    "w2",
+                ),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], [])
+
+    def test_reads_near_misses_and_self_skill_never_author(self):
+        write_jsonl(
+            self.projects / "proj1" / "nonauthor.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Read",
+                    {"file_path": "/Users/me/dev/plug/skills/read-only/SKILL.md"},
+                    "t1",
+                ),
+                make_tool_result("t1"),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/plug/skills/side-file/reference.md"},
+                    "t2",
+                ),
+                make_tool_result("t2"),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/plug/no-skills-parent/SKILL.md"},
+                    "t3",
+                ),
+                make_tool_result("t3"),
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/plug/skills/aiqrank/SKILL.md"},
+                    "t4",
+                ),
+                make_tool_result("t4"),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], [])
+
+    def test_registry_persists_names_only_with_owner_permissions(self):
+        write_jsonl(
+            self.projects / "proj1" / "plugin.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/scott-cc/skills/acceptance-criteria/SKILL.md"},
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        self._scan()
+
+        raw = self.registry.read_text()
+        self.assertEqual(
+            json.loads(raw),
+            {"version": 1, "names": ["acceptance-criteria"]},
+        )
+        # Names only — no paths, identities, or timestamps.
+        self.assertNotIn("/", json.dumps(json.loads(raw)["names"]))
+        self.assertNotIn("scott-cc", raw)
+        self.assertEqual(self.registry.stat().st_mode & 0o777, 0o600)
+
+    def test_registry_names_seed_latest_active_day(self):
+        # Registry survives the transcript window: a name observed in a
+        # previous scan seeds the latest active day even with no retained
+        # mutation evidence.
+        self.registry.write_text(
+            json.dumps({"version": 1, "names": ["previously-authored"]})
+        )
+        write_jsonl(
+            self.projects / "proj1" / "plain.jsonl",
+            [make_user_msg("hi")],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], ["previously-authored"])
+
+    def test_registry_never_fabricates_an_active_day(self):
+        self.registry.write_text(
+            json.dumps({"version": 1, "names": ["previously-authored"]})
+        )
+
+        result = self._scan()
+        self.assertEqual(claude_block(result)["daily"], [])
+        self.assertEqual(self.rollup(result)["authored_skill_names"], [])
+
+    def test_registry_rejects_path_like_or_invalid_names(self):
+        # A corrupt-but-valid-JSON registry with path/session-id shaped
+        # entries must never reach serialized output — only plausible bare
+        # skill names survive the load.
+        self.registry.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "names": [
+                        "/Users/private/leaked-path",
+                        "bad name with spaces",
+                        "sess:id-sentinel",
+                        ".hidden-start",
+                        "ok-name",
+                    ],
+                }
+            )
+        )
+        write_jsonl(
+            self.projects / "proj1" / "plain.jsonl",
+            [make_user_msg("hi")],
+        )
+
+        result = self._scan()
+        self.assertEqual(self.rollup(result)["authored_skill_names"], ["ok-name"])
+        blob = json.dumps(result)
+        for sentinel in (
+            "/Users/private/leaked-path",
+            "bad name with spaces",
+            "sess:id-sentinel",
+            ".hidden-start",
+        ):
+            self.assertNotIn(sentinel, blob)
+
+    def test_corrupt_registry_fails_soft_and_keeps_current_evidence(self):
+        self.registry.write_text("{not-json")
+        write_jsonl(
+            self.projects / "proj1" / "plugin.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Write",
+                    {"file_path": "/Users/me/dev/scott-cc/skills/acceptance-criteria/SKILL.md"},
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], ["acceptance-criteria"])
+        # The registry recovers with current-scan evidence.
+        self.assertEqual(
+            json.loads(self.registry.read_text()),
+            {"version": 1, "names": ["acceptance-criteria"]},
+        )
 
 
 class DailyBucketingTests(unittest.TestCase):
@@ -1336,7 +1933,7 @@ class OpenCodeOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["daily"], [])
         self.assertEqual(result["rollup"]["sessions"], 0)
 
-    def test_scan_transcripts_preserves_opencode_rollup_only_skills(self):
+    def test_scan_transcripts_gives_opencode_no_authorship_from_installed_skills(self):
         fake_home = self.tmp / "home"
         db_path = fake_home / ".local" / "share" / "opencode" / "opencode.db"
         skills_dir = fake_home / ".claude" / "skills" / "daily-review"
@@ -1374,10 +1971,10 @@ class OpenCodeOrchestrationTests(unittest.TestCase):
 
         opencode = result["by_source"]["opencode"]
         self.assertEqual(opencode["rollup"]["sessions"], 1)
-        self.assertEqual(opencode["rollup"]["custom_skill_files_written"], 1)
-        self.assertEqual(opencode["rollup"]["authored_skill_names"], ["daily-review"])
+        self.assertEqual(opencode["rollup"]["custom_skill_files_written"], 0)
+        self.assertEqual(opencode["rollup"]["authored_skill_names"], [])
         self.assertEqual(len(opencode["daily"]), 1)
-        self.assertEqual(opencode["daily"][0]["metrics"]["custom_skill_files_written"], 1)
+        self.assertEqual(opencode["daily"][0]["metrics"]["custom_skill_files_written"], 0)
 
 
 class PiOrchestrationTests(unittest.TestCase):
@@ -1604,7 +2201,7 @@ class CodexOrchestrationTests(unittest.TestCase):
         shutil.copy(self._CODEX_FIXTURES / "fixture_normal.jsonl", dest)
         os.utime(dest, (self._CODEX_NOW, self._CODEX_NOW))
 
-    def test_seeds_authored_skill_names_from_on_disk_codex_skills(self):
+    def test_on_disk_codex_skill_inventory_never_seeds_authorship(self):
         self._stage_codex_session()
         for name in ("codex-skill", "aiqrank"):
             skill_dir = self.codex_dir / "skills" / name
@@ -1617,10 +2214,11 @@ class CodexOrchestrationTests(unittest.TestCase):
             now_ts=self._CODEX_NOW,
         )
 
+        # Installed/repository presence without a successful mutation never
+        # establishes authorship.
         rollup = result["by_source"]["codex"]["rollup"]
         self.assertEqual(rollup["sessions"], 1)
-        self.assertIn("codex-skill", rollup["authored_skill_names"])
-        self.assertNotIn("aiqrank", rollup["authored_skill_names"])
+        self.assertEqual(rollup["authored_skill_names"], [])
 
     def _write_codex_session(self, name: str, events: list[dict | str]) -> Path:
         sessions = self.codex_dir / "sessions" / "2026" / "04" / "20"
@@ -1640,6 +2238,39 @@ class CodexOrchestrationTests(unittest.TestCase):
             "type": event_type,
             "payload": payload,
         }
+
+    def test_registry_names_seed_codex_when_claude_inactive(self):
+        # R10: a Codex-only user keeps registry authorship after the original
+        # mutation ages out of the transcript window.
+        registry = self.tmp / "registry.json"
+        registry.write_text(
+            json.dumps({"version": 1, "names": ["previously-authored"]})
+        )
+        self._write_codex_session(
+            "plain",
+            [
+                self._codex_event(
+                    {"type": "user_message", "message": "hi"},
+                    event_type="event_msg",
+                )
+            ],
+        )
+
+        result = scan(
+            claude_dir=self.claude_dir,
+            codex_dir=self.codex_dir,
+            now_ts=self._CODEX_NOW,
+            authored_registry_path=registry,
+        )
+
+        codex = result["by_source"]["codex"]
+        self.assertEqual(
+            codex["daily"][-1]["metrics"]["authored_skill_names"],
+            ["previously-authored"],
+        )
+        self.assertEqual(
+            codex["rollup"]["authored_skill_names"], ["previously-authored"]
+        )
 
     def test_modern_events_are_deduplicated_and_attributed(self):
         skill = self.codex_dir / "skills" / "review" / "SKILL.md"
@@ -1729,6 +2360,18 @@ class CodexOrchestrationTests(unittest.TestCase):
             "collaboration_mode": "plan",
         }, event_type="turn_context")
         malformed_context["timestamp"] = "2026-04-19T13:00:00.000Z"
+        # Successful implementation follow-through on the plan-mode date.
+        patch = self._codex_event({
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "call_id": "patch-1",
+            "input": "*** Begin Patch\n*** Update File: lib/foo.ex\n@@\n+x\n*** End Patch",
+        })
+        patch["timestamp"] = "2026-04-20T14:00:00.000Z"
+        patch_output = self._codex_event({
+            "type": "custom_tool_call_output", "call_id": "patch-1", "output": "Done",
+        })
+        patch_output["timestamp"] = "2026-04-20T14:00:01.000Z"
         self._write_codex_session(
             "native-plan",
             [
@@ -1736,6 +2379,8 @@ class CodexOrchestrationTests(unittest.TestCase):
                 malformed_context,
                 plan_context,
                 repeated_plan_context,
+                patch,
+                patch_output,
             ],
         )
 
@@ -1758,9 +2403,18 @@ class CodexOrchestrationTests(unittest.TestCase):
             "call_id": "plan-1",
             "arguments": json.dumps({"plan": [{"step": "private", "status": "pending"}]}),
         })
+        patch = self._codex_event({
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "call_id": "patch-1",
+            "input": "*** Begin Patch\n*** Update File: lib/foo.ex\n@@\n+x\n*** End Patch",
+        })
+        patch_output = self._codex_event({
+            "type": "custom_tool_call_output", "call_id": "patch-1", "output": "Done",
+        })
         self._write_codex_session(
             "native-plan-with-tool",
-            [native_plan, update_plan, update_plan],
+            [native_plan, update_plan, update_plan, patch, patch_output],
         )
 
         rollup = scan_codex(self.codex_dir, now_ts=self._CODEX_NOW)["rollup"]

@@ -138,7 +138,6 @@ def scan(
         )
 
     _apply_orchestration(daily, launch_candidates, child_days)
-    _seed_authored_skills(daily, home, main_cwds)
 
     sustained = min_sustained_secs()
     for day, intervals in intervals_by_day.items():
@@ -536,40 +535,6 @@ def _session_file_identity(raw: str, cwd: Path | None) -> str:
     if not path.is_absolute() and cwd is not None:
         path = cwd / path
     return _path_identity(path)
-
-
-def _seed_authored_skills(
-    daily: dict[date, dict], home: Path, main_cwds: set[Path]
-) -> None:
-    authored: dict[str, str] = {}
-    roots = [home / ".pi" / "agent" / "skills"]
-    roots.extend(cwd / ".pi" / "skills" for cwd in main_cwds)
-    for root in roots:
-        for skill_path, name in _discover_skills(root):
-            authored[_path_identity(skill_path)] = name
-    if not authored or not daily:
-        return
-    bucket = _bucket(daily, max(daily))
-    bucket["custom_skill_files_written"] += len(authored)
-    names = set(bucket["authored_skill_names"])
-    names.update(authored.values())
-    bucket["authored_skill_names"] = sorted(names)
-
-
-def _discover_skills(root: Path) -> Iterable[tuple[Path, str]]:
-    out: list[tuple[Path, str]] = []
-    try:
-        resolved_root = root.resolve(strict=True)
-    except FileNotFoundError:
-        return out
-    except OSError as exc:
-        raise PiScanIncomplete("Pi skill root could not be resolved") from exc
-    for path in _walk_files_fail_closed(root, "Pi skill tree"):
-        if path.name == "SKILL.md":
-            out.append((path, _safe_label(path.parent.name)))
-        elif path.parent == resolved_root and path.suffix == ".md":
-            out.append((path, _safe_label(path.stem)))
-    return out
 
 
 def _skill_name_from_read(

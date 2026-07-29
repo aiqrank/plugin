@@ -610,10 +610,8 @@ class PiScannerTests(unittest.TestCase):
         result = self.pi()
         rollup = result["rollup"]
         self.assertEqual(rollup["skill_counts"], {"user-skill": 1})
-        self.assertEqual(rollup["custom_skill_files_written"], 2)
-        self.assertEqual(
-            rollup["authored_skill_names"], ["project-skill", "user-skill"]
-        )
+        self.assertEqual(rollup["custom_skill_files_written"], 0)
+        self.assertEqual(rollup["authored_skill_names"], [])
         serialized = json.dumps(result)
         self.assertNotIn(str(user_skill), serialized)
         self.assertNotIn("PRIVATE-SKILL-BODY", serialized)
@@ -721,7 +719,7 @@ class PiScannerTests(unittest.TestCase):
             with self.assertRaisesRegex(PiScanIncomplete, "could not be traversed"):
                 self.pi()
 
-    def test_unreadable_authored_skill_directory_fails_the_pi_snapshot(self):
+    def test_unreadable_skill_directory_no_longer_affects_the_pi_snapshot(self):
         skill_root = self.home / ".pi" / "agent" / "skills"
         nested = skill_root / "private-skill"
         nested.mkdir(parents=True)
@@ -738,8 +736,9 @@ class PiScannerTests(unittest.TestCase):
             return original_scandir(path)
 
         with patch.object(scan_pi_module.os, "scandir", side_effect=fail_nested):
-            with self.assertRaisesRegex(PiScanIncomplete, "could not be traversed"):
-                self.pi()
+            rollup = self.pi()["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], [])
+        self.assertEqual(rollup["custom_skill_files_written"], 0)
 
     def test_missing_session_directory_returns_empty_envelope(self):
         result = scan(

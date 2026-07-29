@@ -78,6 +78,24 @@ class ScanCursorTests(unittest.TestCase):
 
     # ── happy paths ───────────────────────────────────────────────────────
 
+    def test_installed_skills_on_disk_are_not_authored(self):
+        skill = self.fake_home / ".claude" / "skills" / "installed-skill" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("installed, not authored")
+
+        conn = _create_db(self.db)
+        _put(conn, "composerData:c1", {
+            "createdAt": _ms(2026, 4, 27, 12, 0),
+            "lastUpdatedAt": _ms(2026, 4, 27, 12, 30),
+            "fullConversationHeadersOnly": [{}, {}, {}],
+        })
+        conn.commit()
+        conn.close()
+
+        rollup = self._scan()["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], [])
+        self.assertEqual(rollup["custom_skill_files_written"], 0)
+
     def test_two_composers_emit_two_day_envelope(self):
         conn = _create_db(self.db)
         # Composer 1 — Apr 26 noon.

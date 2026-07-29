@@ -115,6 +115,18 @@ PLAN_MODE_TOOL = "ExitPlanMode"
 CLAUDE_PLAN_AGENT_TOOLS = {"Agent", "Task"}
 AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 
+# `sessions_with_plan_mode` semantics marker: 1 = structural planning
+# outcomes (signal followed by a successful mutation, or a recognized plan
+# artifact write). Emitted in every daily bucket so the server can tell
+# upgraded scans from legacy activation-count rows.
+PLANNING_MEASUREMENT_VERSION = 1
+PLAN_ARTIFACT_PARENT_DIRS = {"docs", ".context"}
+AUTHORED_REGISTRY_VERSION = 1
+# Plausible bare skill names only — applied both when extracting authorship
+# and when loading the registry, so a corrupt registry entry shaped like a
+# path, session id, or free text can never reach serialized output.
+_AUTHORED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
 # Codex-specific
 CODEX_TOOL_TYPES = {"function_call", "custom_tool_call", "tool_use", "local_shell_call"}
 CODEX_PATCH_FILE_RE = re.compile(
@@ -203,6 +215,7 @@ _COUNT_FIELDS = (
     "user_messages",
     "user_corrections",
     "plan_mode_invocations",
+    "planning_measurement_version",
     "tokens_input",
     "tokens_output",
     "tokens_cache_read",
@@ -387,6 +400,7 @@ def scan(
     scheduled_root: Path | None = None,
     codex_dir: Path | None = None,
     pi_dir: Path | None = None,
+    authored_registry_path: Path | None = None,
 ) -> dict:
     """Scan supported coding-agent transcripts within the last `window_days`.
 
@@ -441,6 +455,16 @@ def scan(
             host_home / ".codex"
             if claude_dir is None
             else homes[0] / "__codex_disabled__"
+        )
+
+    # Authored-skill registry resolution follows the same policy: production
+    # uses the real config directory; tests overriding `claude_dir` get an
+    # isolated path inside their sandbox unless they pass one explicitly.
+    if authored_registry_path is None:
+        authored_registry_path = (
+            _default_authored_registry_path()
+            if claude_dir is None
+            else homes[0] / "__authored_skills_registry__.json"
         )
 
     # Pi root resolution follows Pi's documented environment precedence in
@@ -524,16 +548,6 @@ def scan(
                 except (json.JSONDecodeError, OSError):
                     continue
 
-    # Parity with the OpenCode/Cursor scanners: skills present on disk under
-    # ~/.claude/skills/<name>/ (and project-local .claude/skills/) count as
-    # authored even when no Write/Edit for them was captured in the retained
-    # transcript window. Seed them into the most recent Claude day so the
-    # backend's cross-day union picks them up. Only an existing active day is
-    # touched — never a fabricated zero-activity day.
-    claude_daily = daily_by_source[SOURCE_CLAUDE_CODE]
-    if local_skills and claude_daily:
-        _seed_authored_into_latest_day(claude_daily, local_skills, now_ts)
-
     # Cowork root: same Claude Code JSONL format, but nested inside sandboxed
     # session directories at .../local_*/.claude/projects/<projectDir>/*.jsonl.
     # Events land in the cowork source bucket.
@@ -603,6 +617,50 @@ def scan(
                     for interval in intervals
                     if isinstance(interval, (list, tuple)) and len(interval) >= 2
                 ]
+
+    # Authored-skill registry: persist names observed as authored this scan
+    # (successful skills/<name>/SKILL.md mutations), then seed previously
+    # registered names into the latest active Claude day so authorship
+    # survives past the transcript retention window. On-disk skill inventory
+    # (`local_skills`) deliberately does NOT feed authorship — it only
+    # detects invocable bare slash commands. Only an existing active day is
+    # seeded — never a fabricated zero-activity day.
+    registry_names = _load_authored_registry(authored_registry_path)
+    observed_authored: set[str] = set()
+    for source_daily in (
+        daily_by_source[SOURCE_CLAUDE_CODE],
+        daily_by_source[SOURCE_COWORK],
+    ):
+        for metrics in source_daily.values():
+            observed_authored.update(
+                name
+                for name in metrics.get("authored_skill_names") or []
+                if isinstance(name, str) and name
+            )
+    if codex_result is not None:
+        for row in codex_result.get("daily") or []:
+            observed_authored.update(
+                name
+                for name in (row.get("metrics") or {}).get("authored_skill_names") or []
+                if isinstance(name, str) and name
+            )
+    merged_authored = registry_names | observed_authored
+    if merged_authored and merged_authored != registry_names:
+        _save_authored_registry(authored_registry_path, merged_authored)
+    if registry_names:
+        # Seed the first source with an active day so registry names survive
+        # for Codex-only (and Cowork-only) users too, not just Claude.
+        seeded = False
+        for source_daily in (
+            daily_by_source[SOURCE_CLAUDE_CODE],
+            daily_by_source[SOURCE_COWORK],
+        ):
+            if source_daily:
+                _seed_authored_into_latest_day(source_daily, registry_names, now_ts)
+                seeded = True
+                break
+        if not seeded and codex_result is not None:
+            _seed_authored_into_codex_result(codex_result, registry_names)
 
     # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
     # Skipped silently when the DB is absent.
@@ -762,6 +820,7 @@ def scan(
             for d, m in sorted(active_daily.items())
         ]
         rollup = _rollup_from_daily(active_daily.values())
+        _stamp_planning_measurement_version(active_daily, rollup)
         intervals_serialized = _serialize_intervals(
             intervals_by_source[source], cutoff_date
         )
@@ -865,6 +924,42 @@ def _seed_authored_into_latest_day(
     target["authored_skill_names"] = sorted(current | missing)
 
 
+def _seed_authored_into_codex_result(codex_result: dict, names: Iterable[str]) -> None:
+    """Codex counterpart of `_seed_authored_into_latest_day` for the already
+    assembled scan_codex envelope: union names not present on any day into
+    the latest daily row and the precomputed rollup. Never fabricates a day."""
+    daily = codex_result.get("daily")
+    if not isinstance(daily, list) or not daily:
+        return
+    incoming = {name for name in names if isinstance(name, str) and name}
+    existing = {
+        name
+        for row in daily
+        for name in (row.get("metrics") or {}).get("authored_skill_names") or []
+        if isinstance(name, str) and name
+    }
+    missing = incoming - existing
+    if not missing:
+        return
+    target = daily[-1].get("metrics")
+    if not isinstance(target, dict):
+        return
+    current = {
+        name
+        for name in target.get("authored_skill_names") or []
+        if isinstance(name, str) and name
+    }
+    target["authored_skill_names"] = sorted(current | missing)
+    rollup = codex_result.get("rollup")
+    if isinstance(rollup, dict):
+        rollup_current = {
+            name
+            for name in rollup.get("authored_skill_names") or []
+            if isinstance(name, str) and name
+        }
+        rollup["authored_skill_names"] = sorted(rollup_current | missing)
+
+
 def _daily_by_date_with_rollup_only(result: dict, now_ts: float) -> dict[date, dict]:
     """Import a sub-scanner daily list and preserve metrics it can only put
     in rollup, such as local authored skills with no reliable event day."""
@@ -923,6 +1018,45 @@ def _rollup_from_daily(per_day_metrics) -> dict:
     for f in _LIST_FIELDS:
         out[f] = sorted(list_accums[f])
     return out
+
+
+def _stamp_planning_measurement_version(daily: dict[date, dict], rollup: dict) -> None:
+    """Mark emitted rows with the structural planning semantics version."""
+    for metrics in daily.values():
+        metrics["planning_measurement_version"] = PLANNING_MEASUREMENT_VERSION
+    rollup["planning_measurement_version"] = PLANNING_MEASUREMENT_VERSION
+
+
+def _is_plan_artifact_path(file_path: str) -> bool:
+    """True for recognized plan artifacts, matched structurally by path only:
+    a Markdown file directly or recursively under a `docs/plans/` or
+    `.context/plans/` directory, or whose basename is exactly `PLAN.md` or
+    matches `*-plan.md`. File content is never inspected."""
+    if not file_path.endswith(".md"):
+        return False
+    segments = [s for s in file_path.split("/") if s]
+    if not segments:
+        return False
+    basename = segments[-1]
+    if basename == "PLAN.md" or basename.endswith("-plan.md"):
+        return True
+    for i in range(len(segments) - 2):
+        if segments[i] in PLAN_ARTIFACT_PARENT_DIRS and segments[i + 1] == "plans":
+            return True
+    return False
+
+
+def _authored_skill_name_from_path(file_path: str) -> str | None:
+    """Extract `<name>` when a path's final segments are
+    `skills/<name>/SKILL.md` — home skill roots and plugin repositories
+    alike. Excludes the aiqrank self-skill."""
+    segments = [s for s in file_path.split("/") if s]
+    if len(segments) < 3 or segments[-1] != "SKILL.md" or segments[-3] != "skills":
+        return None
+    name = segments[-2]
+    if name == "aiqrank" or not _AUTHORED_NAME_RE.match(name):
+        return None
+    return name
 
 
 def max_concurrent_sustained(
@@ -1001,6 +1135,51 @@ def _log_scan_diagnostic(message: str) -> None:
             os.chmod(log_path, 0o600)
         except OSError:
             pass
+    except OSError:
+        pass
+
+
+def _default_authored_registry_path() -> Path:
+    return _host_home() / ".config" / "aiqrank" / "authored_skills.json"
+
+
+def _load_authored_registry(path: Path) -> set[str]:
+    """Names-only local registry of observed authored skills. Fail-soft: a
+    missing or corrupt registry yields an empty set and never marks a
+    transcript source incomplete."""
+    try:
+        with path.open("r") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    names = data.get("names")
+    if not isinstance(names, list):
+        return set()
+    return {
+        name
+        for name in names
+        if isinstance(name, str)
+        and name != "aiqrank"
+        and _AUTHORED_NAME_RE.match(name)
+    }
+
+
+def _save_authored_registry(path: Path, names: set[str]) -> None:
+    """Atomically persist the names-only registry (temp file + rename) with
+    owner-only permissions. Fail-soft: registry write failures never affect
+    the scan output."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        with tmp_path.open("w") as fh:
+            json.dump(
+                {"version": AUTHORED_REGISTRY_VERSION, "names": sorted(names)}, fh
+            )
+            fh.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
     except OSError:
         pass
 
@@ -1299,6 +1478,51 @@ def _command_spawns_worktree(command: str) -> bool:
     return bool(_WORKTREE_ADD_RE.search(stripped))
 
 
+def _claude_tool_success_dates(path: Path, fallback_date: date) -> dict[str, date]:
+    """Index tool_use ids to the local date of their successful completion.
+
+    Mirrors the Codex mutation-success indexing: a `tool_result` block whose
+    `is_error` is set marks failure; a tool_use with no successful result
+    stays absent, so consumers fail closed. Consumers require the completion
+    date to match the invocation date — a success that lands after midnight
+    does not qualify the earlier date.
+    """
+    success_dates: dict[str, date] = {}
+    try:
+        with path.open("r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "user":
+                    continue
+                msg = event.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                ts = _parse_timestamp(
+                    event.get("timestamp") or event.get("_audit_timestamp")
+                )
+                d = _ts_to_date(ts) or fallback_date
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    tool_use_id = block.get("tool_use_id")
+                    if (
+                        isinstance(tool_use_id, str)
+                        and tool_use_id
+                        and not block.get("is_error")
+                    ):
+                        success_dates.setdefault(tool_use_id, d)
+    except OSError:
+        return {}
+    return success_dates
+
+
 def process_session(
     path: Path,
     daily: dict[date, dict],
@@ -1327,7 +1551,13 @@ def process_session(
     days_with_tools: set[date] = set()
     days_with_orchestration: set[date] = set()
     days_with_context_leverage: set[date] = set()
-    days_with_plan_mode: set[date] = set()
+    # Structural planning: signal dates hold planning activations seen so far
+    # in event order; outcome dates hold qualified structural outcomes (a
+    # signal followed by a successful mutation on the same date, or a
+    # successful plan-artifact write). Only outcomes feed
+    # sessions_with_plan_mode; plan_mode_invocations stays raw.
+    plan_signal_dates: set[date] = set()
+    days_with_plan_outcome: set[date] = set()
     # Per-day message counts within this session — used to update daily
     # max_messages_in_session at the end.
     msgs_per_day: dict[date, int] = {}
@@ -1347,6 +1577,8 @@ def process_session(
         fallback_date = datetime.fromtimestamp(path.stat().st_mtime).date()
     except OSError:
         return
+
+    tool_success_dates = _claude_tool_success_dates(path, fallback_date)
 
     try:
         with path.open("r") as fh:
@@ -1514,8 +1746,9 @@ def process_session(
                             days_with_context_leverage.add(d)
 
                         if name == PLAN_MODE_TOOL:
-                            days_with_plan_mode.add(d)
                             bucket["plan_mode_invocations"] += 1
+                            if is_main:
+                                plan_signal_dates.add(d)
 
                         tool_input = tool_use.get("input")
                         if (
@@ -1524,22 +1757,31 @@ def process_session(
                             and isinstance(tool_input, dict)
                             and tool_input.get("subagent_type") == "Plan"
                         ):
-                            days_with_plan_mode.add(d)
+                            plan_signal_dates.add(d)
                             bucket["plan_mode_invocations"] += 1
 
                         if name in ("Write", "Edit"):
                             target_path = (tool_use.get("input") or {}).get("file_path") or ""
 
-                            # Track authorship: any Write/Edit under
-                            # ~/.claude/skills/<name>/** counts as authoring
-                            # that skill (excluding aiqrank itself).
-                            if (
-                                "/.claude/skills/" in target_path
-                                and AIQRANK_SKILL_DIR_FRAGMENT not in target_path
-                            ):
-                                skill_name = _claude_skill_name_from_path(target_path)
+                            # Authorship and planning credit require a
+                            # successful completion record on the same local
+                            # date as the invocation — a missing, errored, or
+                            # cross-midnight tool_result fails closed.
+                            tool_use_id = tool_use.get("id")
+                            succeeded = (
+                                isinstance(tool_use_id, str)
+                                and tool_success_dates.get(tool_use_id) == d
+                            )
+                            if succeeded and isinstance(target_path, str) and target_path:
+                                skill_name = _authored_skill_name_from_path(target_path)
                                 if skill_name and skill_name not in bucket["authored_skill_names"]:
                                     bucket["authored_skill_names"].append(skill_name)
+
+                                if is_main and (
+                                    d in plan_signal_dates
+                                    or _is_plan_artifact_path(target_path)
+                                ):
+                                    days_with_plan_outcome.add(d)
 
                             if (
                                 target_path.endswith("/SKILL.md")
@@ -1582,7 +1824,7 @@ def process_session(
         _bucket(daily, d)["sessions_with_orchestration"] += 1
     for d in days_with_context_leverage:
         _bucket(daily, d)["sessions_with_context_leverage"] += 1
-    for d in days_with_plan_mode:
+    for d in days_with_plan_outcome:
         _bucket(daily, d)["sessions_with_plan_mode"] += 1
 
     for d, count in msgs_per_day.items():
@@ -1596,20 +1838,6 @@ def process_session(
             if end == start:
                 end = start + 1.0
             intervals_by_day.setdefault(d, []).append((start, end))
-
-
-def _claude_skill_name_from_path(file_path: str) -> str | None:
-    """Extract `<name>` from a `~/.claude/skills/<name>/...` path."""
-    marker = "/.claude/skills/"
-    idx = file_path.find(marker)
-    if idx < 0:
-        return None
-    rest = file_path[idx + len(marker):]
-    if not rest or "/" not in rest:
-        # Allow paths like /.claude/skills/<name> with no trailing /
-        return rest or None
-    name = rest.split("/", 1)[0]
-    return name or None
 
 
 def _local_claude_skills(home: Path) -> set[str]:
@@ -1862,13 +2090,6 @@ def scan_codex(
         daily.clear()
         intervals_by_day.clear()
 
-    codex_skills = {
-        _normalize_codex_label(name)
-        for name in _enumerate_skill_dir(codex_dir / "skills")
-    }
-    if codex_skills and daily:
-        _seed_authored_into_latest_day(daily, codex_skills, now_ts)
-
     for metrics in daily.values():
         _finalize_codex_metric_dicts(metrics)
 
@@ -1884,6 +2105,7 @@ def scan_codex(
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
     rollup = _rollup_from_daily(daily.values())
+    _stamp_planning_measurement_version(daily, rollup)
     if unlocalizable_failures:
         completeness_status = "failed"
     elif incomplete_dates:
@@ -1921,7 +2143,10 @@ def process_codex_session(
     days_seen: set[date] = set()
     days_with_tools: set[date] = set()
     days_with_orchestration: set[date] = set()
-    days_with_plan_mode: set[date] = set()
+    # Same structural split as process_session: activation signals seen so
+    # far in event order vs qualified outcomes that feed the session counter.
+    plan_signal_dates: set[date] = set()
+    days_with_plan_outcome: set[date] = set()
     msgs_per_day: dict[date, int] = {}
     earliest_per_day: dict[date, float] = {}
     latest_per_day: dict[date, float] = {}
@@ -1983,9 +2208,15 @@ def process_codex_session(
         except OSError:
             read_errors += 1
 
+    # Two success indexes: `output_success` stays lenient for skill-read
+    # attribution (the output IS the file content); `mutation_success_dates`
+    # requires positive success evidence and records the completion's local
+    # date so mutation credit can fail closed on ambiguity and on
+    # cross-midnight completions.
     output_success: dict[str, bool] = {}
+    mutation_success_dates: dict[str, date] = {}
     mcp_completion_ids: set[str] = set()
-    for ordinal, event, _d, _ts in parsed_events(record_parse_failures=True):
+    for ordinal, event, d, _ts in parsed_events(record_parse_failures=True):
         payload = event.get("payload")
         if not isinstance(payload, dict):
             continue
@@ -1993,8 +2224,13 @@ def process_codex_session(
         call_id = payload.get("call_id")
         if p_type in ("function_call_output", "custom_tool_call_output") and isinstance(call_id, str):
             output_success[call_id] = output_success.get(call_id, False) or _codex_output_succeeded(payload)
+            if call_id not in mutation_success_dates and _codex_mutation_succeeded(payload):
+                mutation_success_dates[call_id] = d
         elif event.get("type") == "event_msg" and p_type == "exec_command_end" and isinstance(call_id, str):
-            output_success[call_id] = int(payload.get("exit_code") or 0) == 0
+            ok = int(payload.get("exit_code") or 0) == 0
+            output_success[call_id] = ok
+            if ok and call_id not in mutation_success_dates:
+                mutation_success_dates[call_id] = d
         elif event.get("type") == "event_msg" and p_type == "mcp_tool_call_end":
             mcp_completion_ids.add(
                 call_id if isinstance(call_id, str) and call_id else f"mcp-event-{ordinal}"
@@ -2039,7 +2275,7 @@ def process_codex_session(
                 isinstance(collaboration_mode, dict)
                 and collaboration_mode.get("mode") == "plan"
             ):
-                days_with_plan_mode.add(d)
+                plan_signal_dates.add(d)
             continue
 
         if ev_type == "event_msg":
@@ -2127,7 +2363,8 @@ def process_codex_session(
                             d,
                             identity,
                             days_with_orchestration,
-                            days_with_plan_mode,
+                            plan_signal_dates,
+                            days_with_plan_outcome,
                             launches_by_day,
                             command_verbs_by_day,
                         )
@@ -2168,6 +2405,11 @@ def process_codex_session(
                 if not isinstance(name, str) or not name:
                     continue
 
+                succeeded = (
+                    isinstance(call_id, str)
+                    and bool(call_id)
+                    and mutation_success_dates.get(call_id) == d
+                )
                 _apply_codex_tool_effects(
                     bucket,
                     name,
@@ -2175,9 +2417,11 @@ def process_codex_session(
                     d,
                     identity,
                     days_with_orchestration,
-                    days_with_plan_mode,
+                    plan_signal_dates,
+                    days_with_plan_outcome,
                     launches_by_day,
                     command_verbs_by_day,
+                    succeeded=succeeded,
                 )
                 days_with_tools.add(d)
 
@@ -2189,6 +2433,8 @@ def process_codex_session(
                     for nested_index, nested_name in enumerate(_extract_nested_codex_tools(code)):
                         if nested_name.startswith("mcp__"):
                             continue
+                        # Nested calls have no completion record of their
+                        # own — they inherit the enclosing call's success.
                         nested_identity = f"{identity}:nested:{nested_index}"
                         _apply_codex_tool_effects(
                             bucket,
@@ -2197,9 +2443,11 @@ def process_codex_session(
                             d,
                             nested_identity,
                             days_with_orchestration,
-                            days_with_plan_mode,
+                            plan_signal_dates,
+                            days_with_plan_outcome,
                             launches_by_day,
                             command_verbs_by_day,
+                            succeeded=succeeded,
                             nested=True,
                         )
                 continue
@@ -2249,7 +2497,7 @@ def process_codex_session(
         _bucket(daily, d)["sessions_with_tools"] += 1
     for d in days_with_orchestration:
         _bucket(daily, d)["sessions_with_orchestration"] += 1
-    for d in days_with_plan_mode:
+    for d in days_with_plan_outcome:
         _bucket(daily, d)["sessions_with_plan_mode"] += 1
 
     for d, count in msgs_per_day.items():
@@ -2280,10 +2528,12 @@ def _apply_codex_tool_effects(
     d: date,
     identity: str,
     days_with_orchestration: set[date],
-    days_with_plan_mode: set[date],
+    plan_signal_dates: set[date],
+    days_with_plan_outcome: set[date],
     launches_by_day: dict[date, set[str]],
     command_verbs_by_day: dict[date, set[str]],
     *,
+    succeeded: bool = False,
     nested: bool = False,
 ) -> None:
     """Apply one direct, nested, or MCP-completion tool signal."""
@@ -2316,7 +2566,7 @@ def _apply_codex_tool_effects(
                 bucket["max_parallel_agents"] = n
 
     elif name == "update_plan":
-        days_with_plan_mode.add(d)
+        plan_signal_dates.add(d)
         bucket["plan_mode_invocations"] += 1
 
     if name in {"shell", "exec_command"}:
@@ -2344,16 +2594,28 @@ def _apply_codex_tool_effects(
         if isinstance(fp, str) and fp:
             target_paths = [fp]
 
+    # Planning credit requires a successful mutation with a recognized
+    # target: a prior signal on the same date, or a plan-artifact path.
+    if succeeded and target_paths and (
+        d in plan_signal_dates
+        or any(_is_plan_artifact_path(p) for p in target_paths)
+    ):
+        days_with_plan_outcome.add(d)
+
     for target_path in target_paths:
-        # Codex skill authorship.
-        if CODEX_SKILLS_DIR_FRAGMENT in target_path:
-            m = CODEX_SKILL_NAME_RE.search(target_path)
-            if m:
-                skill_name = m.group(1)
-                if skill_name and skill_name not in bucket["authored_skill_names"]:
-                    bucket["authored_skill_names"].append(skill_name)
-                if target_path.endswith("/SKILL.md"):
-                    bucket["custom_skill_files_written"] += 1
+        if (
+            CODEX_SKILLS_DIR_FRAGMENT in target_path
+            and CODEX_SKILL_NAME_RE.search(target_path)
+            and target_path.endswith("/SKILL.md")
+        ):
+            bucket["custom_skill_files_written"] += 1
+
+        # Skill authorship requires a successful completion record and a
+        # skills/<name>/SKILL.md target — plugin repositories included.
+        if succeeded:
+            skill_name = _authored_skill_name_from_path(target_path)
+            if skill_name and skill_name not in bucket["authored_skill_names"]:
+                bucket["authored_skill_names"].append(skill_name)
 
         # Codex AGENTS.md (Claude's CLAUDE.md equivalent). Tracked under
         # the same `claude_md_writes` field — server-side scoring is
@@ -2429,6 +2691,44 @@ def _cap_codex_dictionary(values: dict) -> dict:
 def _finalize_codex_metric_dicts(metrics: dict) -> None:
     for field in ("tool_name_counts", "skill_counts", "mcp_server_counts", "agent_type_counts"):
         metrics[field] = _cap_codex_dictionary(metrics.get(field) or {})
+
+
+# Mutation-success evidence for `_codex_mutation_succeeded`. Failure markers
+# reject first; a positive marker is then required, so ambiguous output fails
+# closed rather than open.
+_CODEX_MUTATION_FAILURE_RE = re.compile(
+    r"\b(?:error|errors|failed|failure|cancelled|canceled|denied|rejected|"
+    r"traceback|exception)\b|no such file"
+)
+_CODEX_MUTATION_SUCCESS_RE = re.compile(
+    r"\b(?:success|succeeded|done|ok|okay|applied|updated|created|added|"
+    r"wrote|written|deleted)\b"
+)
+
+
+def _codex_mutation_succeeded(payload: dict) -> bool:
+    """Positive-evidence success check for structured mutation completions.
+
+    Unlike the lenient read-attribution heuristic (`_codex_output_succeeded`,
+    where the output IS the file content), ambiguous output fails closed: an
+    explicit status decides first, then an embedded exit_code, then a failure
+    marker rejects, and finally a success marker is required. Residual gap: a
+    genuinely successful mutation whose output carries no recognizable marker
+    earns no credit.
+    """
+    status = payload.get("status")
+    if isinstance(status, str):
+        return status.lower() in {"completed", "success", "succeeded", "ok"}
+    output = payload.get("output")
+    if not isinstance(output, str) or not output:
+        return False
+    lowered = output[:500].lower()
+    exit_match = re.search(r'"exit_code"\s*:\s*(-?\d+)', lowered)
+    if exit_match:
+        return exit_match.group(1) == "0"
+    if _CODEX_MUTATION_FAILURE_RE.search(lowered):
+        return False
+    return bool(_CODEX_MUTATION_SUCCESS_RE.search(lowered))
 
 
 def _codex_output_succeeded(payload: dict) -> bool:

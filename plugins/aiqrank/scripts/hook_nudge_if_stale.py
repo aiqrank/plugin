@@ -29,10 +29,17 @@ STALE_SECONDS = 30 * 24 * 60 * 60
 # that doesn't match a strict semver-like shape.
 _VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?$")
 _VERSION_MAX_LEN = 32
-NUDGE = "AIQ Rank: it's been 30 days — run /aiqrank to refresh your rank."
+NUDGE_FMT = "AIQ Rank: it's been 30 days — run {command} to refresh your rank."
 VERSION_NUDGE_FMT = (
-    "AIQ Rank: plugin update available (v{latest}) — run /aiqrank and it installs itself."
+    "AIQ Rank: plugin update available (v{latest}) — run {command} and it installs itself."
 )
+
+
+def _aiqrank_command() -> str:
+    if os.environ.get("CODEX_PLUGIN_ROOT"):
+        return "$aiqrank:aiqrank"
+
+    return "/aiqrank"
 
 
 def _log_hook_fired() -> None:
@@ -65,10 +72,10 @@ def main() -> int:
     _log_hook_fired()
     try:
         if _is_stale():
-            print(NUDGE)
+            print(NUDGE_FMT.format(command=_aiqrank_command()))
         latest = _read_stale_version()
         if latest:
-            print(VERSION_NUDGE_FMT.format(latest=latest))
+            print(VERSION_NUDGE_FMT.format(latest=latest, command=_aiqrank_command()))
     except Exception:
         pass
     return 0

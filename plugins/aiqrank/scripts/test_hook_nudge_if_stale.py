@@ -95,11 +95,32 @@ class HookNudgeTests(unittest.TestCase):
         output = self._run()
         self.assertIn("plugin update available", output)
         self.assertIn("0.9.1", output)
-        # The nudge points at /aiqrank, which now updates itself, rather than
-        # asking the user to run the update commands by hand.
+        # Claude Code uses its slash command, which updates itself rather than
+        # asking the user to run update commands by hand.
         self.assertIn("/aiqrank", output)
         self.assertNotIn("curl -sSL", output)
         self.assertNotIn("30 days", output)
+
+    def test_codex_stale_version_uses_namespaced_skill_command(self):
+        self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
+        self.mod.STALE_VERSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.mod.STALE_VERSION_PATH.write_text("0.9.1\n")
+        self.mod.LAST_UPLOAD_PATH.write_text(
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n"
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_PLUGIN_ROOT": "/plugin"}):
+            output = self._run()
+
+        self.assertIn("$aiqrank:aiqrank", output)
+        self.assertNotIn("run /aiqrank", output)
+
+    def test_codex_stale_rank_uses_namespaced_skill_command(self):
+        with mock.patch.dict(os.environ, {"CODEX_PLUGIN_ROOT": "/plugin"}):
+            output = self._run()
+
+        self.assertIn("$aiqrank:aiqrank", output)
+        self.assertNotIn("run /aiqrank", output)
 
     def test_no_stale_version_file_silent_when_fresh(self):
         self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"

@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scan_codex import scan, _shell_verb, _patch_touches_agents_md  # noqa: E402
 from scan_transcripts import scan as scan_all_sources  # noqa: E402
+from test_scan_transcripts import (  # noqa: E402
+    make_tool_call_with_id,
+    make_tool_result,
+    write_jsonl,
+)
 
 
 FIXTURES = Path(__file__).resolve().parents[4] / "test" / "fixtures" / "codex"
@@ -341,6 +346,412 @@ class ScanCodexTests(unittest.TestCase):
                 "*** Begin Patch\n*** Update File: notes.md\n+ see AGENTS.md"
             )
         )
+
+
+class CodexStructuralPlanningTests(unittest.TestCase):
+    """Codex structural planning outcomes and plugin skill authorship mirror
+    the canonical Claude semantics: signals qualify only with a later
+    successful mutation on the same date, plan-artifact writes qualify alone,
+    and authorship requires a successful skills/<name>/SKILL.md mutation."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._time_patch = mock.patch("time.time", return_value=_FIXTURE_NOW)
+        self._time_patch.start()
+
+    def tearDown(self):
+        self._time_patch.stop()
+        shutil.rmtree(self.tmp)
+
+    def _write_rollout(self, name: str, events: list[dict]) -> Path:
+        sessions = self.tmp / "sessions" / "2026" / "04" / "20"
+        sessions.mkdir(parents=True, exist_ok=True)
+        path = sessions / f"rollout-{name}.jsonl"
+        with path.open("w") as fh:
+            for event in events:
+                fh.write(json.dumps(event) + "\n")
+        os.utime(path, (_FIXTURE_NOW, _FIXTURE_NOW))
+        return path
+
+    @staticmethod
+    def _event(
+        payload: dict,
+        ts: str = "2026-04-20T12:00:00.000Z",
+        event_type: str = "response_item",
+    ) -> dict:
+        return {"timestamp": ts, "type": event_type, "payload": payload}
+
+    def _update_plan(self, ts: str = "2026-04-20T12:00:00.000Z") -> dict:
+        return self._event(
+            {"type": "function_call", "name": "update_plan", "call_id": "plan-1", "arguments": "{}"},
+            ts,
+        )
+
+    def _patch(
+        self, call_id: str, file_path: str, ts: str = "2026-04-20T12:01:00.000Z"
+    ) -> dict:
+        return self._event(
+            {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "call_id": call_id,
+                "input": f"*** Begin Patch\n*** Update File: {file_path}\n@@\n+x\n*** End Patch",
+            },
+            ts,
+        )
+
+    def _output(
+        self, call_id: str, text: str = "Done", ts: str = "2026-04-20T12:01:01.000Z"
+    ) -> dict:
+        return self._event(
+            {"type": "custom_tool_call_output", "call_id": call_id, "output": text},
+            ts,
+        )
+
+    def test_update_plan_with_successful_patch_qualifies_once(self):
+        self._write_rollout(
+            "qualify",
+            [
+                self._update_plan(),
+                self._patch("p1", "lib/foo.ex"),
+                self._output("p1"),
+                self._patch("p2", "lib/bar.ex", ts="2026-04-20T12:02:00.000Z"),
+                self._output("p2", ts="2026-04-20T12:02:01.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(rollup["plan_mode_invocations"], 1)
+
+    def test_activation_alone_and_failed_patch_earn_no_credit(self):
+        self._write_rollout("activation-only", [self._update_plan()])
+        self._write_rollout(
+            "failed-patch",
+            [
+                self._update_plan(),
+                self._patch("p1", "lib/foo.ex"),
+                self._output("p1", text="Error: command failed"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+        self.assertEqual(rollup["plan_mode_invocations"], 2)
+
+    def test_missing_patch_output_fails_closed(self):
+        self._write_rollout(
+            "unpaired",
+            [self._update_plan(), self._patch("p1", "lib/foo.ex")],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_shell_only_follow_through_earns_no_credit(self):
+        self._write_rollout(
+            "shell-only",
+            [
+                self._update_plan(),
+                self._event(
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sh-1",
+                        "arguments": json.dumps({"cmd": "mix test"}),
+                    },
+                    ts="2026-04-20T12:01:00.000Z",
+                ),
+                self._event(
+                    {"type": "exec_command_end", "call_id": "sh-1", "exit_code": 0},
+                    ts="2026-04-20T12:01:01.000Z",
+                    event_type="event_msg",
+                ),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_plan_artifact_patch_qualifies_without_signal(self):
+        self._write_rollout(
+            "artifact",
+            [
+                self._patch("p1", "docs/plans/2026-07-29-001-fix-example-plan.md"),
+                self._output("p1"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(rollup["plan_mode_invocations"], 0)
+
+    def test_generic_patch_targets_earn_no_artifact_credit(self):
+        self._write_rollout(
+            "generic",
+            [
+                self._patch("p1", "README.md"),
+                self._output("p1"),
+                self._patch("p2", "spec.md", ts="2026-04-20T12:02:00.000Z"),
+                self._output("p2", ts="2026-04-20T12:02:01.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_cross_midnight_follow_through_does_not_qualify(self):
+        self._write_rollout(
+            "cross-midnight",
+            [
+                self._update_plan(ts="2026-04-19T08:00:00.000Z"),
+                self._patch("p1", "lib/foo.ex", ts="2026-04-20T14:00:00.000Z"),
+                self._output("p1", ts="2026-04-20T14:00:01.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_completion_after_midnight_fails_closed(self):
+        # The patch is invoked on day one but its successful output lands the
+        # next day — same-date completion is not proven.
+        self._write_rollout(
+            "late-completion",
+            [
+                self._update_plan(ts="2026-04-19T08:00:00.000Z"),
+                self._patch("p1", "lib/foo.ex", ts="2026-04-19T09:00:00.000Z"),
+                self._output("p1", ts="2026-04-20T15:00:00.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_ambiguous_or_failure_marker_outputs_fail_closed(self):
+        for name, output in [
+            ("denied", "permission denied while applying patch"),
+            ("patchfail", "patch failed to apply"),
+            ("neutral", "xyzzy text with no recognizable marker"),
+        ]:
+            self._write_rollout(
+                name,
+                [
+                    self._update_plan(),
+                    self._patch("p1", "lib/foo.ex"),
+                    self._output("p1", text=output),
+                ],
+            )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+
+    def test_embedded_exit_code_decides_mutation_success(self):
+        self._write_rollout(
+            "exit-zero",
+            [
+                self._update_plan(),
+                self._patch("p1", "lib/foo.ex"),
+                self._output("p1", text='{"output":"","metadata":{"exit_code":0}}'),
+            ],
+        )
+        self._write_rollout(
+            "exit-one",
+            [
+                self._update_plan(ts="2026-04-20T13:00:00.000Z"),
+                self._patch("p2", "lib/bar.ex", ts="2026-04-20T13:01:00.000Z"),
+                self._output(
+                    "p2",
+                    text='{"output":"success","metadata":{"exit_code":1}}',
+                    ts="2026-04-20T13:01:01.000Z",
+                ),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        # exit_code 0 qualifies its session; exit_code 1 overrides the
+        # "success" text and fails closed.
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+
+    def test_nested_apply_patch_inherits_outer_success(self):
+        code = (
+            'await tools.apply_patch("*** Begin Patch\\n'
+            '*** Update File: docs/plans/2026-07-29-002-nested-plan.md\\n'
+            '*** End Patch");\n'
+            'await tools.apply_patch("*** Begin Patch\\n'
+            '*** Update File: plugin/skills/nested-skill/SKILL.md\\n'
+            '*** End Patch");'
+        )
+        self._write_rollout(
+            "nested-success",
+            [
+                self._event(
+                    {"type": "custom_tool_call", "name": "exec", "call_id": "outer-1", "input": code}
+                ),
+                self._event(
+                    {"type": "custom_tool_call_output", "call_id": "outer-1", "output": "Done"},
+                    ts="2026-04-20T12:00:01.000Z",
+                ),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(rollup["authored_skill_names"], ["nested-skill"])
+
+    def test_nested_apply_patch_with_failed_outer_earns_nothing(self):
+        code = (
+            'await tools.apply_patch("*** Begin Patch\\n'
+            '*** Update File: docs/plans/2026-07-29-002-nested-plan.md\\n'
+            '*** End Patch");\n'
+            'await tools.apply_patch("*** Begin Patch\\n'
+            '*** Update File: plugin/skills/nested-skill/SKILL.md\\n'
+            '*** End Patch");'
+        )
+        self._write_rollout(
+            "nested-failed",
+            [
+                self._event(
+                    {"type": "custom_tool_call", "name": "exec", "call_id": "outer-1", "input": code}
+                ),
+                self._event(
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "outer-1",
+                        "output": "Error: command failed",
+                    },
+                    ts="2026-04-20T12:00:01.000Z",
+                ),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["sessions_with_plan_mode"], 0)
+        self.assertEqual(rollup["authored_skill_names"], [])
+
+    def test_write_tool_to_plugin_skill_md_establishes_authorship(self):
+        self._write_rollout(
+            "plugin-author",
+            [
+                self._event(
+                    {
+                        "type": "function_call",
+                        "name": "Write",
+                        "call_id": "w1",
+                        "arguments": json.dumps(
+                            {"file_path": "/Users/me/dev/scott-cc/skills/acceptance-criteria/SKILL.md"}
+                        ),
+                    }
+                ),
+                self._event(
+                    {"type": "function_call_output", "call_id": "w1", "output": "ok"},
+                    ts="2026-04-20T12:00:01.000Z",
+                ),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], ["acceptance-criteria"])
+
+    def test_apply_patch_to_plugin_skill_md_establishes_authorship(self):
+        self._write_rollout(
+            "patch-author",
+            [
+                self._patch("p1", "plugin/skills/review-helper/SKILL.md"),
+                self._output("p1"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], ["review-helper"])
+
+    def test_failed_and_self_skill_mutations_never_author(self):
+        self._write_rollout(
+            "non-author",
+            [
+                self._patch("p1", "plugin/skills/aiqrank/SKILL.md"),
+                self._output("p1"),
+                self._patch("p2", "plugin/skills/broken/SKILL.md", ts="2026-04-20T12:02:00.000Z"),
+                self._output("p2", text="Error: command failed", ts="2026-04-20T12:02:01.000Z"),
+                self._patch("p3", "plugin/skills/unpaired/SKILL.md", ts="2026-04-20T12:03:00.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], [])
+
+    def test_daily_rows_and_rollup_carry_planning_measurement_version(self):
+        self._write_rollout(
+            "version",
+            [
+                self._event(
+                    {"type": "user_message", "message": "hello"},
+                    event_type="event_msg",
+                )
+            ],
+        )
+
+        result = scan(codex_dir=self.tmp)
+        self.assertEqual(len(result["daily"]), 1)
+        self.assertEqual(
+            result["daily"][0]["metrics"]["planning_measurement_version"], 1
+        )
+        self.assertEqual(result["rollup"]["planning_measurement_version"], 1)
+
+    def test_claude_and_codex_parity_for_equivalent_fixtures(self):
+        # Equivalent structural fixtures: a planning signal followed by a
+        # successful mutation of a plugin skill file. Both parsers must
+        # produce identical structural outcomes.
+        skill_path = "/Users/me/dev/scott-cc/skills/parity-skill/SKILL.md"
+        claude_dir = self.tmp / "claude"
+        (claude_dir / "projects").mkdir(parents=True)
+        write_jsonl(
+            claude_dir / "projects" / "proj1" / "parity.jsonl",
+            [
+                make_tool_call_with_id(
+                    "ExitPlanMode", {"plan": "..."}, "sig-1", ts="2026-04-20T12:00:00Z"
+                ),
+                make_tool_call_with_id(
+                    "Write", {"file_path": skill_path}, "w1", ts="2026-04-20T12:01:00Z"
+                ),
+                make_tool_result("w1", ts="2026-04-20T12:01:01Z"),
+            ],
+        )
+        self._write_rollout(
+            "parity",
+            [
+                self._update_plan(),
+                self._event(
+                    {
+                        "type": "function_call",
+                        "name": "Write",
+                        "call_id": "w1",
+                        "arguments": json.dumps({"file_path": skill_path}),
+                    },
+                    ts="2026-04-20T12:01:00.000Z",
+                ),
+                self._event(
+                    {"type": "function_call_output", "call_id": "w1", "output": "ok"},
+                    ts="2026-04-20T12:01:01.000Z",
+                ),
+            ],
+        )
+
+        result = scan_all_sources(
+            claude_dir=claude_dir, codex_dir=self.tmp, now_ts=_FIXTURE_NOW
+        )
+        claude_rollup = result["by_source"]["claude_code"]["rollup"]
+        codex_rollup = result["by_source"]["codex"]["rollup"]
+
+        for field in (
+            "sessions_with_plan_mode",
+            "plan_mode_invocations",
+            "authored_skill_names",
+            "planning_measurement_version",
+        ):
+            self.assertEqual(claude_rollup[field], codex_rollup[field], field)
+        self.assertEqual(claude_rollup["sessions_with_plan_mode"], 1)
+        self.assertEqual(claude_rollup["authored_skill_names"], ["parity-skill"])
 
 
 class CodexModelEffortTests(unittest.TestCase):

@@ -147,6 +147,23 @@ class ScanOpenCodeTests(unittest.TestCase):
         return scan(**kwargs)
 
     # ── happy path ───────────────────────────────────────────────────────
+    def test_installed_skills_on_disk_are_not_authored(self):
+        skill = self.fake_home / ".claude" / "skills" / "installed-skill" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("installed, not authored")
+
+        now = time.time()
+        t = int(now * 1000)
+        conn = _create_db(self.db)
+        _insert_session(conn, "s1", None, t, t + 1000)
+        _insert_message(conn, "m1", "s1", t, {"role": "assistant", "parts": []})
+        conn.commit()
+        conn.close()
+
+        rollup = self._scan()["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], [])
+        self.assertEqual(rollup["custom_skill_files_written"], 0)
+
     def test_two_sessions_across_two_days(self):
         # Use "now" timestamps so the default 30-day window picks them up
         # but place them on two different local-calendar days.

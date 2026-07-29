@@ -31,11 +31,10 @@ Best-effort / unmeasurable fields:
     a `role` field across versions. We treat any message whose `data.role`
     is "user" as a user message; absent that, we conservatively skip
     incrementing this field. Defaults to 0 when role is unobservable.
-  * `custom_skill_files_written` / `authored_skill_names` — populated
-    from the local ~/.claude/skills/ directory via the shared helper.
-    OpenCode reads skills from the same path. Counts are added to the
-    rollup once at the end (not distributed per-day) since OpenCode does
-    not expose file-write events we can attribute to a specific day.
+  * `custom_skill_files_written` / `authored_skill_names` — always empty
+    for this source. Installed skills on disk are not authorship evidence;
+    OpenCode does not expose file-write events, so authored-skill credit
+    comes only from sources that observe successful skill mutations.
 
 Python stdlib only — no third-party deps. SQLite via stdlib `sqlite3`.
 """
@@ -54,7 +53,6 @@ from typing import Iterable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scan_transcripts import (  # noqa: E402  -- shared helpers
-    _local_claude_skills,
     max_concurrent_sustained,
 )
 
@@ -309,20 +307,11 @@ def scan(
     # opencode.json mtime walks (per-session directory + global config).
     _walk_mcp_config(daily, sessions_by_id, opencode_config_root, effective_cutoff, now_ts)
 
-    # Local skill snapshot — applied to rollup once (no per-day attribution).
-    skill_names = _local_claude_skills(home)
-
     daily = {d: m for d, m in daily.items() if _has_activity(m)}
     daily_list = [
         {"date": d.isoformat(), "metrics": m} for d, m in sorted(daily.items())
     ]
     rollup = _rollup_from_daily(daily.values())
-
-    if skill_names:
-        rollup["custom_skill_files_written"] += len(skill_names)
-        existing = set(rollup.get("authored_skill_names") or [])
-        existing.update(skill_names)
-        rollup["authored_skill_names"] = sorted(existing)
 
     intervals_serialized = {
         d.isoformat(): [[s, e] for (s, e) in ivs]
