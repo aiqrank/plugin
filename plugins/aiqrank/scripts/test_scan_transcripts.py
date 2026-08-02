@@ -925,6 +925,10 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
             "/repo/.context/plans/idea.md",
             "/repo/sub/PLAN.md",
             "/repo/feature-plan.md",
+            # A `plans/` directory qualifies wherever it sits.
+            "/repo/.claude/plans/idea.md",
+            "/repo/plans/idea.md",
+            "/repo/mydocs/plans/notes.md",
         ]
         for i, artifact_path in enumerate(artifact_paths):
             write_jsonl(
@@ -945,9 +949,10 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
             "/repo/spec.md",
             "/repo/plan.md",
             "/repo/replan.md",
-            "/repo/mydocs/plans/notes.md",
             "/repo/docs/planning/notes.md",
             "/repo/docs/plans/data.txt",
+            # `plans` as the file itself, not a directory.
+            "/repo/docs/plans",
         ]
         for i, near_miss in enumerate(near_miss_paths):
             write_jsonl(

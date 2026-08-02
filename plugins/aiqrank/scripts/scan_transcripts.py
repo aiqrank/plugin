@@ -120,7 +120,13 @@ AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 # artifact write). Emitted in every daily bucket so the server can tell
 # upgraded scans from legacy activation-count rows.
 PLANNING_MEASUREMENT_VERSION = 1
-PLAN_ARTIFACT_PARENT_DIRS = {"docs", ".context"}
+# Directory name that marks a plan artifact, matched at any depth. It used to
+# be an allowlist of two permitted parents (`docs`, `.context`), which meant
+# the same `plans/PLAN.md` counted or not depending on where the repository
+# happened to put it — `.claude/plans/`, `.github/plans/` and a top-level
+# `plans/` all scored zero. The convention being detected is the `plans/`
+# directory itself, not its parent.
+PLAN_ARTIFACT_DIR = "plans"
 AUTHORED_REGISTRY_VERSION = 1
 # Plausible bare skill names only — applied both when extracting authorship
 # and when loading the registry, so a corrupt registry entry shaped like a
@@ -1029,9 +1035,9 @@ def _stamp_planning_measurement_version(daily: dict[date, dict], rollup: dict) -
 
 def _is_plan_artifact_path(file_path: str) -> bool:
     """True for recognized plan artifacts, matched structurally by path only:
-    a Markdown file directly or recursively under a `docs/plans/` or
-    `.context/plans/` directory, or whose basename is exactly `PLAN.md` or
-    matches `*-plan.md`. File content is never inspected."""
+    a Markdown file directly or recursively under a `plans/` directory at any
+    depth, or whose basename is exactly `PLAN.md` or matches `*-plan.md`.
+    File content is never inspected."""
     if not file_path.endswith(".md"):
         return False
     segments = [s for s in file_path.split("/") if s]
@@ -1040,8 +1046,10 @@ def _is_plan_artifact_path(file_path: str) -> bool:
     basename = segments[-1]
     if basename == "PLAN.md" or basename.endswith("-plan.md"):
         return True
-    for i in range(len(segments) - 2):
-        if segments[i] in PLAN_ARTIFACT_PARENT_DIRS and segments[i + 1] == "plans":
+    # Any `plans/` directory that actually contains something — the final
+    # segment is the file, so a trailing `plans` segment cannot qualify.
+    for segment in segments[:-1]:
+        if segment == PLAN_ARTIFACT_DIR:
             return True
     return False
 
