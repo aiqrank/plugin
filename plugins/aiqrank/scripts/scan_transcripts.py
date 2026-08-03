@@ -503,6 +503,11 @@ def scan(
         local_skills |= _local_claude_skills(home)
         local_skills |= _project_local_claude_skills(home)
 
+    # Distinct shell verbs per day, accumulated across every session of a
+    # source and folded into `command_diversity` once the walk is done.
+    claude_command_verbs: dict[date, set[str]] = {}
+    cowork_command_verbs: dict[date, set[str]] = {}
+
     seen_claude_transcripts: set[str] = set()
     for home in homes:
         projects = home / "projects"
@@ -535,6 +540,7 @@ def scan(
                     is_main,
                     is_cowork=False,
                     local_skills=local_skills,
+                    command_verbs_by_day=claude_command_verbs,
                 )
 
             meta_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
@@ -571,7 +577,13 @@ def scan(
             is_main=True,
             is_cowork=True,
             local_skills=local_skills,
+            command_verbs_by_day=cowork_command_verbs,
         )
+
+    for d, verbs in claude_command_verbs.items():
+        _bucket(daily_by_source[SOURCE_CLAUDE_CODE], d)["command_diversity"] = len(verbs)
+    for d, verbs in cowork_command_verbs.items():
+        _bucket(cowork_daily, d)["command_diversity"] = len(verbs)
 
     # Cowork scheduled-task runs: walk session manifests at workspace level
     # (local_*.json siblings of the local_*/ sandbox dirs) and bucket each
@@ -1540,6 +1552,7 @@ def process_session(
     is_main: bool = True,
     is_cowork: bool = False,
     local_skills: set[str] | None = None,
+    command_verbs_by_day: dict[date, set[str]] | None = None,
 ) -> None:
     """Parse a single JSONL transcript and update per-day buckets.
 
@@ -1553,7 +1566,16 @@ def process_session(
     queue_events, cowork_sessions) are populated alongside the regular
     counters in the (cowork) source's bucket. When `is_cowork` is False,
     those counters remain 0.
+
+    `command_verbs_by_day` accumulates distinct shell verbs across sessions,
+    so the caller folds it into `command_diversity` once every session for
+    the source has been read. It is caller-owned for the same reason the
+    Codex scan owns its own: diversity is a per-day property of the whole
+    day, not of one session.
     """
+    if command_verbs_by_day is None:
+        command_verbs_by_day = {}
+
     # Per-session-per-day: which days saw which kinds of activity.
     days_seen: set[date] = set()
     days_with_tools: set[date] = set()
@@ -1727,6 +1749,15 @@ def process_session(
                             # Command strings are tested and discarded — never
                             # stored or logged because they can contain secrets.
                             command = (tool_use.get("input") or {}).get("command", "")
+                            # Distinct shell verbs per day. Mirrors the Codex
+                            # `command_diversity` counter, which reads the same
+                            # signal off `shell`/`exec_command`. Only the verb
+                            # (the command's basename) is kept; the rest of the
+                            # command string is discarded here as elsewhere,
+                            # and only the per-day *count* is ever uploaded.
+                            verb = _first_meaningful_word(command)
+                            if verb:
+                                command_verbs_by_day.setdefault(d, set()).add(verb)
                             if _command_opens_pr(command):
                                 bucket["prs_opened"] += 1
                             if _command_spawns_worktree(command):

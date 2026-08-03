@@ -3259,5 +3259,74 @@ class ModelAndPrSignalTests(unittest.TestCase):
         self.assertEqual(r["main_user_messages"], 1)
 
 
+class ClaudeCodeCommandDiversityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.projects = self.tmp / "projects"
+        (self.projects / "proj1").mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def rollup(self, result):
+        return claude_block(result)["rollup"]
+
+    def test_counts_distinct_verbs_not_invocations(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("do the thing"),
+                make_tool_call("Bash", {"command": "git status"}),
+                make_tool_call("Bash", {"command": "git push"}),
+                make_tool_call("Bash", {"command": "gh pr view 1"}),
+                make_tool_call("Bash", {"command": "jq . out.json"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        # git, gh, jq — four calls, three verbs.
+        self.assertEqual(r["command_diversity"], 3)
+
+    def test_verbs_union_across_sessions_on_the_same_day(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("one"),
+                make_tool_call("Bash", {"command": "git status"}),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "sessB.jsonl",
+            [
+                make_user_msg("two"),
+                make_tool_call("Bash", {"command": "aws s3 ls"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["command_diversity"], 2)
+
+    def test_env_prefix_and_absolute_path_normalize_to_the_verb(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("run it"),
+                make_tool_call("Bash", {"command": "FOO=1 /usr/local/bin/terraform plan"}),
+                make_tool_call("Bash", {"command": "terraform apply"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["command_diversity"], 1)
+
+    def test_zero_without_bash_calls(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("read only"),
+                make_tool_call("Read", {"file_path": "/x/y.py"}),
+            ],
+        )
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["command_diversity"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
