@@ -115,11 +115,10 @@ PLAN_MODE_TOOL = "ExitPlanMode"
 CLAUDE_PLAN_AGENT_TOOLS = {"Agent", "Task"}
 AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 
-# `sessions_with_plan_mode` semantics marker: 1 = structural planning
-# outcomes (signal followed by a successful mutation, or a recognized plan
-# artifact write). Emitted in every daily bucket so the server can tell
-# upgraded scans from legacy activation-count rows.
-PLANNING_MEASUREMENT_VERSION = 1
+# `sessions_with_plan_mode` semantics marker. Version 2 broadens recognized
+# plan artifacts to Markdown files below any `plans/` directory. Emitted in
+# every daily bucket so the server can prefer the newest measurement definition.
+PLANNING_MEASUREMENT_VERSION = 2
 # Directory name that marks a plan artifact, matched at any depth. It used to
 # be an allowlist of two permitted parents (`docs`, `.context`), which meant
 # the same `plans/PLAN.md` counted or not depending on where the repository

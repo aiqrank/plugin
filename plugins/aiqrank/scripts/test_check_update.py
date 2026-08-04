@@ -43,7 +43,6 @@ class CheckUpdateTests(unittest.TestCase):
             exit_code = self.mod.main()
 
         self.assertEqual(exit_code, 1)
-        self.assertIn("curl -sSL https://aiqrank.com/setup/codex | bash", output.getvalue())
         self.assertIn("$aiqrank:aiqrank", output.getvalue())
 
     def test_current_version_clears_previous_update_notice(self):

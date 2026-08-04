@@ -114,6 +114,7 @@ class HookNudgeTests(unittest.TestCase):
 
         self.assertIn("$aiqrank:aiqrank", output)
         self.assertNotIn("run /aiqrank", output)
+        self.assertIn("updates the Codex plugin automatically", output)
 
     def test_codex_stale_rank_uses_namespaced_skill_command(self):
         with mock.patch.dict(os.environ, {"CODEX_PLUGIN_ROOT": "/plugin"}):

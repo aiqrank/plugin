@@ -1,0 +1,15 @@
+{"timestamp":"2026-04-20T12:00:00.000Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-04-20T12:00:00.000Z","cwd":"/Users/test/proj","originator":"codex_cli_rs","cli_version":"0.34.0","instructions":null,"git":{"commit_hash":"deadbeef","branch":"main","repository_url":"git@github.com:test/proj.git"}}}
+{"timestamp":"2026-04-20T12:00:05.000Z","type":"turn_context","payload":{"cwd":"/Users/test/proj","approval_policy":"on-request","sandbox_policy":{"mode":"workspace-write"},"model":"gpt-5-codex","summary":"auto"}}
+{"timestamp":"2026-04-20T12:00:10.000Z","type":"event_msg","payload":{"type":"user_message","message":"please add a readme"}}
+{"timestamp":"2026-04-20T12:00:12.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"thinking about the structure"}}
+{"timestamp":"2026-04-20T12:00:14.000Z","type":"event_msg","payload":{"type":"agent_message","message":"on it"}}
+{"timestamp":"2026-04-20T12:00:15.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls -la\"]}","call_id":"c1"}}
+{"timestamp":"2026-04-20T12:00:16.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"git status\"]}","call_id":"c2"}}
+{"timestamp":"2026-04-20T12:00:17.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"git diff\"]}","call_id":"c3"}}
+{"timestamp":"2026-04-20T12:00:18.000Z","type":"response_item","payload":{"type":"function_call","name":"mcp__pencil__get_editor_state","arguments":"{}","call_id":"c4"}}
+{"timestamp":"2026-04-20T12:00:19.000Z","type":"response_item","payload":{"type":"web_search_call","call_id":"c5"}}
+{"timestamp":"2026-04-20T12:00:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":170},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":170},"model_context_window":272000}}}
+{"timestamp":"2026-04-20T12:00:21.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\",\"workdir\":\"/tmp\",\"max_output_tokens\":200}","call_id":"c6"}}
+{"timestamp":"2026-04-20T12:00:22.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"c6","stdout":"/tmp\n","exit_code":0}}
+{"timestamp":"2026-04-20T12:00:30.000Z","type":"event_msg","payload":{"type":"user_message","message":"actually, no — revert that change"}}
+{"timestamp":"2026-04-20T12:00:31.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":5,"total_tokens":65}}}}

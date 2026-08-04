@@ -1098,9 +1098,9 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
         claude = claude_block(scan(claude_dir=self.tmp))
         self.assertEqual(len(claude["daily"]), 1)
         self.assertEqual(
-            claude["daily"][0]["metrics"]["planning_measurement_version"], 1
+            claude["daily"][0]["metrics"]["planning_measurement_version"], 2
         )
-        self.assertEqual(claude["rollup"]["planning_measurement_version"], 1)
+        self.assertEqual(claude["rollup"]["planning_measurement_version"], 2)
 
     def test_serialized_envelope_contains_no_planning_sentinels(self):
         plan_path = "/Users/me/secret-project/docs/plans/2026-07-29-042-secret-initiative-plan.md"
@@ -1638,6 +1638,20 @@ class CoworkScannerTests(unittest.TestCase):
         self.assertEqual(claude_r["cowork_sessions"], 0)
         self.assertEqual(claude_r["cowork_messages"], 0)
         self.assertEqual(claude_r["queue_events"], 0)
+
+    def test_command_diversity_is_isolated_by_source(self):
+        write_jsonl(
+            self.projects / "proj1" / "interactive.jsonl",
+            [make_tool_call("Bash", {"command": "git status"})],
+        )
+        write_jsonl(
+            self.cowork_projects / "conv1.jsonl",
+            [make_tool_call("Bash", {"command": "aws s3 ls"})],
+        )
+
+        result = self._scan()
+        self.assertEqual(claude_block(result)["rollup"]["command_diversity"], 1)
+        self.assertEqual(cowork_block(result)["rollup"]["command_diversity"], 1)
 
     def test_missing_cowork_root_is_silent(self):
         # No cowork directory present at all — scan must not crash.
@@ -2187,7 +2201,20 @@ class CodexOrchestrationTests(unittest.TestCase):
     even when no write for them was captured in the transcript window.
     """
 
-    _CODEX_FIXTURES = Path(__file__).resolve().parents[4] / "test" / "fixtures" / "codex"
+    _CODEX_FIXTURE_ROOTS = (
+        Path(__file__).resolve().parents[4],  # server repository layout
+        Path(__file__).resolve().parents[3],  # standalone plugin repository layout
+    )
+    _CODEX_FIXTURES = next(
+        (
+            root / "test" / "fixtures" / "codex"
+            for root in _CODEX_FIXTURE_ROOTS
+            if (root / "test" / "fixtures" / "codex").is_dir()
+        ),
+        None,
+    )
+    if _CODEX_FIXTURES is None:
+        raise RuntimeError("Codex test fixtures are missing from the repository")
     _CODEX_NOW = datetime(2026, 4, 21, tzinfo=timezone.utc).timestamp()
 
     def setUp(self):
@@ -3303,6 +3330,39 @@ class ClaudeCodeCommandDiversityTests(unittest.TestCase):
         )
         r = self.rollup(scan(claude_dir=self.tmp))
         self.assertEqual(r["command_diversity"], 2)
+
+    def test_verbs_roll_up_across_days_without_losing_daily_distinction(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Bash", {"command": "git status"}, "b1", "2026-04-01T10:00:00Z"
+                ),
+                make_tool_call_with_id(
+                    "Bash", {"command": "aws s3 ls"}, "b2", "2026-04-02T10:00:00Z"
+                ),
+            ],
+        )
+
+        result = scan(claude_dir=self.tmp, now_ts=_FIXTURE_NOW + 86400)
+        daily = {row["date"]: row["metrics"] for row in claude_block(result)["daily"]}
+
+        self.assertEqual(daily["2026-04-01"]["command_diversity"], 1)
+        self.assertEqual(daily["2026-04-02"]["command_diversity"], 1)
+        self.assertEqual(self.rollup(result)["command_diversity"], 2)
+
+    def test_subagent_bash_calls_contribute_to_command_diversity(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [make_user_msg("delegate the check")],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "sessA" / "subagents" / "agent-001.jsonl",
+            [make_tool_call("Bash", {"command": "kubectl get pods"})],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+        self.assertEqual(r["command_diversity"], 1)
 
     def test_env_prefix_and_absolute_path_normalize_to_the_verb(self):
         write_jsonl(

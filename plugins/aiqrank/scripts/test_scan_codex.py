@@ -25,7 +25,16 @@ from test_scan_transcripts import (  # noqa: E402
 )
 
 
-FIXTURES = Path(__file__).resolve().parents[4] / "test" / "fixtures" / "codex"
+_FIXTURE_ROOTS = (
+    Path(__file__).resolve().parents[4],  # server repository layout
+    Path(__file__).resolve().parents[3],  # standalone plugin repository layout
+)
+FIXTURES = next(
+    (root / "test" / "fixtures" / "codex" for root in _FIXTURE_ROOTS if (root / "test" / "fixtures" / "codex").is_dir()),
+    None,
+)
+if FIXTURES is None:
+    raise RuntimeError("Codex test fixtures are missing from the repository")
 
 # The codex fixtures carry explicit 2026-04-20 event timestamps. The scanner now
 # drops day-buckets older than `now - window_days`, so the fixture-based tests
@@ -694,9 +703,9 @@ class CodexStructuralPlanningTests(unittest.TestCase):
         result = scan(codex_dir=self.tmp)
         self.assertEqual(len(result["daily"]), 1)
         self.assertEqual(
-            result["daily"][0]["metrics"]["planning_measurement_version"], 1
+            result["daily"][0]["metrics"]["planning_measurement_version"], 2
         )
-        self.assertEqual(result["rollup"]["planning_measurement_version"], 1)
+        self.assertEqual(result["rollup"]["planning_measurement_version"], 2)
 
     def test_claude_and_codex_parity_for_equivalent_fixtures(self):
         # Equivalent structural fixtures: a planning signal followed by a

@@ -50,8 +50,7 @@ def main() -> int:
 
     print(
         f"AIQ Rank: plugin update available (v{latest}). "
-        "Run in a terminal: curl -sSL https://aiqrank.com/setup/codex | bash; "
-        "then start a new Codex session and run $aiqrank:aiqrank."
+        "Run $aiqrank:aiqrank to update it automatically, then start a new Codex session."
     )
     return 1
 

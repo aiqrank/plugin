@@ -107,42 +107,78 @@ class ResolveRootTest(unittest.TestCase):
 
 
 class UpdateCodexTest(unittest.TestCase):
-    def test_downloads_from_the_tag_matching_the_version(self):
+    def test_refreshes_codex_plugin_and_downloads_matching_tag(self):
         seen = {}
 
         def fake_fetch(url):
             seen["url"] = url
             return b"print('installer')"
 
-        with mock.patch.object(self_update, "_fetch", fake_fetch):
-            with mock.patch.object(self_update, "_run", return_value=True) as run:
-                self.assertTrue(self_update._update_codex("0.3.16"))
+        with mock.patch.object(self_update.shutil, "which", return_value="/bin/codex"):
+            with mock.patch.object(self_update, "_fetch", fake_fetch):
+                with mock.patch.object(self_update, "_run", return_value=True) as run:
+                    self.assertTrue(self_update._update_codex("0.3.16"))
+
+        commands = [call[0][0] for call in run.call_args_list]
+        self.assertEqual(commands[0][1:], ["plugin", "marketplace", "upgrade", "aiqrank"])
+        self.assertEqual(commands[1][1:], ["plugin", "add", "aiqrank@aiqrank"])
+        self.assertEqual(
+            commands[2][1:],
+            ["-", "--base", "https://raw.githubusercontent.com/aiqrank/plugin/v0.3.16/plugins/aiqrank"],
+        )
 
         self.assertEqual(
             seen["url"],
             "https://raw.githubusercontent.com/aiqrank/plugin/v0.3.16"
             "/plugins/aiqrank/scripts/install_codex.py",
         )
-        self.assertIn("--base", run.call_args[0][0])
+
+    def test_adds_marketplace_when_upgrade_fails(self):
+        with mock.patch.object(self_update.shutil, "which", return_value="/bin/codex"):
+            with mock.patch.object(self_update, "_fetch", return_value=b"installer"):
+                with mock.patch.object(
+                    self_update, "_run", side_effect=[False, True, True, True]
+                ) as run:
+                    self.assertTrue(self_update._update_codex("0.3.16"))
+
+        commands = [call[0][0] for call in run.call_args_list]
+        self.assertEqual(commands[1][1:], ["plugin", "marketplace", "add", "aiqrank/plugin"])
+        self.assertEqual(commands[2][1:], ["plugin", "add", "aiqrank@aiqrank"])
+
+    def test_reports_failure_when_codex_cli_is_missing(self):
+        with mock.patch.object(self_update.shutil, "which", return_value=None):
+            with mock.patch.object(self_update, "_fetch") as fetch:
+                self.assertFalse(self_update._update_codex("0.3.16"))
+        fetch.assert_not_called()
+
+    def test_failed_download_does_not_run_installer(self):
+        with mock.patch.object(self_update.shutil, "which", return_value="/bin/codex"):
+            with mock.patch.object(self_update, "_fetch", return_value=None):
+                with mock.patch.object(self_update, "_run", return_value=True) as run:
+                    self.assertFalse(self_update._update_codex("0.3.16"))
+
+        self.assertEqual(run.call_count, 2)
+
+    def test_failed_marketplace_update_does_not_continue_when_add_fails(self):
+        with mock.patch.object(self_update.shutil, "which", return_value="/bin/codex"):
+            with mock.patch.object(self_update, "_run", side_effect=[False, False]) as run:
+                self.assertFalse(self_update._update_codex("0.3.16"))
+
+        self.assertEqual(run.call_count, 2)
 
     def test_host_is_constant_and_not_server_controlled(self):
         seen = {}
 
-        with mock.patch.object(
-            self_update, "_fetch", lambda url: seen.setdefault("url", url) and None
-        ):
-            self_update._update_codex("0.3.16")
+        with mock.patch.object(self_update, "_run", return_value=True) as run:
+            with mock.patch.object(self_update.shutil, "which", return_value="/bin/codex"):
+                with mock.patch.object(
+                    self_update, "_fetch", lambda url: seen.setdefault("url", url) and None
+                ):
+                    self_update._update_codex("0.3.16")
 
         self.assertTrue(
             seen["url"].startswith("https://raw.githubusercontent.com/aiqrank/plugin/")
         )
-
-    def test_failed_download_does_not_run_anything(self):
-        with mock.patch.object(self_update, "_fetch", return_value=None):
-            with mock.patch.object(self_update, "_run") as run:
-                self.assertFalse(self_update._update_codex("0.3.16"))
-        run.assert_not_called()
-
 
 class UpdateClaudeTest(unittest.TestCase):
     def test_runs_marketplace_then_plugin_update(self):

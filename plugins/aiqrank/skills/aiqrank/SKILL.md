@@ -36,6 +36,6 @@ Step 0 updates the plugin automatically, so there is normally nothing to do. The
 If step 0 reports that the automatic update did not complete, pass along the manual command it printed:
 
 - Claude Code — `claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank`
-- Codex — `curl -sSL https://aiqrank.com/setup/codex | bash`, then start a new Codex session and run `$aiqrank:aiqrank`
+- Codex — `codex plugin marketplace upgrade aiqrank && codex plugin add aiqrank@aiqrank`, then start a new Codex session and run `$aiqrank:aiqrank`
 
 To disable background uploads: `touch ~/.config/aiqrank/disabled`

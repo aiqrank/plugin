@@ -54,7 +54,7 @@ _UPDATE_TIMEOUT = 180
 _MANUAL_CLAUDE = (
     "claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank"
 )
-_MANUAL_CODEX = "curl -sSL https://aiqrank.com/setup/codex | bash"
+_MANUAL_CODEX = "codex plugin marketplace upgrade aiqrank && codex plugin add aiqrank@aiqrank"
 
 
 def main() -> int:
@@ -132,11 +132,22 @@ def _update_claude() -> bool:
 
 
 def _update_codex(version: str) -> bool:
-    """Run the installer published at the release tag for `version`.
+    """Refresh the Codex plugin and managed artifacts for `version`.
 
-    The installer is fed to Python on stdin rather than written to disk, so a
-    partial download cannot be left behind as an executable file.
+    The Codex CLI owns the marketplace cache. The release-pinned installer is
+    then fed to Python on stdin rather than written to disk, so a partial
+    download cannot be left behind as an executable file.
     """
+    codex = shutil.which("codex")
+    if codex is None:
+        return False
+
+    if not _run([codex, "plugin", "marketplace", "upgrade", "aiqrank"]):
+        if not _run([codex, "plugin", "marketplace", "add", "aiqrank/plugin"]):
+            return False
+    if not _run([codex, "plugin", "add", "aiqrank@aiqrank"]):
+        return False
+
     base = f"{REPO_RAW_BASE}/v{version}/plugins/aiqrank"
     source = _fetch(f"{base}/scripts/install_codex.py")
     if source is None:

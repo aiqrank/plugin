@@ -31,7 +31,7 @@ _VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?$")
 _VERSION_MAX_LEN = 32
 NUDGE_FMT = "AIQ Rank: it's been 30 days — run {command} to refresh your rank."
 VERSION_NUDGE_FMT = (
-    "AIQ Rank: plugin update available (v{latest}) — run {command} and it installs itself."
+    "AIQ Rank: plugin update available (v{latest}) — {instruction}"
 )
 
 
@@ -40,6 +40,15 @@ def _aiqrank_command() -> str:
         return "$aiqrank:aiqrank"
 
     return "/aiqrank"
+
+
+def _update_instruction() -> str:
+    if os.environ.get("CODEX_PLUGIN_ROOT"):
+        return (
+            "run $aiqrank:aiqrank; it updates the Codex plugin automatically."
+        )
+
+    return "run /aiqrank and it installs itself."
 
 
 def _log_hook_fired() -> None:
@@ -75,7 +84,7 @@ def main() -> int:
             print(NUDGE_FMT.format(command=_aiqrank_command()))
         latest = _read_stale_version()
         if latest:
-            print(VERSION_NUDGE_FMT.format(latest=latest, command=_aiqrank_command()))
+            print(VERSION_NUDGE_FMT.format(latest=latest, instruction=_update_instruction()))
     except Exception:
         pass
     return 0

@@ -22,7 +22,7 @@ Updates apply automatically before each scan, refreshing the managed scanner and
 That covers the managed artifacts only. If the user asks to update the Codex marketplace plugin as well, or the automatic update reports that it did not complete, tell them to run this in a terminal:
 
 ```bash
-curl -sSL https://aiqrank.com/setup/codex | bash
+codex plugin marketplace upgrade aiqrank && codex plugin add aiqrank@aiqrank
 ```
 
 They should then start a new Codex session and run `$aiqrank:aiqrank`.

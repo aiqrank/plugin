@@ -1,0 +1,7 @@
+{"timestamp":"2026-04-20T14:00:00.000Z","type":"session_meta","payload":{"id":"ghi","cwd":"/Users/test/edge","originator":"codex_cli_rs","cli_version":"0.99.0"}}
+not-valid-json-line
+{"timestamp":"2026-04-20T14:00:05.000Z","type":"event_msg","payload":{"type":"unknown_future_thing","message":"drift"}}
+{"timestamp":"2026-04-20T14:00:06.000Z","type":"brand_new_top_level","payload":{"type":"whatever"}}
+{"timestamp":"2026-04-20T14:00:07.000Z","type":"compacted","payload":{}}
+{"timestamp":"2026-04-20T14:00:08.000Z","type":"event_msg","payload":{"type":"context_compacted","info":{"count":1}}}
+{"timestamp":"2026-04-20T14:00:09.000Z","type":"event_msg","payload":{"type":"user_message","message":""}}
