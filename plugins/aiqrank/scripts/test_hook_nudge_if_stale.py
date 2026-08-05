@@ -123,6 +123,28 @@ class HookNudgeTests(unittest.TestCase):
         self.assertIn("$aiqrank:aiqrank", output)
         self.assertNotIn("run /aiqrank", output)
 
+    def test_codex_cache_root_uses_namespaced_skill_command(self):
+        codex_root = self.tmp_path / ".codex" / "plugins" / "cache" / "aiqrank" / "aiqrank" / "0.3.20"
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_PLUGIN_ROOT": "", "CLAUDE_PLUGIN_ROOT": str(codex_root)},
+        ):
+            output = self._run()
+
+        self.assertIn("$aiqrank:aiqrank", output)
+        self.assertNotIn("run /aiqrank", output)
+
+    def test_claude_cache_root_keeps_slash_command(self):
+        claude_root = self.tmp_path / ".claude" / "plugins" / "cache" / "aiqrank" / "aiqrank" / "0.3.20"
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_PLUGIN_ROOT": "", "CLAUDE_PLUGIN_ROOT": str(claude_root)},
+        ):
+            output = self._run()
+
+        self.assertIn("run /aiqrank", output)
+        self.assertNotIn("$aiqrank:aiqrank", output)
+
     def test_no_stale_version_file_silent_when_fresh(self):
         self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
         self.mod.LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)

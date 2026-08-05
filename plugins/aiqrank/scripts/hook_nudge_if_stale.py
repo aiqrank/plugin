@@ -35,15 +35,31 @@ VERSION_NUDGE_FMT = (
 )
 
 
-def _aiqrank_command() -> str:
+def _is_codex_host() -> bool:
     if os.environ.get("CODEX_PLUGIN_ROOT"):
+        return True
+
+    # Codex currently injects the installed root through the Claude-compatible
+    # variable when it runs a Claude-format plugin hook. The cache path is the
+    # stable host signal in that case.
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    parts = re.split(r"[/\\\\]+", root)
+    try:
+        codex_index = parts.index(".codex")
+    except ValueError:
+        return False
+    return "plugins" in parts[codex_index + 1 :]
+
+
+def _aiqrank_command() -> str:
+    if _is_codex_host():
         return "$aiqrank:aiqrank"
 
     return "/aiqrank"
 
 
 def _update_instruction() -> str:
-    if os.environ.get("CODEX_PLUGIN_ROOT"):
+    if _is_codex_host():
         return (
             "run $aiqrank:aiqrank; it updates the Codex plugin automatically."
         )
