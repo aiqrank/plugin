@@ -3,8 +3,9 @@
 
 Prints up to two lines on stdout:
   * 30-day staleness nudge when the last upload is missing or > 30 days old.
-  * Plugin-update nudge when ~/.config/aiqrank/stale_version exists (written
-    by hook_upload_today.py based on the server's latest_plugin_version).
+  * Plugin-update nudge when ~/.config/aiqrank/stale_version contains a
+    version newer than this bundle (written by hook_upload_today.py based on
+    the server's latest_plugin_version).
 Silent otherwise. Always exits 0.
 
 Python stdlib only. Must be fast (~5ms).
@@ -18,6 +19,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from _version import PLUGIN_VERSION
+from check_update import _version_tuple
 
 CONFIG_DIR = Path.home() / ".config" / "aiqrank"
 LAST_UPLOAD_PATH = CONFIG_DIR / "last_upload_at"
@@ -114,6 +118,15 @@ def _read_stale_version() -> str | None:
     except OSError:
         return None
     if not v or len(v) > _VERSION_MAX_LEN or _VERSION_RE.match(v) is None:
+        return None
+    try:
+        if _version_tuple(v) <= _version_tuple(PLUGIN_VERSION):
+            # A release can leave an older marker behind while the user is
+            # upgrading. It is no longer actionable once this bundle is at
+            # least that new, so heal the marker and stay silent.
+            STALE_VERSION_PATH.unlink(missing_ok=True)
+            return None
+    except (ValueError, OSError):
         return None
     return v
 

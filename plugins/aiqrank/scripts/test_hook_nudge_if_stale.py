@@ -101,6 +101,21 @@ class HookNudgeTests(unittest.TestCase):
         self.assertNotIn("curl -sSL", output)
         self.assertNotIn("30 days", output)
 
+    def test_older_stale_version_is_cleared_and_silent(self):
+        self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
+        self.mod.STALE_VERSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.mod.STALE_VERSION_PATH.write_text("0.3.20\n")
+        self.mod.LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.mod.LAST_UPLOAD_PATH.write_text(
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n"
+        )
+
+        with mock.patch.object(self.mod, "PLUGIN_VERSION", "0.3.22"):
+            output = self._run()
+
+        self.assertEqual(output, "")
+        self.assertFalse(self.mod.STALE_VERSION_PATH.exists())
+
     def test_codex_stale_version_uses_namespaced_skill_command(self):
         self.mod.STALE_VERSION_PATH = self.tmp_path / ".config" / "aiqrank" / "stale_version"
         self.mod.STALE_VERSION_PATH.parent.mkdir(parents=True, exist_ok=True)

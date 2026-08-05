@@ -26,6 +26,7 @@ the user sees the manual command, which is the pre-auto-update behaviour.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ _MANUAL_CLAUDE = (
     "claude plugin marketplace update aiqrank && claude plugin update aiqrank@aiqrank"
 )
 _MANUAL_CODEX = "codex plugin marketplace upgrade aiqrank && codex plugin add aiqrank@aiqrank"
+_PLUGIN_VERSION_RE = re.compile(r"PLUGIN_VERSION\s*=\s*[\"']([^\"']+)[\"']")
 
 
 def main() -> int:
@@ -88,13 +90,26 @@ def _publish_root(root: Path) -> None:
 
 def detect_engine() -> str:
     """Identify the running engine so we never update the wrong install."""
-    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
-        return "claude"
     if os.environ.get("CODEX_PLUGIN_ROOT"):
         return "codex"
+    claude_compat_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    if _is_codex_plugin_root(claude_compat_root):
+        return "codex"
+    if claude_compat_root:
+        return "claude"
     if (CODEX_MANAGED_ROOT / "scripts").is_dir() or _newest_cached(CODEX_CACHE):
         return "codex"
     return "claude"
+
+
+def _is_codex_plugin_root(root: str) -> bool:
+    """Recognize Codex's Claude-compatible plugin-root environment variable."""
+    parts = re.split(r"[/\\\\]+", root)
+    try:
+        codex_index = parts.index(".codex")
+    except ValueError:
+        return False
+    return "plugins" in parts[codex_index + 1 :]
 
 
 def pending_version() -> str | None:
@@ -104,6 +119,7 @@ def pending_version() -> str | None:
         return None
     try:
         if _version_tuple(latest) <= _version_tuple(PLUGIN_VERSION):
+            _clear_stale_signal()
             return None
     except ValueError:
         return None
@@ -186,8 +202,19 @@ def resolve_root(engine: str) -> Path:
     the version loaded when the session started, which an update supersedes.
     """
     if engine == "codex":
-        if (CODEX_MANAGED_ROOT / "scripts").is_dir():
-            return CODEX_MANAGED_ROOT
+        managed = CODEX_MANAGED_ROOT if (CODEX_MANAGED_ROOT / "scripts").is_dir() else None
+        cached = _newest_cached(CODEX_CACHE)
+        candidates = []
+        if managed is not None:
+            managed_version = _root_version(managed)
+            if managed_version is not None:
+                candidates.append((managed_version, managed))
+        if cached is not None:
+            candidates.append((_version_tuple(cached.name), cached))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        if managed is not None:
+            return managed
         cache, injected = CODEX_CACHE, os.environ.get("CODEX_PLUGIN_ROOT")
     else:
         cache, injected = CLAUDE_CACHE, os.environ.get("CLAUDE_PLUGIN_ROOT")
@@ -198,6 +225,21 @@ def resolve_root(engine: str) -> Path:
     if injected:
         return Path(injected)
     return Path(__file__).resolve().parent.parent
+
+
+def _root_version(root: Path) -> tuple[int, int, int, int, int, str] | None:
+    """Read the managed bundle version without importing user-owned scripts."""
+    try:
+        text = (root / "scripts" / "_version.py").read_text()
+    except OSError:
+        return None
+    match = _PLUGIN_VERSION_RE.search(text)
+    if match is None:
+        return None
+    try:
+        return _version_tuple(match.group(1))
+    except ValueError:
+        return None
 
 
 def _newest_cached(cache: Path) -> Path | None:

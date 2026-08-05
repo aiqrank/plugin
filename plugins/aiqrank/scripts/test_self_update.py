@@ -28,9 +28,27 @@ class DetectEngineTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"CODEX_PLUGIN_ROOT": "/x"}, clear=True):
             self.assertEqual(self_update.detect_engine(), "codex")
 
-    def test_claude_wins_when_both_are_injected(self):
+    def test_explicit_codex_root_wins_when_both_are_injected(self):
         env = {"CLAUDE_PLUGIN_ROOT": "/a", "CODEX_PLUGIN_ROOT": "/b"}
         with mock.patch.dict("os.environ", env, clear=True):
+            self.assertEqual(self_update.detect_engine(), "codex")
+
+    def test_detects_codex_from_claude_compatible_cache_root(self):
+        root = "/Users/test/.codex/plugins/cache/aiqrank/aiqrank/0.3.21"
+        with mock.patch.dict(
+            "os.environ",
+            {"CLAUDE_PLUGIN_ROOT": root, "CODEX_PLUGIN_ROOT": ""},
+            clear=True,
+        ):
+            self.assertEqual(self_update.detect_engine(), "codex")
+
+    def test_keeps_claude_cache_root_as_claude(self):
+        root = "/Users/test/.claude/plugins/cache/aiqrank/aiqrank/0.3.21"
+        with mock.patch.dict(
+            "os.environ",
+            {"CLAUDE_PLUGIN_ROOT": root, "CODEX_PLUGIN_ROOT": ""},
+            clear=True,
+        ):
             self.assertEqual(self_update.detect_engine(), "claude")
 
     def test_falls_back_to_codex_managed_install(self):
@@ -49,7 +67,9 @@ class PendingVersionTest(unittest.TestCase):
             with mock.patch.object(
                 self_update, "_read_stale_version", return_value="0.3.15"
             ):
-                self.assertIsNone(self_update.pending_version())
+                with mock.patch.object(self_update, "_clear_stale_signal") as clear:
+                    self.assertIsNone(self_update.pending_version())
+        clear.assert_called_once()
 
     def test_returns_version_when_newer(self):
         with mock.patch.object(self_update, "PLUGIN_VERSION", "0.3.15"):
@@ -96,6 +116,25 @@ class ResolveRootTest(unittest.TestCase):
                     self.assertEqual(
                         self_update.resolve_root("claude").name, "0.3.16"
                     )
+
+    def test_newer_codex_cache_supersedes_older_managed_root(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            managed = base / "managed"
+            managed_scripts = managed / "scripts"
+            managed_scripts.mkdir(parents=True)
+            (managed_scripts / "_version.py").write_text(
+                'PLUGIN_VERSION = "0.3.14"\n'
+            )
+            cache = _make_cache(base / "cache", ["0.3.21"])
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with mock.patch.object(self_update, "CODEX_MANAGED_ROOT", managed):
+                    with mock.patch.object(self_update, "CODEX_CACHE", cache):
+                        self.assertEqual(
+                            self_update.resolve_root("codex"), cache / "0.3.21"
+                        )
 
     def test_falls_back_to_injected_root_when_cache_is_absent(self):
         env = {"CLAUDE_PLUGIN_ROOT": "/injected"}
@@ -223,6 +262,57 @@ class MainTest(unittest.TestCase):
         output = " ".join(call[0][0] for call in printed.call_args_list)
         self.assertIn("did not complete", output)
         self.assertIn("PLUGIN_ROOT=/root", output)
+
+    def test_codex_compat_session_clears_old_marker_and_uses_newest_cache(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            marker = base / "stale_version"
+            marker.write_text("0.3.20\n")
+
+            managed = base / "managed"
+            managed_scripts = managed / "scripts"
+            managed_scripts.mkdir(parents=True)
+            (managed_scripts / "_version.py").write_text(
+                'PLUGIN_VERSION = "0.3.14"\n'
+            )
+            cache = _make_cache(base / "cache", ["0.3.21"])
+            plugin_root_path = base / "plugin_root"
+            plugin_root_path.parent.mkdir(parents=True, exist_ok=True)
+            compat_root = base / ".codex" / "plugins" / "cache" / "aiqrank"
+
+            with mock.patch.object(self_update, "PLUGIN_VERSION", "0.3.22"):
+                with mock.patch.object(self_update, "STALE_VERSION_PATH", marker):
+                    with mock.patch.object(
+                        self_update, "CODEX_MANAGED_ROOT", managed
+                    ):
+                        with mock.patch.object(self_update, "CODEX_CACHE", cache):
+                            with mock.patch.object(
+                                self_update, "PLUGIN_ROOT_PATH", plugin_root_path
+                            ):
+                                with mock.patch.dict(
+                                    "os.environ",
+                                    {
+                                        "CLAUDE_PLUGIN_ROOT": str(compat_root),
+                                        "CODEX_PLUGIN_ROOT": "",
+                                    },
+                                    clear=True,
+                                ):
+                                    with mock.patch.object(
+                                        self_update, "update"
+                                    ) as update:
+                                        with mock.patch("builtins.print") as printed:
+                                            self.assertEqual(self_update.main(), 0)
+                                        update.assert_not_called()
+                                        self.assertFalse(marker.exists())
+                                        self.assertEqual(
+                                            plugin_root_path.read_text(),
+                                            str(cache / "0.3.21") + "\n",
+                                        )
+                                        printed.assert_called_once_with(
+                                            f"PLUGIN_ROOT={cache / '0.3.21'}"
+                                        )
 
     def test_successful_update_clears_the_stale_signal(self):
         with mock.patch.object(self_update, "pending_version", return_value="0.3.16"):
