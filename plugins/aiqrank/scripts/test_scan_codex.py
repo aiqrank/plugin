@@ -25,7 +25,16 @@ from test_scan_transcripts import (  # noqa: E402
 )
 
 
-FIXTURES = Path(__file__).resolve().parents[4] / "test" / "fixtures" / "codex"
+# This file is <repo>/plugins/aiqrank/scripts/, so the repo root is parents[3].
+# parents[4] pointed one level above the checkout — outside the repository
+# entirely.
+FIXTURES = Path(__file__).resolve().parents[3] / "test" / "fixtures" / "codex"
+
+# test/fixtures/ is not committed, so fixture-backed tests cannot run from a
+# fresh clone. Skip rather than error: an error is indistinguishable from a
+# real regression in every contributor's test output.
+_HAVE_FIXTURES = (FIXTURES / "fixture_normal.jsonl").is_file()
+_SKIP_REASON = f"Codex fixtures not present at {FIXTURES}"
 
 # The codex fixtures carry explicit 2026-04-20 event timestamps. The scanner now
 # drops day-buckets older than `now - window_days`, so the fixture-based tests
@@ -60,6 +69,7 @@ class ScanCodexTests(unittest.TestCase):
         self._time_patch.stop()
         shutil.rmtree(self.tmp)
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_normal_session_extracts_expected_counts(self):
         _staged_session_root(self.tmp, "fixture_normal.jsonl")
         result = scan(codex_dir=self.tmp)
@@ -100,6 +110,7 @@ class ScanCodexTests(unittest.TestCase):
         # No unknown event types in the normal fixture
         self.assertEqual(result["_unknown_event_types"], {})
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_apply_patch_counts_file_changes_and_agents_md(self):
         _staged_session_root(self.tmp, "fixture_apply_patch.jsonl")
         result = scan(codex_dir=self.tmp)
@@ -114,6 +125,7 @@ class ScanCodexTests(unittest.TestCase):
         self.assertEqual(rollup["agents_md_writes"], 1)
         self.assertEqual(rollup["claude_md_writes"], 1)
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_edge_cases_unknown_types_and_malformed_lines(self):
         _staged_session_root(self.tmp, "fixture_edge_cases.jsonl")
         result = scan(codex_dir=self.tmp)
@@ -127,6 +139,7 @@ class ScanCodexTests(unittest.TestCase):
         self.assertIn("event_msg:unknown_future_thing", unknown)
         self.assertIn("brand_new_top_level:whatever", unknown)
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_all_fixtures_together(self):
         _staged_session_root(
             self.tmp,
@@ -170,6 +183,7 @@ class ScanCodexTests(unittest.TestCase):
         self.assertNotIn("2026-01-15", result["intervals_by_day"])
         self.assertNotIn("2025-12-01", result["intervals_by_day"])
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_privacy_no_raw_text_in_output(self):
         _staged_session_root(
             self.tmp, "fixture_normal.jsonl", "fixture_apply_patch.jsonl"
@@ -187,6 +201,7 @@ class ScanCodexTests(unittest.TestCase):
         self.assertNotIn("/Users/test/proj", blob)
         self.assertNotIn("/Users/test/other", blob)
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_mtime_filter_excludes_old_files(self):
         _staged_session_root(self.tmp, "fixture_normal.jsonl")
         # Push file mtime back beyond the default 30-day window
@@ -221,6 +236,7 @@ class ScanCodexTests(unittest.TestCase):
         self.assertEqual(result["source"], "codex")
         self.assertEqual(result["daily"], [])
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_standalone_and_integrated_codex_blocks_are_identical(self):
         _staged_session_root(self.tmp, "fixture_normal.jsonl", "fixture_apply_patch.jsonl")
         claude_dir = self.tmp / "claude"
@@ -764,6 +780,7 @@ class CodexModelEffortTests(unittest.TestCase):
         self._time_patch.stop()
         shutil.rmtree(self.tmp)
 
+    @unittest.skipUnless(_HAVE_FIXTURES, _SKIP_REASON)
     def test_captures_model_from_turn_context(self):
         _staged_session_root(self.tmp, "fixture_normal.jsonl")
         rollup = scan(codex_dir=self.tmp)["rollup"]

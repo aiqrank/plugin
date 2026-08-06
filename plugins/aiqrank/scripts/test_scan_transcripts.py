@@ -2176,13 +2176,28 @@ class CursorOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["rollup"]["sessions"], 0)
 
 
+# This file is <repo>/plugins/aiqrank/scripts/, so the repo root is
+# parents[3]. parents[4] pointed one level above the checkout — outside the
+# repository entirely, so the lookup could only ever have succeeded by accident
+# of where the clone happened to sit.
+_CODEX_FIXTURES_DIR = Path(__file__).resolve().parents[3] / "test" / "fixtures" / "codex"
+
+# test/fixtures/ is not committed, so fixture-backed tests cannot run from a
+# fresh clone. Skip rather than error: an error is indistinguishable from a
+# real regression in every contributor's test output. Applied per test, not to
+# the class — only one test here needs the fixture, and a class-level skip
+# would silently disable the other sixteen.
+_HAVE_CODEX_FIXTURES = (_CODEX_FIXTURES_DIR / "fixture_normal.jsonl").is_file()
+_CODEX_FIXTURES_SKIP_REASON = f"Codex fixtures not present at {_CODEX_FIXTURES_DIR}"
+
+
 class CodexOrchestrationTests(unittest.TestCase):
     """Integration tests verifying scan_transcripts.py credits on-disk Codex
     skills under ~/.codex/skills/<name>/ as authored (parity with Claude Code),
     even when no write for them was captured in the transcript window.
     """
 
-    _CODEX_FIXTURES = Path(__file__).resolve().parents[4] / "test" / "fixtures" / "codex"
+    _CODEX_FIXTURES = _CODEX_FIXTURES_DIR
     _CODEX_NOW = datetime(2026, 4, 21, tzinfo=timezone.utc).timestamp()
 
     def setUp(self):
@@ -2201,6 +2216,7 @@ class CodexOrchestrationTests(unittest.TestCase):
         shutil.copy(self._CODEX_FIXTURES / "fixture_normal.jsonl", dest)
         os.utime(dest, (self._CODEX_NOW, self._CODEX_NOW))
 
+    @unittest.skipUnless(_HAVE_CODEX_FIXTURES, _CODEX_FIXTURES_SKIP_REASON)
     def test_on_disk_codex_skill_inventory_never_seeds_authorship(self):
         self._stage_codex_session()
         for name in ("codex-skill", "aiqrank"):
