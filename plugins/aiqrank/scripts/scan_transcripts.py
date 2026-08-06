@@ -1675,7 +1675,7 @@ def process_session(
                     # setting the user chose. Normalized to a short label; the
                     # helper is source-agnostic despite its name.
                     if is_main:
-                        _increment_codex_dict(bucket, "effort_usage", event.get("effort"))
+                        _increment_label_dict(bucket, "effort_usage", event.get("effort"))
 
                     usage = msg.get("usage") or {}
                     if isinstance(usage, dict):
@@ -2348,8 +2348,8 @@ def process_codex_session(
             continue
 
         if ev_type == "turn_context":
-            _increment_codex_dict(bucket, "model_usage", payload.get("model"))
-            _increment_codex_dict(bucket, "effort_usage", payload.get("effort"))
+            _increment_label_dict(bucket, "model_usage", payload.get("model"))
+            _increment_label_dict(bucket, "effort_usage", payload.get("effort"))
             collaboration_mode = payload.get("collaboration_mode")
             if (
                 isinstance(collaboration_mode, dict)
@@ -2567,7 +2567,7 @@ def process_codex_session(
             skill_name = _codex_skill_name(skill_path)
             if skill_name and skill_name not in skill_names_seen:
                 skill_names_seen.add(skill_name)
-                _increment_codex_dict(_bucket(daily, d), "skill_counts", skill_name)
+                _increment_label_dict(_bucket(daily, d), "skill_counts", skill_name)
 
     for d in days_seen:
         bucket = _bucket(daily, d)
@@ -2622,13 +2622,13 @@ def _apply_codex_tool_effects(
         return
     bucket["tool_calls"] += 1
     bucket["main_tool_calls"] += 1
-    _increment_codex_dict(bucket, "tool_name_counts", name)
+    _increment_label_dict(bucket, "tool_name_counts", name)
 
     if name.startswith("mcp__"):
         parts = name.split("__")
         server = parts[1] if len(parts) >= 3 else ""
         if server:
-            _increment_codex_dict(bucket, "mcp_server_counts", server)
+            _increment_label_dict(bucket, "mcp_server_counts", server)
 
     if name == "spawn_agent":
         days_with_orchestration.add(d)
@@ -2636,7 +2636,7 @@ def _apply_codex_tool_effects(
 
         agent_type = _codex_arg(payload, "agent_type")
         if isinstance(agent_type, str) and agent_type:
-            _increment_codex_dict(bucket, "agent_type_counts", agent_type)
+            _increment_label_dict(bucket, "agent_type_counts", agent_type)
 
     elif name == "wait_agent":
         targets = _codex_arg(payload, "targets")
@@ -2745,7 +2745,13 @@ def _normalize_codex_label(value) -> str:
     return label[:CODEX_MAX_LABEL_LENGTH]
 
 
-def _increment_codex_dict(bucket: dict, field: str, raw_label, amount: int = 1) -> None:
+def _increment_label_dict(bucket: dict, field: str, raw_label, amount: int = 1) -> None:
+    """Add `amount` to `bucket[field][<normalized label>]`.
+
+    Source-agnostic despite having started life on the Codex path: the Claude
+    Code scan calls it for `effort_usage`, and nothing here depends on which
+    source produced the label.
+    """
     label = _normalize_codex_label(raw_label)
     if not label:
         return
