@@ -1840,6 +1840,15 @@ def process_session(
                             # instead of reading 0 for every Claude Code user.
                             # Gated on the same success evidence as authorship —
                             # a missing or errored tool_result fails closed.
+                            # Counted on subagent transcripts too, by the same
+                            # rule as `reasoning_blocks` below and for the
+                            # opposite reason from `effort_usage`: this is work
+                            # produced, not a setting the user chose, and a
+                            # delegated write mutates the tree exactly as a
+                            # direct one does. It also keeps the field
+                            # comparable to Codex, where `file_changes` counts
+                            # every successful mutation in the session and no
+                            # main/subagent split exists to mirror.
                             if succeeded:
                                 bucket["file_changes"] += 1
 

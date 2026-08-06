@@ -3441,6 +3441,30 @@ class ClaudeCodeMetricParityTests(unittest.TestCase):
 
         self.assertEqual(r["file_changes"], 1)
 
+    def test_file_changes_counts_subagent_writes(self):
+        # A delegated write mutates the tree exactly as a direct one does, so
+        # it counts — the same rule as reasoning_blocks, and deliberately the
+        # opposite of effort_usage, which is a user-chosen setting.
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("delegate it"),
+                make_tool_call_with_id("Write", {"file_path": "/repo/a.py"}, "t1"),
+                make_tool_result("t1"),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "sessA" / "subagents" / "agent-001.jsonl",
+            [
+                make_tool_call_with_id("Edit", {"file_path": "/repo/b.py"}, "t2"),
+                make_tool_result("t2"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["file_changes"], 2)
+
     def test_reasoning_blocks_counts_thinking_blocks_including_subagents(self):
         write_jsonl(
             self.projects / "proj1" / "sessA.jsonl",
