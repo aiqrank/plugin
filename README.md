@@ -34,6 +34,15 @@ The plugin scans and scores activity from all of these tools in a single run:
 - Cursor (local SQLite store at `~/Library/Application Support/Cursor/...`)
 - OpenCode (local SQLite store at `~/.local/share/opencode/opencode.db`)
 - Pi (local JSONL sessions under `~/.pi/agent/sessions` or Pi's configured session root)
+- Hermes (local session database at `~/.hermes/state.db`)
+- OpenClaw (per-agent local SQLite stores under `~/.openclaw/agents`)
+- NanoClaw (current v2 stores in detected checkouts, or paths from
+  `AIQRANK_NANOCLAW_ROOTS`)
+
+For Hermes, OpenClaw, and NanoClaw, interactive conversations count as
+sessions, cron/heartbeat/system work counts as scheduled activity, and spawned
+children count as orchestration. Automated work therefore cannot inflate the
+ordinary session count.
 
 Each tool gets its own per-tool leaderboard chip and profile tab. The All-tools
 aggregate combines the seven cross-tool dimensions into a single headline score.

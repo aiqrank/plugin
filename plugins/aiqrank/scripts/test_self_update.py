@@ -282,37 +282,38 @@ class MainTest(unittest.TestCase):
             plugin_root_path.parent.mkdir(parents=True, exist_ok=True)
             compat_root = base / ".codex" / "plugins" / "cache" / "aiqrank"
 
-            with mock.patch.object(self_update, "PLUGIN_VERSION", "0.3.22"):
-                with mock.patch.object(self_update, "STALE_VERSION_PATH", marker):
-                    with mock.patch.object(
-                        self_update, "CODEX_MANAGED_ROOT", managed
-                    ):
-                        with mock.patch.object(self_update, "CODEX_CACHE", cache):
-                            with mock.patch.object(
-                                self_update, "PLUGIN_ROOT_PATH", plugin_root_path
-                            ):
-                                with mock.patch.dict(
-                                    "os.environ",
-                                    {
-                                        "CLAUDE_PLUGIN_ROOT": str(compat_root),
-                                        "CODEX_PLUGIN_ROOT": "",
-                                    },
-                                    clear=True,
-                                ):
-                                    with mock.patch.object(
-                                        self_update, "update"
-                                    ) as update:
-                                        with mock.patch("builtins.print") as printed:
-                                            self.assertEqual(self_update.main(), 0)
-                                        update.assert_not_called()
-                                        self.assertFalse(marker.exists())
-                                        self.assertEqual(
-                                            plugin_root_path.read_text(),
-                                            str(cache / "0.3.21") + "\n",
-                                        )
-                                        printed.assert_called_once_with(
-                                            f"PLUGIN_ROOT={cache / '0.3.21'}"
-                                        )
+            with (
+                mock.patch.object(self_update, "PLUGIN_VERSION", "0.3.22"),
+                mock.patch.object(
+                    self_update, "_read_stale_version", return_value="0.3.20"
+                ),
+                mock.patch.object(self_update, "STALE_VERSION_PATH", marker),
+                mock.patch.object(self_update, "CODEX_MANAGED_ROOT", managed),
+                mock.patch.object(self_update, "CODEX_CACHE", cache),
+                mock.patch.object(
+                    self_update, "PLUGIN_ROOT_PATH", plugin_root_path
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {
+                        "CLAUDE_PLUGIN_ROOT": str(compat_root),
+                        "CODEX_PLUGIN_ROOT": "",
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(self_update, "update") as update,
+                mock.patch("builtins.print") as printed,
+            ):
+                self.assertEqual(self_update.main(), 0)
+                update.assert_not_called()
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    plugin_root_path.read_text(),
+                    str(cache / "0.3.21") + "\n",
+                )
+                printed.assert_called_once_with(
+                    f"PLUGIN_ROOT={cache / '0.3.21'}"
+                )
 
     def test_successful_update_clears_the_stale_signal(self):
         with mock.patch.object(self_update, "pending_version", return_value="0.3.16"):

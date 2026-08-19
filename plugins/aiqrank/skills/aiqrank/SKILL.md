@@ -1,12 +1,12 @@
 ---
 name: aiqrank
-description: Compute and share your AI proficiency rank from supported local coding-agent history, including Pi when present.
+description: Compute and share your AI proficiency rank from supported local coding-agent and agent-runtime history.
 allowed-tools: [Bash]
 ---
 
 # AIQ Rank
 
-AIQ Rank takes privacy seriously. Supported coding-agent sessions, including Pi when present, are scanned locally — only aggregate metrics (session counts, token totals, and tool names used) are sent to aiqrank as part of your profile. Conversation text never leaves your device.
+AIQ Rank takes privacy seriously. Supported coding-agent sessions, including Pi, Hermes, OpenClaw, and NanoClaw when present, are scanned locally — only aggregate metrics (session counts, token totals, and tool names used) are sent to aiqrank as part of your profile. Conversation text never leaves your device.
 
 Run step 0 first. It applies any pending update and records the resolved plugin root at `~/.config/aiqrank/plugin_root`, which the later steps read — so the run uses the freshly updated scripts. If step 0 prints an update line, show that one line to the user.
 

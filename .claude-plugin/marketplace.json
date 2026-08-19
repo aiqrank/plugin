@@ -9,7 +9,7 @@
       "name": "aiqrank",
       "source": "./plugins/aiqrank",
       "description": "Compute and share your AI proficiency score from supported local coding-agent history.",
-      "version": "0.3.22",
+      "version": "0.3.23",
       "category": "productivity",
       "tags": ["ai-proficiency", "metrics", "social"]
     }

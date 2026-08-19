@@ -11,6 +11,9 @@ the last 30 days, including:
        (Local Agent Mode) autonomous sessions
   3. ~/.codex/sessions/**/rollout-*.jsonl — Codex CLI rollouts (optional)
   4. ~/.pi/agent/sessions/**/*.jsonl      — Pi sessions (optional)
+  5. ~/.hermes/state.db                    — Hermes sessions (optional)
+  6. ~/.openclaw/agents/*/agent/*.sqlite   — OpenClaw sessions (optional)
+  7. NanoClaw data/v2.db stores            — NanoClaw sessions (optional)
 
 Events are bucketed into per-source dicts:
 
@@ -288,6 +291,9 @@ SOURCE_CODEX = "codex"
 SOURCE_OPENCODE = "opencode"
 SOURCE_CURSOR = "cursor"
 SOURCE_PI = "pi"
+SOURCE_HERMES = "hermes"
+SOURCE_OPENCLAW = "openclaw"
+SOURCE_NANOCLAW = "nanoclaw"
 ALL_SOURCES = (
     SOURCE_CLAUDE_CODE,
     SOURCE_COWORK,
@@ -295,6 +301,9 @@ ALL_SOURCES = (
     SOURCE_OPENCODE,
     SOURCE_CURSOR,
     SOURCE_PI,
+    SOURCE_HERMES,
+    SOURCE_OPENCLAW,
+    SOURCE_NANOCLAW,
 )
 
 
@@ -405,6 +414,9 @@ def scan(
     scheduled_root: Path | None = None,
     codex_dir: Path | None = None,
     pi_dir: Path | None = None,
+    hermes_db: Path | None = None,
+    openclaw_dir: Path | None = None,
+    nanoclaw_roots: list[Path] | None = None,
     authored_registry_path: Path | None = None,
 ) -> dict:
     """Scan supported coding-agent transcripts within the last `window_days`.
@@ -484,6 +496,24 @@ def scan(
                 sys.stderr.write(f"scan_pi resolver failed: {type(e).__name__}: {e}\n")
         else:
             pi_dir = homes[0] / "__pi_disabled__"
+
+    # Runtime stores follow the same test-isolation rule as every optional
+    # source: overriding Claude's root must never read the developer's real
+    # home unless the test opts in with an explicit path.
+    if hermes_db is None:
+        hermes_db = (
+            Path(os.environ.get("HERMES_HOME", host_home / ".hermes")) / "state.db"
+            if claude_dir is None
+            else homes[0] / "__hermes_disabled__" / "state.db"
+        )
+    if openclaw_dir is None:
+        openclaw_dir = (
+            Path(os.environ.get("OPENCLAW_STATE_DIR", host_home / ".openclaw"))
+            if claude_dir is None
+            else homes[0] / "__openclaw_disabled__"
+        )
+    if nanoclaw_roots is None and claude_dir is not None:
+        nanoclaw_roots = [homes[0] / "__nanoclaw_disabled__"]
 
     # Per-source per-day metric buckets and main-session intervals.
     daily_by_source: dict[str, dict[date, dict]] = {s: {} for s in ALL_SOURCES}
@@ -800,6 +830,88 @@ def scan(
             pi_emit = False
             sys.stderr.write(f"scan_pi failed: {type(e).__name__}: {e}\n")
 
+    # Agent runtimes: preserve human, scheduled, and child-agent semantics
+    # inside each scanner. A detected-but-incomplete store is omitted so a
+    # replacement upload cannot erase the last complete snapshot.
+    runtime_emit: dict[str, bool] = {}
+    try:
+        # A broken scan_agent_runtimes module (bad install, syntax error)
+        # must NOT abort the orchestrator's primary Claude scan (plan §452).
+        # On failure all three runtime sources are explicitly marked
+        # not-emitting so the by_source gate omits them, identical to
+        # "runtime sources not detected".
+        from scan_agent_runtimes import (  # noqa: E402
+            resolve_nanoclaw_roots,
+            scan_hermes,
+            scan_nanoclaw,
+            scan_openclaw,
+        )
+
+        resolved_nanoclaw_roots = (
+            nanoclaw_roots if nanoclaw_roots is not None else resolve_nanoclaw_roots()
+        )
+        runtime_specs = (
+            (
+                SOURCE_HERMES,
+                lambda: scan_hermes(
+                    hermes_db,
+                    window_days=window_days,
+                    now_ts=now_ts,
+                    mtime_after_ts=mtime_after_ts,
+                ),
+            ),
+            (
+                SOURCE_OPENCLAW,
+                lambda: scan_openclaw(
+                    openclaw_dir,
+                    window_days=window_days,
+                    now_ts=now_ts,
+                    mtime_after_ts=mtime_after_ts,
+                ),
+            ),
+            (
+                SOURCE_NANOCLAW,
+                lambda: scan_nanoclaw(
+                    resolved_nanoclaw_roots,
+                    window_days=window_days,
+                    now_ts=now_ts,
+                    mtime_after_ts=mtime_after_ts,
+                ),
+            ),
+        )
+    except Exception as e:
+        runtime_specs = ()
+        runtime_emit = {
+            SOURCE_HERMES: False,
+            SOURCE_OPENCLAW: False,
+            SOURCE_NANOCLAW: False,
+        }
+        sys.stderr.write(
+            f"scan_agent_runtimes failed: {type(e).__name__}: {e}\n"
+        )
+    for source, scanner in runtime_specs:
+        try:
+            result = scanner()
+            runtime_emit[source] = bool(result.get("detected"))
+            if not runtime_emit[source]:
+                continue
+            daily_by_source[source] = _daily_by_date_with_rollup_only(result, now_ts)
+            parsed_intervals: dict[date, list[tuple[float, float]]] = {}
+            for date_str, values in (result.get("intervals_by_day") or {}).items():
+                try:
+                    day = date.fromisoformat(date_str)
+                except (TypeError, ValueError):
+                    continue
+                parsed_intervals[day] = [
+                    (float(value[0]), float(value[1]))
+                    for value in (values or [])
+                    if isinstance(value, (list, tuple)) and len(value) >= 2
+                ]
+            intervals_by_source[source] = parsed_intervals
+        except Exception as e:
+            runtime_emit[source] = False
+            sys.stderr.write(f"scan_{source} failed: {type(e).__name__}: {e}\n")
+
     # Per-day concurrency from sweep-line over each day's clipped intervals,
     # computed per source. Only counts a level that held for
     # >= min_sustained_secs within the day — see DEFAULT_MIN_SUSTAINED_SECS.
@@ -824,6 +936,8 @@ def scan(
         if source == SOURCE_CURSOR and not cursor_emit:
             continue
         if source == SOURCE_PI and not pi_emit:
+            continue
+        if source in runtime_emit and not runtime_emit[source]:
             continue
         if source == SOURCE_CODEX and codex_result is not None:
             by_source[source] = codex_result

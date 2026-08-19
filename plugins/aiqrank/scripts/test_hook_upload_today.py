@@ -805,6 +805,9 @@ class HookUploadTests(unittest.TestCase):
             self._invoke_silent()
 
         self.assertIn("pi", self.mod.INLINE_SCAN_SOURCES)
+        self.assertIn("hermes", self.mod.INLINE_SCAN_SOURCES)
+        self.assertIn("openclaw", self.mod.INLINE_SCAN_SOURCES)
+        self.assertIn("nanoclaw", self.mod.INLINE_SCAN_SOURCES)
         self.assertFalse(self.mod.LAST_UPLOAD_PATH.exists())
 
     def test_legacy_server_pi_retry_preserves_combined(self):
@@ -846,6 +849,76 @@ class HookUploadTests(unittest.TestCase):
         self.assertIn("pi", posted_bodies[0]["by_source"])
         self.assertNotIn("pi", posted_bodies[1]["by_source"])
         self.assertIn("combined", posted_bodies[1]["by_source"])
+
+    def test_legacy_server_too_many_sources_retry_drops_extras(self):
+        """An older server caps the request at 7 sources and rejects the whole
+        payload before per-source validation. The retry must progressively
+        drop extra sources (newest first) so legacy data still uploads.
+        """
+        self._setup_device()
+        base = 1745056800.0
+        fake_scan = _claude_envelope(
+            daily=[{"date": "2026-04-19", "metrics": {"sessions": 1}}],
+            intervals_by_day={"2026-04-19": [[base, base + 1200]]},
+        )
+        for source in ("opencode", "cursor", "pi", "hermes", "openclaw", "nanoclaw"):
+            fake_scan["by_source"][source] = {
+                "daily": [{"date": "2026-04-19", "metrics": {"sessions": 1}}],
+                "rollup": {},
+                "intervals_by_day": {},
+            }
+        posted_bodies = []
+        legacy_allowlist = {
+            "claude_code", "codex", "combined", "cowork", "opencode", "cursor", "pi",
+        }
+
+        class FakeResp:
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data)
+            posted_bodies.append(body)
+            sources = body["by_source"]
+            if len(sources) > 7:
+                raise self.mod.urllib.error.HTTPError(
+                    url=None,
+                    code=422,
+                    msg="too many sources",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        json.dumps({"error": "too many sources (max 7)"}).encode()
+                    ),
+                )
+            unknown = next((s for s in sources if s not in legacy_allowlist), None)
+            if unknown is not None:
+                raise self.mod.urllib.error.HTTPError(
+                    url=None,
+                    code=422,
+                    msg="unknown source",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        json.dumps({"error": "unknown source", "source": unknown}).encode()
+                    ),
+                )
+            return FakeResp()
+
+        with mock.patch.object(self.mod, "_run_scan", return_value=fake_scan), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self._invoke_silent()
+
+        # 8 sources -> too many (drop nanoclaw) -> 7 -> unknown hermes ->
+        # 6 -> unknown openclaw -> 5 -> accepted.
+        self.assertEqual(len(posted_bodies), 4)
+        self.assertIn("nanoclaw", posted_bodies[0]["by_source"])
+        final = posted_bodies[-1]["by_source"]
+        for source in ("hermes", "openclaw", "nanoclaw"):
+            self.assertNotIn(source, final)
+        for source in ("claude_code", "opencode", "cursor", "pi", "combined"):
+            self.assertIn(source, final)
+        self.assertIn("server rejected nanoclaw source", self._log_contents())
+        self.assertTrue(self.mod.LAST_UPLOAD_PATH.exists())
 
     def test_combined_source_unions_cowork_intervals(self):
         """The combined-intervals sweep includes the Cowork source — not just

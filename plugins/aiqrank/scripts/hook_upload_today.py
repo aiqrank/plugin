@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _version import PLUGIN_VERSION, USER_AGENT  # noqa: E402
 from infer_role import classify_role  # noqa: E402
 from install_codex import install_bundled  # noqa: E402
-from scan_transcripts import max_concurrent_sustained, min_sustained_secs  # noqa: E402
+from scan_transcripts import ALL_SOURCES, max_concurrent_sustained, min_sustained_secs  # noqa: E402
 
 # Server-supplied version strings written to disk and printed by the nudge
 # hook are validated against this shape to block ANSI escapes, control
@@ -57,7 +57,9 @@ CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
 # Payload size guard: every serialized request must stay below this threshold.
 PAYLOAD_SIZE_LIMIT_BYTES = 400 * 1024
-INLINE_SCAN_SOURCES = ("opencode", "cursor", "pi")
+INLINE_SCAN_SOURCES = tuple(
+    source for source in ALL_SOURCES if source not in {"claude_code", "codex", "cowork"}
+)
 
 
 def _setup_logger() -> logging.Logger:
@@ -350,6 +352,9 @@ def _run(logger: logging.Logger) -> None:
             f"opencode_days={len(inline_source_daily.get('opencode') or [])} "
             f"cursor_days={len(inline_source_daily.get('cursor') or [])} "
             f"pi_days={len(inline_source_daily.get('pi') or [])} "
+            f"hermes_days={len(inline_source_daily.get('hermes') or [])} "
+            f"openclaw_days={len(inline_source_daily.get('openclaw') or [])} "
+            f"nanoclaw_days={len(inline_source_daily.get('nanoclaw') or [])} "
             f"devices={device_id[:8]}"
         )
 
@@ -455,7 +460,34 @@ def _post_by_source(
             )
             index += 1
         except urllib.error.HTTPError as e:
-            unknown_source = _unknown_source_from_error(e)
+            body = _http_422_body(e)
+            unknown_source = _unknown_source_from_body(body)
+            if unknown_source is None and _is_too_many_sources_body(body):
+                # An older server caps the per-request source count and
+                # rejects the whole payload before per-source validation.
+                # Drop one droppable extra source (newest first, never one
+                # already accepted) and retry so legacy sources still upload.
+                dropped = next(
+                    (
+                        source
+                        for source in reversed(list(chunk["sources"]))
+                        if source in extra_sources_daily
+                        and source not in accepted_sources
+                        and chunk["sources"].get(source)
+                    ),
+                    None,
+                )
+                if dropped is None:
+                    logger.info(f"error chunk={index} http={e.code}")
+                    return False
+                logger.info(
+                    f"server rejected {dropped} source, retrying without it"
+                )
+                rejected_sources.add(dropped)
+                for remaining in chunks[index:]:
+                    remaining["sources"].pop(dropped, None)
+                # Retry this chunk if supported data or metadata remains.
+                continue
             if (
                 unknown_source not in retryable_sources
                 or unknown_source not in chunk["sources"]
@@ -497,6 +529,12 @@ def _is_unknown_source_error(err: urllib.error.HTTPError, source: str) -> bool:
 
 
 def _unknown_source_from_error(err: urllib.error.HTTPError) -> str | None:
+    return _unknown_source_from_body(_http_422_body(err))
+
+
+def _http_422_body(err: urllib.error.HTTPError) -> dict | None:
+    """Parse a 422 response body once — the error stream is single-read, so
+    every 422 shape check must go through the dict this returns."""
     if err.code != 422:
         return None
     try:
@@ -505,10 +543,27 @@ def _unknown_source_from_error(err: urllib.error.HTTPError) -> str | None:
         return None
     finally:
         err.close()
+    return body if isinstance(body, dict) else None
+
+
+def _unknown_source_from_body(body: dict | None) -> str | None:
     if not isinstance(body, dict) or body.get("error") != "unknown source":
         return None
     source = body.get("source")
     return source if isinstance(source, str) and source else None
+
+
+def _is_too_many_sources_body(body: dict | None) -> bool:
+    """True iff the server returned the legacy source-count cap error —
+    `{"error": "too many sources (max N)"}`. Older servers reject the whole
+    request with this before per-source validation, so we drop extra sources
+    and retry rather than lose the legacy Claude/Codex snapshot. The prefix
+    match deliberately excludes "too many daily entries for source ...",
+    which is a data problem, not a compatibility one."""
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return isinstance(error, str) and error.startswith("too many sources")
 
 
 def _is_unknown_combined_source_error(err: urllib.error.HTTPError) -> bool:
