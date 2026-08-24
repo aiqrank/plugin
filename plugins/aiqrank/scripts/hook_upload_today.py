@@ -53,7 +53,16 @@ LOG_PATH = CONFIG_DIR / "hook.log"
 STALE_VERSION_PATH = CONFIG_DIR / "stale_version"
 
 MAX_WINDOW_DAYS = 30
+BACKGROUND_WINDOW_DAYS = 7
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+
+# Local SessionStart/SessionEnd runs detach before scanning, so their useful
+# budget is not the hook command's short foreground timeout. The background
+# hook deliberately sends a short rolling window; older rows remain intact on
+# the server because ingestion upserts only the dates included in the payload.
+# A full 30-day replacement snapshot remains the explicit manual backfill path.
+LOCAL_SCAN_TIMEOUT_SEC = 240
+CLOUD_SCAN_TIMEOUT_SEC = 20
 
 # Payload size guard: every serialized request must stay below this threshold.
 PAYLOAD_SIZE_LIMIT_BYTES = 400 * 1024
@@ -235,6 +244,11 @@ def main() -> int:
 
     try:
         _run(logger)
+    except subprocess.TimeoutExpired as e:
+        try:
+            logger.info(f"error TimeoutExpired timeout_sec={e.timeout}")
+        except Exception:
+            pass
     except Exception as e:
         try:
             logger.info(f"error {type(e).__name__}")
@@ -282,6 +296,13 @@ def _run(logger: logging.Logger) -> None:
 
         try:
             claude_metrics = _run_scan()
+        except subprocess.TimeoutExpired:
+            # Propagate to main()'s handler so the timeout budget
+            # (timeout_sec) is logged. _run's generic SubprocessError catch
+            # below would otherwise swallow TimeoutExpired (a SubprocessError
+            # subclass) and log only the type name, losing the budget the
+            # main handler was added to surface.
+            raise
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as e:
             logger.info(f"error {type(e).__name__}")
             return
@@ -461,6 +482,7 @@ def _post_by_source(
             index += 1
         except urllib.error.HTTPError as e:
             body = _http_422_body(e)
+            reason = _http_error_reason(body)
             unknown_source = _unknown_source_from_body(body)
             if unknown_source is None and _is_too_many_sources_body(body):
                 # An older server caps the per-request source count and
@@ -478,7 +500,9 @@ def _post_by_source(
                     None,
                 )
                 if dropped is None:
-                    logger.info(f"error chunk={index} http={e.code}")
+                    logger.info(
+                        f"error chunk={index} http={e.code} reason={reason}"
+                    )
                     return False
                 logger.info(
                     f"server rejected {dropped} source, retrying without it"
@@ -493,7 +517,9 @@ def _post_by_source(
                 or unknown_source not in chunk["sources"]
                 or not chunk["sources"].get(unknown_source)
             ):
-                logger.info(f"error chunk={index} http={e.code}")
+                logger.info(
+                    f"error chunk={index} http={e.code} reason={reason}"
+                )
                 return False
             if unknown_source in accepted_sources:
                 logger.info(
@@ -536,6 +562,7 @@ def _http_422_body(err: urllib.error.HTTPError) -> dict | None:
     """Parse a 422 response body once — the error stream is single-read, so
     every 422 shape check must go through the dict this returns."""
     if err.code != 422:
+        err.close()
         return None
     try:
         body = json.loads(err.read())
@@ -544,6 +571,21 @@ def _http_422_body(err: urllib.error.HTTPError) -> dict | None:
     finally:
         err.close()
     return body if isinstance(body, dict) else None
+
+
+def _http_error_reason(body: dict | None) -> str:
+    """Return a short, log-safe explanation from a server rejection."""
+    if not isinstance(body, dict):
+        return "unknown"
+    error = body.get("error")
+    if not isinstance(error, str) or not error:
+        return "unparseable"
+    reason = re.sub(r"[\x00-\x1f\x7f]", "", error)[:160]
+    source = body.get("source")
+    if isinstance(source, str) and source:
+        source = re.sub(r"[\x00-\x1f\x7f]", "", source)[:80]
+        reason = f"{reason} source={source}"
+    return reason or "unparseable"
 
 
 def _unknown_source_from_body(body: dict | None) -> str | None:
@@ -832,9 +874,9 @@ def _scan_timeout_sec() -> int:
     # Cloud SessionEnd is bounded at 60s wall clock by Claude Code (see
     # hooks.json), and the synchronous pipeline stacks _run_scan +
     # _maybe_scan_codex + N × _post_upload — so each leg must fit
-    # comfortably inside that ceiling. Local (detached) runs keep the
-    # original generous budget.
-    return 20 if _is_cloud_remote() else 60
+    # comfortably inside that ceiling. Local (detached) runs use the longer
+    # budget because their host hook is no longer waiting on the child.
+    return CLOUD_SCAN_TIMEOUT_SEC if _is_cloud_remote() else LOCAL_SCAN_TIMEOUT_SEC
 
 
 def _upload_timeout_sec() -> int:
@@ -871,7 +913,7 @@ def _write_last_upload_at(ts: str) -> None:
 def _run_scan() -> dict:
     script = Path(__file__).resolve().parent / "scan_transcripts.py"
     result = subprocess.run(
-        [sys.executable, str(script), "--days", str(MAX_WINDOW_DAYS)],
+        [sys.executable, str(script), "--days", str(BACKGROUND_WINDOW_DAYS)],
         capture_output=True,
         text=True,
         check=True,

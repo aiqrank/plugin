@@ -1386,6 +1386,41 @@ class HookUploadTests(unittest.TestCase):
         self.assertEqual(successful_bodies, [posted_bodies[0]])
         self.assertIn("pi", posted_bodies[0]["by_source"])
 
+    def test_unrecognized_422_logs_server_reason(self):
+        logger = mock.MagicMock()
+
+        def reject(payload):
+            raise self.mod.urllib.error.HTTPError(
+                url=None,
+                code=422,
+                msg="unprocessable entity",
+                hdrs=None,
+                fp=io.BytesIO(
+                    json.dumps(
+                        {
+                            "error": "invalid inferred role",
+                            "source": "claude_code",
+                        }
+                    ).encode()
+                ),
+            )
+
+        with mock.patch.object(self.mod, "_post_upload", side_effect=reject):
+            success = self.mod._post_by_source(
+                "device-422-reason",
+                [{"date": "2026-07-15", "metrics": {"sessions": 1}}],
+                [],
+                [],
+                {},
+                "engineer",
+                logger,
+            )
+
+        self.assertFalse(success)
+        logger.info.assert_any_call(
+            "error chunk=0 http=422 reason=invalid inferred role source=claude_code"
+        )
+
     def test_large_claude_daily_alone_is_chunked(self):
         """A heavy Claude (cowork) backfill that exceeds 400 KB is split, even
         when Codex is small or absent. Pre-cowork the claude side never grew
@@ -1450,11 +1485,13 @@ class HookUploadTests(unittest.TestCase):
 
     # --- timeout tests ---
 
-    def test_run_scan_passes_timeout_60(self):
-        """_run_scan passes timeout=60 to subprocess.run."""
+    def test_run_scan_passes_long_local_timeout(self):
+        """_run_scan uses a bounded rolling window and local timeout."""
         captured_kwargs = {}
+        captured_args = []
 
         def capture_kwargs(*args, **kwargs):
+            captured_args.extend(args[0])
             captured_kwargs.update(kwargs)
             # Return a valid result to avoid JSON parse errors
             import json as _json
@@ -1468,7 +1505,8 @@ class HookUploadTests(unittest.TestCase):
             except Exception:
                 pass
 
-        self.assertEqual(captured_kwargs.get("timeout"), 60)
+        self.assertEqual(captured_kwargs.get("timeout"), 240)
+        self.assertEqual(captured_args[-2:], ["--days", "7"])
 
     def test_scan_transcript_timeout_stops_upload(self):
         """TimeoutExpired from _run_scan is caught as SubprocessError: upload does not happen."""
@@ -1476,7 +1514,7 @@ class HookUploadTests(unittest.TestCase):
         self.mod.DEVICE_PATH.write_text(json.dumps({"device_id": "device-timeout02"}))
 
         def timeout_run_scan():
-            raise subprocess.TimeoutExpired(cmd="scan_transcripts.py", timeout=60)
+            raise subprocess.TimeoutExpired(cmd="scan_transcripts.py", timeout=240)
 
         posted = []
 
@@ -1488,6 +1526,27 @@ class HookUploadTests(unittest.TestCase):
         self.assertEqual(posted, [], "urlopen must not be called when scan times out")
         log = self._log_contents()
         self.assertIn("error", log)
+
+    def test_scan_timeout_logs_timeout_budget(self):
+        """A real _run_scan timeout surfaces the budget via main()'s handler.
+
+        Patches _run_scan (not _run) so the exception flows through _run's
+        re-raise to main()'s `except subprocess.TimeoutExpired` handler —
+        the production path. Patching _run would bypass _run's catch and
+        mask the dead-handler regression.
+        """
+        self._setup_device()
+
+        with mock.patch.object(
+            self.mod,
+            "_run_scan",
+            side_effect=subprocess.TimeoutExpired(
+                cmd="scan_transcripts.py", timeout=240
+            ),
+        ):
+            self._invoke_silent()
+
+        self.assertIn("error TimeoutExpired timeout_sec=240", self._log_contents())
 
     def test_empty_sample_defaults_to_engineer(self):
         self.mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)

@@ -69,8 +69,9 @@ class UploadMetricsTests(unittest.TestCase):
             argv += extra_args
 
         with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
-             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch.object(self.mod, "open_in_browser") as open_in_browser, \
              mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            self.open_in_browser_mock = open_in_browser
             rc = self.mod.main(argv)
         return rc, captured, stdout.getvalue()
 
@@ -80,7 +81,8 @@ class UploadMetricsTests(unittest.TestCase):
             "device_id": "dev-new-123",
         })
         self.assertEqual(rc, 0)
-        self.assertIn("Opening your rank at https://aiqrank.com/teaser?s=abc", stdout)
+        self.assertIn("Rank updated at https://aiqrank.com/teaser?s=abc", stdout)
+        self.open_in_browser_mock.assert_not_called()
         # Payload shape
         self.assertIn("daily", captured["body"])
         self.assertEqual(captured["body"]["inferred_role"], "engineer")
@@ -139,6 +141,30 @@ class UploadMetricsTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Rank updated at https://aiqrank.com/teaser?s=noopen", stdout.getvalue())
         open_in_browser.assert_not_called()
+
+    def test_open_opt_in_launches_browser(self):
+        response_body = {
+            "teaser_url": "https://aiqrank.com/teaser?s=open",
+            "device_id": "dev-new-open",
+        }
+
+        def fake_urlopen(req, timeout=30):
+            return FakeResponse(response_body)
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser") as open_in_browser, \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            rc = self.mod.main([
+                "--metrics",
+                str(self.metrics_path),
+                "--role",
+                "engineer",
+                "--open",
+            ])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("Opening your rank at https://aiqrank.com/teaser?s=open", stdout.getvalue())
+        open_in_browser.assert_called_once_with(response_body["teaser_url"])
 
     def test_by_source_metrics_payload_is_preserved(self):
         metrics = {
@@ -312,6 +338,271 @@ class UploadMetricsTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("AIQ Rank upload failed", stderr.getvalue())
+
+    def test_legacy_unknown_source_retry_preserves_core_sources(self):
+        import urllib.error
+
+        metrics = {
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}]
+                },
+                "codex": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 2}}]
+                },
+                "hermes": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}]
+                },
+            }
+        }
+        self.metrics_path.write_text(json.dumps(metrics))
+        posted = []
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data.decode("utf-8"))
+            posted.append(body)
+            if len(posted) == 1:
+                raise urllib.error.HTTPError(
+                    url=req.full_url,
+                    code=422,
+                    msg="unknown source",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        json.dumps(
+                            {"error": "unknown source", "source": "hermes"}
+                        ).encode()
+                    ),
+                )
+            return FakeResponse({
+                "teaser_url": "https://aiqrank.com/teaser?s=retry",
+                "device_id": "dev-retry",
+            })
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            rc = self.mod.main([
+                "--metrics", str(self.metrics_path), "--role", "engineer", "--no-open"
+            ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(posted), 2)
+        self.assertIn("hermes", posted[0]["by_source"])
+        self.assertNotIn("hermes", posted[1]["by_source"])
+        self.assertIn("claude_code", posted[1]["by_source"])
+        self.assertIn("codex", posted[1]["by_source"])
+        self.assertIn("Rank updated at", stdout.getvalue())
+
+    def test_legacy_source_cap_retry_drops_optional_source(self):
+        import urllib.error
+
+        sources = {
+            source: {
+                "daily": [{"date": "2026-04-20", "metrics": {"sessions": 1}}]
+            }
+            for source in (
+                "claude_code",
+                "codex",
+                "cowork",
+                "combined",
+                "opencode",
+                "cursor",
+                "pi",
+                "hermes",
+            )
+        }
+        self.metrics_path.write_text(json.dumps({"by_source": sources}))
+        posted = []
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data.decode("utf-8"))
+            posted.append(body)
+            if len(posted) == 1:
+                raise urllib.error.HTTPError(
+                    url=req.full_url,
+                    code=422,
+                    msg="too many sources",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        json.dumps({"error": "too many sources (max 7)"}).encode()
+                    ),
+                )
+            return FakeResponse({
+                "teaser_url": "https://aiqrank.com/teaser?s=cap-retry",
+                "device_id": "dev-cap-retry",
+            })
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout:
+            rc = self.mod.main([
+                "--metrics", str(self.metrics_path), "--role", "engineer", "--no-open"
+            ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(posted), 2)
+        self.assertNotIn("hermes", posted[1]["by_source"])
+        self.assertIn("claude_code", posted[1]["by_source"])
+        self.assertIn("codex", posted[1]["by_source"])
+        self.assertIn("Rank updated at", stdout.getvalue())
+
+    def test_give_up_unknown_source_not_retryable_prints_reason(self):
+        """A core source rejected as 'unknown source' is not droppable: exit 1
+        with the parsed reason. Exercises the give-up branch where the rejected
+        source is not in RETRYABLE_SOURCES (lines ~213-215) and the
+        _remember_http_error_body/_http_error_reason memoization round-trip.
+        """
+        import urllib.error
+
+        metrics = {
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}]
+                },
+            }
+        }
+        self.metrics_path.write_text(json.dumps(metrics))
+
+        def fake_urlopen(req, timeout=30):
+            raise urllib.error.HTTPError(
+                url=req.full_url,
+                code=422,
+                msg="unknown source",
+                hdrs=None,
+                fp=io.BytesIO(
+                    json.dumps(
+                        {"error": "unknown source", "source": "claude_code"}
+                    ).encode()
+                ),
+            )
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            rc = self.mod.main([
+                "--metrics", str(self.metrics_path), "--role", "engineer", "--no-open"
+            ])
+
+        self.assertEqual(rc, 1)
+        self.assertIn(
+            "AIQ Rank upload failed: http 422: unknown source source=claude_code",
+            stderr.getvalue(),
+        )
+
+    def test_give_up_too_many_sources_no_retryable_to_drop_exits_1(self):
+        """'too many sources' with only core sources (none retryable) has
+        nothing to drop: exit 1. Exercises the give-up branch where
+        `dropped is None` falls through to the final raise (lines ~228/232-233).
+        """
+        import urllib.error
+
+        metrics = {
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}]
+                },
+                "codex": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 2}}]
+                },
+            }
+        }
+        self.metrics_path.write_text(json.dumps(metrics))
+
+        def fake_urlopen(req, timeout=30):
+            raise urllib.error.HTTPError(
+                url=req.full_url,
+                code=422,
+                msg="too many sources",
+                hdrs=None,
+                fp=io.BytesIO(
+                    json.dumps({"error": "too many sources (max 7)"}).encode()
+                ),
+            )
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            rc = self.mod.main([
+                "--metrics", str(self.metrics_path), "--role", "engineer", "--no-open"
+            ])
+
+        self.assertEqual(rc, 1)
+        self.assertIn(
+            "AIQ Rank upload failed: http 422: too many sources (max 7)",
+            stderr.getvalue(),
+        )
+
+    def test_give_up_unrecognized_422_with_by_source_prints_reason(self):
+        """A 422 that is neither 'unknown source' nor 'too many sources'
+        (e.g. 'invalid inferred role') with by_source surfaces the parsed
+        reason. Exercises the final fall-through give-up (lines ~232-233) and
+        the memoization round-trip for a reason carrying a source field.
+        """
+        import urllib.error
+
+        metrics = {
+            "by_source": {
+                "claude_code": {
+                    "daily": [{"date": "2026-04-20", "metrics": {"sessions": 3}}]
+                },
+            }
+        }
+        self.metrics_path.write_text(json.dumps(metrics))
+
+        def fake_urlopen(req, timeout=30):
+            raise urllib.error.HTTPError(
+                url=req.full_url,
+                code=422,
+                msg="unprocessable entity",
+                hdrs=None,
+                fp=io.BytesIO(
+                    json.dumps(
+                        {"error": "invalid inferred role", "source": "claude_code"}
+                    ).encode()
+                ),
+            )
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            rc = self.mod.main([
+                "--metrics", str(self.metrics_path), "--role", "engineer", "--no-open"
+            ])
+
+        self.assertEqual(rc, 1)
+        self.assertIn(
+            "AIQ Rank upload failed: http 422: invalid inferred role source=claude_code",
+            stderr.getvalue(),
+        )
+
+    def test_http_failure_prints_server_reason(self):
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            url="https://aiqrank.com/api/teaser/upload",
+            code=422,
+            msg="unprocessable entity",
+            hdrs=None,
+            fp=io.BytesIO(
+                json.dumps({"error": "too many sources (max 7)"}).encode()
+            ),
+        )
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=error), \
+             mock.patch.object(self.mod, "open_in_browser"), \
+             mock.patch("sys.stdout", new=io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            rc = self.mod.main(["--metrics", str(self.metrics_path), "--role", "engineer"])
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "AIQ Rank upload failed: http 422: too many sources (max 7)",
+            stderr.getvalue(),
+        )
 
 
 if __name__ == "__main__":

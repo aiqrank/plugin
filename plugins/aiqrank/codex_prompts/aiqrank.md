@@ -10,10 +10,10 @@ AIQ Rank takes privacy seriously. Supported coding-agent sessions, including Pi,
 
 Before scanning, if `~/.aiqrank/scripts/self_update.py` exists, run it with Python. It applies any pending update in place, so the scan below uses the refreshed scripts. If it prints an update line, show that one line to the user. If it reports that the update did not complete, show that line and continue.
 
-1. Scan locally and upload aggregate counts (reads supported coding-agent and agent-runtime sessions on this machine and sends integer counts plus normalized tool/skill/MCP names — never message content): `python3 ~/.aiqrank/scripts/upload_metrics.py --scan --role engineer`
+1. Scan locally and upload aggregate counts without opening a browser (reads supported coding-agent and agent-runtime sessions on this machine and sends integer counts plus normalized tool/skill/MCP names — never message content): `python3 ~/.aiqrank/scripts/upload_metrics.py --scan --role engineer --no-open`
 2. Follow the link printed by that command to see your rank at aiqrank.com/me.
 
-The teaser page handles preview + sign-in on first run, then redirects to your owner dashboard at `/me`. Print nothing except the one line from `upload_metrics.py`.
+The teaser page handles preview + sign-in on first run, then redirects to your owner dashboard at `/me`. The upload command does not open a browser by default; open the printed link manually when needed. Print nothing except the one line from `upload_metrics.py`.
 
 ## Updating
 

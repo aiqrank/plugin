@@ -22,12 +22,12 @@ Run step 0 first. It applies any pending update and records the resolved plugin 
    ```bash
    PLUGIN_ROOT="$(cat "$HOME/.config/aiqrank/plugin_root" 2>/dev/null)"; [ -n "$PLUGIN_ROOT" ] && [ -d "$PLUGIN_ROOT/scripts" ] || { echo "aiqrank plugin root not resolved — run step 0 first"; exit 1; }; PY="$(command -v python3 || command -v python)"; [ -n "$PY" ] || { echo "python not found — install Python 3"; exit 1; }; "$PY" "$PLUGIN_ROOT/scripts/infer_role.py" --from /tmp/aiqrank_metrics.json > /tmp/aiqrank_role.json
    ```
-3. Submit and open teaser:
+3. Submit the metrics without opening a browser:
    ```bash
-   PLUGIN_ROOT="$(cat "$HOME/.config/aiqrank/plugin_root" 2>/dev/null)"; [ -n "$PLUGIN_ROOT" ] && [ -d "$PLUGIN_ROOT/scripts" ] || { echo "aiqrank plugin root not resolved — run step 0 first"; exit 1; }; PY="$(command -v python3 || command -v python)"; [ -n "$PY" ] || { echo "python not found — install Python 3"; exit 1; }; "$PY" "$PLUGIN_ROOT/scripts/upload_metrics.py" --metrics /tmp/aiqrank_metrics.json --role <role-from-step-2>
+   PLUGIN_ROOT="$(cat "$HOME/.config/aiqrank/plugin_root" 2>/dev/null)"; [ -n "$PLUGIN_ROOT" ] && [ -d "$PLUGIN_ROOT/scripts" ] || { echo "aiqrank plugin root not resolved — run step 0 first"; exit 1; }; PY="$(command -v python3 || command -v python)"; [ -n "$PY" ] || { echo "python not found — install Python 3"; exit 1; }; "$PY" "$PLUGIN_ROOT/scripts/upload_metrics.py" --metrics /tmp/aiqrank_metrics.json --role <role-from-step-2> --no-open
    ```
 
-The teaser page handles preview + sign-in on first run, then redirects to the owner dashboard at `/me`. Print nothing inside Claude Code except the one line from `upload_metrics.py`, plus the update line from step 0 when there is one.
+The command prints the teaser URL after a successful upload. Open that link manually when you want to preview/sign in; pass `--open` only when browser launch is explicitly requested. Print nothing inside Claude Code except the one line from `upload_metrics.py`, plus the update line from step 0 when there is one.
 
 ## Updating
 

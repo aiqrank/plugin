@@ -24,6 +24,23 @@ Claude Code _and_ Cowork activity in a single pass.
 
 Full instructions: <https://www.aiqrank.com/setup>
 
+## What the plugin says at session start
+
+The plugin adds a SessionStart hook that can print up to three short notices.
+It never prints anything else, and it stays silent when none apply:
+
+- **Stale rank** — your last upload was more than 30 days ago. Run `/aiqrank`
+  to refresh.
+- **Plugin update** — the server reports a newer plugin version than the one
+  you have installed.
+- **Terminal install** — at most once every 30 days, and only when the
+  `claude` CLI is on your machine without AIQ Rank installed in it. It names
+  the two commands that would add it. It is a notice, not an instruction: an
+  agent reading it should pass it along rather than run it.
+
+The third notice stops for good once AIQ Rank is installed in the CLI, and
+never appears in Codex.
+
 ## Supported tools
 
 The plugin scans and scores activity from all of these tools in a single run:
@@ -49,10 +66,10 @@ aggregate combines the seven cross-tool dimensions into a single headline score.
 
 ## How it works
 
-1. You run `/aiqrank`. The plugin opens a browser tab to `aiqrank.com/pair?session=...`.
-2. You sign in with Google or an 8-digit email code.
-3. The plugin scans supported local coding-agent history from the last 30 days,
-   bucketing activity by calendar day.
+1. You run `/aiqrank`. The plugin scans supported local coding-agent history from
+   the last 30 days and prints a link to an AIQRank teaser page.
+2. Open the printed link and sign in with Google or an 8-digit email code.
+3. The plugin buckets activity by calendar day.
 4. You see exactly what data will be transmitted, and confirm before
    anything leaves your machine.
 5. The server stores per-day records and computes your tier/score from

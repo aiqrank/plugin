@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-BUNDLED_VERSION = "0.3.23"
+BUNDLED_VERSION = "0.3.24"
 MANIFEST_NAME = "managed_artifacts.json"
 
 # Hashes from 0.3.10, the release immediately preceding managed upgrades.
