@@ -1158,11 +1158,17 @@ def _stamp_planning_measurement_version(daily: dict[date, dict], rollup: dict) -
     rollup["planning_measurement_version"] = PLANNING_MEASUREMENT_VERSION
 
 
+def _normalize_recorded_path(file_path: str) -> str:
+    """Use forward slashes before matching paths recorded by any host OS."""
+    return file_path.replace("\\", "/")
+
+
 def _is_plan_artifact_path(file_path: str) -> bool:
     """True for recognized plan artifacts, matched structurally by path only:
     a Markdown file directly or recursively under a `plans/` directory at any
     depth, or whose basename is exactly `PLAN.md` or matches `*-plan.md`.
     File content is never inspected."""
+    file_path = _normalize_recorded_path(file_path)
     if not file_path.endswith(".md"):
         return False
     segments = [s for s in file_path.split("/") if s]
@@ -1183,7 +1189,7 @@ def _authored_skill_name_from_path(file_path: str) -> str | None:
     """Extract `<name>` when a path's final segments are
     `skills/<name>/SKILL.md` — home skill roots and plugin repositories
     alike. Excludes the aiqrank self-skill."""
-    segments = [s for s in file_path.split("/") if s]
+    segments = [s for s in _normalize_recorded_path(file_path).split("/") if s]
     if len(segments) < 3 or segments[-1] != "SKILL.md" or segments[-3] != "skills":
         return None
     name = segments[-2]
@@ -1913,7 +1919,9 @@ def process_session(
                             bucket["plan_mode_invocations"] += 1
 
                         if name in ("Write", "Edit"):
-                            target_path = (tool_use.get("input") or {}).get("file_path") or ""
+                            target_path = _normalize_recorded_path(
+                                (tool_use.get("input") or {}).get("file_path") or ""
+                            )
 
                             # Authorship and planning credit require a
                             # successful completion record on the same local
@@ -2745,6 +2753,8 @@ def _apply_codex_tool_effects(
         fp = _codex_arg(payload, "file_path") or _codex_arg(payload, "path")
         if isinstance(fp, str) and fp:
             target_paths = [fp]
+
+    target_paths = [_normalize_recorded_path(path) for path in target_paths]
 
     # Planning credit requires a successful mutation with a recognized
     # target: a prior signal on the same date, or a plan-artifact path.

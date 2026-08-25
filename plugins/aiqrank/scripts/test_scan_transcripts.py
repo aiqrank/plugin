@@ -929,6 +929,7 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
             "/repo/.claude/plans/idea.md",
             "/repo/plans/idea.md",
             "/repo/mydocs/plans/notes.md",
+            r"C:\repo\docs\plans\windows-plan.md",
         ]
         for i, artifact_path in enumerate(artifact_paths):
             write_jsonl(
@@ -1193,6 +1194,25 @@ class PluginSkillAuthorshipTests(unittest.TestCase):
 
         r = self.rollup(self._scan())
         self.assertEqual(r["authored_skill_names"], ["my-tool"])
+
+    def test_windows_skill_md_write_establishes_authorship(self):
+        write_jsonl(
+            self.projects / "proj1" / "windows.jsonl",
+            [
+                make_tool_call_with_id(
+                    "Edit",
+                    {
+                        "file_path": r"C:\Users\me\.claude\skills\my-tool\SKILL.md",
+                    },
+                    "w1",
+                ),
+                make_tool_result("w1"),
+            ],
+        )
+
+        r = self.rollup(self._scan())
+        self.assertEqual(r["authored_skill_names"], ["my-tool"])
+        self.assertEqual(r["custom_skill_files_written"], 1)
 
     def test_failed_or_unpaired_skill_mutations_never_author(self):
         write_jsonl(
@@ -2375,6 +2395,46 @@ class CodexOrchestrationTests(unittest.TestCase):
         self.assertEqual(rollup["skill_counts"], {"review": 1})
         self.assertEqual(rollup["file_changes"], 1)
         self.assertEqual(rollup["agents_md_writes"], 1)
+
+    def test_windows_write_paths_receive_skill_and_document_credit(self):
+        events = []
+        for call_id, name, arguments in [
+            (
+                "skill",
+                "Write",
+                {"file_path": r"C:\Users\me\.codex\skills\review\SKILL.md"},
+            ),
+            ("agents", "Edit", {"file_path": r"C:\repo\AGENTS.md"}),
+            ("plan", "Write", {"file_path": r"C:\repo\docs\plans\fix.md"}),
+        ]:
+            events.extend(
+                [
+                    self._codex_event(
+                        {
+                            "type": "function_call",
+                            "name": name,
+                            "call_id": call_id,
+                            "arguments": json.dumps(arguments),
+                        }
+                    ),
+                    self._codex_event(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": "ok",
+                        }
+                    ),
+                ]
+            )
+        self._write_codex_session("windows-paths", events)
+
+        rollup = scan_codex(self.codex_dir, now_ts=self._CODEX_NOW)["rollup"]
+
+        self.assertEqual(rollup["authored_skill_names"], ["review"])
+        self.assertEqual(rollup["custom_skill_files_written"], 1)
+        self.assertEqual(rollup["claude_md_writes"], 1)
+        self.assertEqual(rollup["agents_md_writes"], 1)
+        self.assertEqual(rollup["sessions_with_plan_mode"], 1)
 
     def test_native_plan_mode_marks_only_qualifying_dates_without_invocation_inflation(self):
         plan_context = self._codex_event({
