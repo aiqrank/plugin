@@ -18,8 +18,8 @@ from install_codex import BUNDLED_VERSION, SCRIPT_NAMES
 
 
 class VersionParityTests(unittest.TestCase):
-    def test_monthly_cli_install_reminder_prepares_the_0_3_25_release(self):
-        self.assertEqual(PLUGIN_VERSION, "0.3.25")
+    def test_customization_measures_config_surfaces_in_the_0_3_26_release(self):
+        self.assertEqual(PLUGIN_VERSION, "0.3.26")
 
     def test_plugin_version_matches_plugin_json(self):
         plugin_json = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"

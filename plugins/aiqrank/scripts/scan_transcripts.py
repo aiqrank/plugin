@@ -248,7 +248,19 @@ _PEAK_FIELDS = (
     "max_messages_in_session",
     "max_parallel_agents",
     "scheduled_tasks_active",
+    # Configuration-surface snapshot for `custom_creation`. Both are
+    # whole-scan snapshots stamped on the latest active day, so they
+    # aggregate by MAX rather than summing across the window.
+    "config_surfaces_built",
+    "config_surfaces_used",
+    "customization_measurement_version",
 )
+
+# Bumped when the `custom_creation` inputs change meaning. Lets the server
+# tell "this scanner measured zero surfaces" apart from "this scanner never
+# measured surfaces", the same way `planning_measurement_version` does for
+# planning. Legacy rows read as 0 and keep the write-count scoring.
+CUSTOMIZATION_MEASUREMENT_VERSION = 1
 
 _DICT_FIELDS = (
     "tool_name_counts",
@@ -537,6 +549,10 @@ def scan(
     claude_command_verbs: dict[date, set[str]] = {}
     cowork_command_verbs: dict[date, set[str]] = {}
 
+    # Project working directories seen this scan, mapped to whether the
+    # project had in-window transcripts. Feeds the config-surface snapshot.
+    project_cwds: dict[Path, bool] = {}
+
     seen_claude_transcripts: set[str] = set()
     for home in homes:
         projects = home / "projects"
@@ -550,7 +566,10 @@ def scan(
             if not project_dir.is_dir():
                 continue
 
+            project_active = False
+
             for jsonl_path in iter_transcript_files(project_dir, cutoff_ts, mtime_after_ts):
+                project_active = True
                 try:
                     rel = str(jsonl_path.relative_to(home))
                 except ValueError:
@@ -571,6 +590,10 @@ def scan(
                     local_skills=local_skills,
                     command_verbs_by_day=claude_command_verbs,
                 )
+
+            cwd = _extract_cwd_from_project(project_dir)
+            if cwd is not None:
+                project_cwds[cwd] = project_cwds.get(cwd, False) or project_active
 
             meta_cutoff = cutoff_ts if mtime_after_ts is None else max(cutoff_ts, mtime_after_ts)
             for meta_path in project_dir.rglob("agent-*.meta.json"):
@@ -708,6 +731,39 @@ def scan(
                 break
         if not seeded and codex_result is not None:
             _seed_authored_into_codex_result(codex_result, registry_names)
+
+    # Configuration-surface snapshot. Usage comes from what the walk already
+    # observed this window: subagent invocations and bare-name slash commands.
+    # Stamped on the latest active day of *every* source that shares this
+    # machine, so a user active in both Claude Code and Cowork gets surface
+    # scoring on both tabs rather than whichever source happened to sort
+    # first. The snapshot describes the machine, not the source, so the same
+    # counts on two sources are correct — MAX aggregation cannot double-count
+    # them. Only an already-active day is stamped, never a fabricated one.
+    agent_names_used: set[str] = set()
+    command_names_used: set[str] = set()
+    for source_daily in (
+        daily_by_source[SOURCE_CLAUDE_CODE],
+        daily_by_source[SOURCE_COWORK],
+    ):
+        for metrics in source_daily.values():
+            agent_names_used.update(metrics.get("agent_type_counts") or {})
+            command_names_used.update(metrics.get("skill_counts") or {})
+
+    surfaces_built, surfaces_used = _enumerate_config_surfaces(
+        homes, project_cwds, agent_names_used, command_names_used
+    )
+    for source_daily in (
+        daily_by_source[SOURCE_CLAUDE_CODE],
+        daily_by_source[SOURCE_COWORK],
+    ):
+        if source_daily:
+            target = source_daily[max(source_daily)]
+            target["config_surfaces_built"] = surfaces_built
+            target["config_surfaces_used"] = surfaces_used
+            target["customization_measurement_version"] = (
+                CUSTOMIZATION_MEASUREMENT_VERSION
+            )
 
     # OpenCode root: read ~/.local/share/opencode/opencode.db via scan_opencode.
     # Skipped silently when the DB is absent.
@@ -2070,6 +2126,95 @@ def _enumerate_skill_dir(skills_dir: Path) -> set[str]:
         except OSError:
             continue
     return names
+
+
+def _enumerate_md_names(dir_path: Path) -> set[str]:
+    """Return bare names (no `.md`) of Markdown files directly in `dir_path`.
+
+    Used for the `agents/` and `commands/` config surfaces, whose entries are
+    single files rather than the directory-plus-SKILL.md shape skills use.
+    """
+    if not dir_path.is_dir():
+        return set()
+    try:
+        entries = list(dir_path.iterdir())
+    except OSError:
+        return set()
+    names: set[str] = set()
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.suffix == ".md":
+                names.add(entry.stem)
+        except OSError:
+            continue
+    return names
+
+
+def _enumerate_config_surfaces(
+    homes: Iterable[Path],
+    project_cwds: dict[Path, bool],
+    agent_names_used: set[str],
+    command_names_used: set[str],
+) -> tuple[int, int]:
+    """Count configuration surfaces present on disk, and the subset exercised
+    in this scan's window. Returns `(built, used)`.
+
+    A "surface" is one durable piece of environment configuration:
+
+      * a project instruction file (`CLAUDE.md` / `AGENTS.md`) per project,
+        plus the user-level `~/.claude/CLAUDE.md`
+      * a project MCP config (`.mcp.json`) per project
+      * a custom subagent definition (`agents/<name>.md`)
+      * a custom slash command (`commands/<name>.md`)
+
+    A surface counts as *used* when the scan saw the thing it configures:
+    project-scoped surfaces when that project had transcripts in the window,
+    subagents when the name appears in `agent_type_counts`, and commands when
+    the name appears in `skill_counts`.
+
+    Only the two integers leave the machine — never a path, project name, or
+    file body. `project_cwds` maps each project working directory to whether
+    it had in-window activity.
+    """
+    built = 0
+    used = 0
+
+    def add(present: bool, exercised: bool) -> None:
+        nonlocal built, used
+        if present:
+            built += 1
+            if exercised:
+                used += 1
+
+    def exists(path: Path) -> bool:
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+
+    # User-level instruction file: exercised whenever any project was active.
+    home_active = any(project_cwds.values())
+    for home in homes:
+        add(exists(home / "CLAUDE.md"), home_active)
+
+    for cwd, active in project_cwds.items():
+        add(exists(cwd / "CLAUDE.md") or exists(cwd / "AGENTS.md"), active)
+        add(exists(cwd / ".mcp.json"), active)
+
+    # Subagents and slash commands are name-addressable, so their usage is
+    # checked per name rather than per project.
+    agent_dirs = [home / "agents" for home in homes]
+    command_dirs = [home / "commands" for home in homes]
+    for cwd in project_cwds:
+        agent_dirs.append(cwd / ".claude" / "agents")
+        command_dirs.append(cwd / ".claude" / "commands")
+
+    for name in {n for d in agent_dirs for n in _enumerate_md_names(d)}:
+        add(True, name in agent_names_used)
+    for name in {n for d in command_dirs for n in _enumerate_md_names(d)}:
+        add(True, name in command_names_used)
+
+    return built, used
 
 
 def _extract_cwd_from_project(project_dir: Path) -> Path | None:

@@ -3450,3 +3450,212 @@ class ClaudeCodeCommandDiversityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigSurfaceTests(unittest.TestCase):
+    """Configuration surfaces feed `custom_creation` as a state measurement:
+    what the user has configured, and how much of it they still exercise.
+    Only the two counts leave the machine — never a path or a file body."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _repo(self, name: str) -> Path:
+        repo = self.tmp / name
+        repo.mkdir(parents=True)
+        return repo
+
+    def test_counts_instruction_files_mcp_configs_agents_and_commands(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        (repo / "CLAUDE.md").write_text("# conventions\n")
+        (repo / ".mcp.json").write_text("{}")
+        agents = repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "reviewer.md").write_text("reviewer")
+        commands = repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+        (commands / "ship.md").write_text("ship")
+
+        built, used = _enumerate_config_surfaces(
+            [], {repo: True}, {"reviewer"}, {"ship"}
+        )
+
+        self.assertEqual(built, 4)
+        self.assertEqual(used, 4)
+
+    def test_agents_md_counts_as_an_instruction_surface(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        (repo / "AGENTS.md").write_text("# conventions\n")
+
+        built, _used = _enumerate_config_surfaces([], {repo: True}, set(), set())
+        self.assertEqual(built, 1)
+
+    def test_instruction_file_and_agents_md_together_count_once(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        (repo / "CLAUDE.md").write_text("a")
+        (repo / "AGENTS.md").write_text("b")
+
+        built, _used = _enumerate_config_surfaces([], {repo: True}, set(), set())
+        self.assertEqual(built, 1)
+
+    def test_inactive_project_is_built_but_not_used(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        (repo / "CLAUDE.md").write_text("# conventions\n")
+
+        built, used = _enumerate_config_surfaces([], {repo: False}, set(), set())
+
+        self.assertEqual(built, 1)
+        self.assertEqual(used, 0)
+
+    def test_unused_agent_and_command_count_as_built_only(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        agents = repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "used.md").write_text("x")
+        (agents / "shelved.md").write_text("x")
+
+        built, used = _enumerate_config_surfaces([], {repo: True}, {"used"}, set())
+
+        self.assertEqual(built, 2)
+        self.assertEqual(used, 1)
+
+    def test_user_level_instruction_file_counts(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        home = self.tmp / ".claude"
+        home.mkdir()
+        (home / "CLAUDE.md").write_text("# global\n")
+        repo = self._repo("repo")
+
+        built, used = _enumerate_config_surfaces([home], {repo: True}, set(), set())
+
+        self.assertEqual(built, 1)
+        self.assertEqual(used, 1)
+
+    def test_user_level_instruction_file_unused_when_no_project_active(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        home = self.tmp / ".claude"
+        home.mkdir()
+        (home / "CLAUDE.md").write_text("# global\n")
+        repo = self._repo("repo")
+
+        built, used = _enumerate_config_surfaces([home], {repo: False}, set(), set())
+
+        self.assertEqual(built, 1)
+        self.assertEqual(used, 0)
+
+    def test_no_config_yields_zero(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("bare")
+        self.assertEqual(
+            _enumerate_config_surfaces([], {repo: True}, set(), set()), (0, 0)
+        )
+
+    def test_deleted_cwd_does_not_raise(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        gone = self.tmp / "never-existed"
+        self.assertEqual(
+            _enumerate_config_surfaces([], {gone: True}, set(), set()), (0, 0)
+        )
+
+    def test_same_name_across_projects_counts_once(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        for name in ("a", "b"):
+            commands = self._repo(name) / ".claude" / "commands"
+            commands.mkdir(parents=True)
+            (commands / "ship.md").write_text("ship")
+
+        built, _used = _enumerate_config_surfaces(
+            [], {self.tmp / "a": True, self.tmp / "b": True}, set(), set()
+        )
+        self.assertEqual(built, 1)
+
+    def test_non_markdown_entries_are_ignored(self):
+        from scan_transcripts import _enumerate_config_surfaces
+
+        repo = self._repo("repo")
+        agents = repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "notes.txt").write_text("x")
+        (agents / "nested").mkdir()
+
+        built, _used = _enumerate_config_surfaces([], {repo: True}, set(), set())
+        self.assertEqual(built, 0)
+
+    def test_scan_stamps_surface_counts_on_latest_active_day(self):
+        from scan_transcripts import CUSTOMIZATION_MEASUREMENT_VERSION, scan
+
+        repo = self._repo("repo")
+        (repo / "CLAUDE.md").write_text("# conventions\n")
+
+        claude_dir = self.tmp / ".claude"
+        jsonl = claude_dir / "projects" / "-tmp-repo" / "sess.jsonl"
+        write_jsonl(jsonl, [{**make_user_msg("hello"), "cwd": str(repo)}])
+
+        result = scan(
+            window_days=30,
+            claude_dir=claude_dir,
+            authored_registry_path=self.tmp / "authored_skills.json",
+        )
+        rollup = (result["by_source"]["claude_code"])["rollup"]
+
+        self.assertEqual(rollup["config_surfaces_built"], 1)
+        self.assertEqual(rollup["config_surfaces_used"], 1)
+        self.assertEqual(
+            rollup["customization_measurement_version"],
+            CUSTOMIZATION_MEASUREMENT_VERSION,
+        )
+
+    def test_scan_stamps_every_source_sharing_the_machine(self):
+        from scan_transcripts import CUSTOMIZATION_MEASUREMENT_VERSION, scan
+
+        repo = self._repo("repo")
+        (repo / "CLAUDE.md").write_text("# conventions\n")
+
+        claude_dir = self.tmp / ".claude"
+        write_jsonl(
+            claude_dir / "projects" / "-tmp-repo" / "sess.jsonl",
+            [{**make_user_msg("hello"), "cwd": str(repo)}],
+        )
+
+        cowork_root = self.tmp / "cowork-sessions"
+        cowork_projects = (
+            cowork_root / "acct" / "ws" / "local_sess" / ".claude" / "projects" / "p"
+        )
+        cowork_projects.mkdir(parents=True)
+        write_jsonl(cowork_projects / "conv.jsonl", [make_user_msg("hello cowork")])
+
+        result = scan(
+            window_days=30,
+            claude_dir=claude_dir,
+            cowork_root=cowork_root,
+            authored_registry_path=self.tmp / "authored_skills.json",
+        )
+
+        # The snapshot describes the machine, so both sources carry it rather
+        # than whichever source happens to be checked first.
+        for source in ("claude_code", "cowork"):
+            rollup = result["by_source"][source]["rollup"]
+            self.assertEqual(rollup["config_surfaces_built"], 1, source)
+            self.assertEqual(
+                rollup["customization_measurement_version"],
+                CUSTOMIZATION_MEASUREMENT_VERSION,
+                source,
+            )
