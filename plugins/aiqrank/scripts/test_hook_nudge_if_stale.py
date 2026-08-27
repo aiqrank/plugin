@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import date
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -585,3 +586,46 @@ class HookNudgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CustomizationCutoverWarningTests(unittest.TestCase):
+    """The version nudge carries the Customization consequence, because a
+    changelog only reaches people who visit the site while this line reaches
+    everyone mid-session."""
+
+    def setUp(self):
+        if "hook_nudge_if_stale" in sys.modules:
+            del sys.modules["hook_nudge_if_stale"]
+        import hook_nudge_if_stale
+
+        self.mod = hook_nudge_if_stale
+
+    def _warn(self, version, today, codex=False):
+        with mock.patch.object(self.mod, "PLUGIN_VERSION", version), mock.patch.object(
+            self.mod, "_is_codex_host", lambda: codex
+        ):
+            return self.mod._customization_warning(today)
+
+    def test_stale_install_is_warned_with_the_date(self):
+        text = self._warn("0.3.7", date(2026, 9, 1))
+        self.assertIn("26 Oct 2026", text)
+        self.assertIn("Customization", text)
+
+    def test_warning_is_a_statement_not_an_imperative(self):
+        # This lands in an agent's SessionStart context; imperative phrasing
+        # reads as a task to perform.
+        text = self._warn("0.3.7", date(2026, 9, 1))
+        self.assertNotIn("run ", text)
+        self.assertNotIn("`", text)
+
+    def test_current_install_is_not_warned(self):
+        self.assertEqual(self._warn("0.3.26", date(2026, 9, 1)), "")
+        self.assertEqual(self._warn("0.3.30", date(2026, 9, 1)), "")
+
+    def test_codex_is_exempt_because_it_cannot_report_surfaces(self):
+        self.assertEqual(self._warn("0.3.7", date(2026, 9, 1), codex=True), "")
+
+    def test_after_the_cutover_the_wording_switches_to_present_tense(self):
+        text = self._warn("0.3.7", date(2026, 11, 1))
+        self.assertIn("scoring below its real value", text)
+        self.assertNotIn("drops on", text)

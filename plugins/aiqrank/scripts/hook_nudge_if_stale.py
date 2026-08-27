@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from _version import PLUGIN_VERSION
@@ -76,6 +76,21 @@ NUDGE_FMT = "AIQ Rank: it's been 30 days — run {command} to refresh your rank.
 VERSION_NUDGE_FMT = (
     "AIQ Rank: plugin update available (v{latest}) — {instruction}"
 )
+
+# Customization switched from counting config edits to measuring the
+# configuration present on the machine. Only 0.3.26+ reports that, so older
+# installs lose the surface half of the dimension once the grace period ends.
+# The warning is a statement of consequence, never an imperative — this text
+# lands in an agent's SessionStart context, and "run ..." phrasing reads as a
+# task to perform (see the CLI-install nudge below for the same reasoning).
+CUSTOMIZATION_SURFACE_MIN_VERSION = "0.3.26"
+CUSTOMIZATION_CUTOVER = date(2026, 10, 26)
+CUSTOMIZATION_PENDING_FMT = (
+    " Your Customization score drops on {cutover} unless this plugin is updated."
+)
+CUSTOMIZATION_PASSED = (
+    " Customization is scoring below its real value until this plugin is updated."
+)
 # This line lands in an agent's SessionStart context, not only a human's
 # terminal. Imperative "run `...`" phrasing reads to an agent with shell
 # access as a task to perform, and it would be mutating the user's CLI
@@ -127,6 +142,29 @@ def _update_instruction() -> str:
     return "run /aiqrank and it installs itself."
 
 
+def _customization_warning(today: date | None = None) -> str:
+    """Consequence clause appended to the version nudge for installs too old to
+    report configuration surfaces.
+
+    Empty for Codex, whose scanner cannot emit surfaces at any version and is
+    therefore exempt from the cutover, and empty once this install is new
+    enough that the cutover costs it nothing.
+    """
+    if _is_codex_host():
+        return ""
+    if _version_tuple(PLUGIN_VERSION) >= _version_tuple(
+        CUSTOMIZATION_SURFACE_MIN_VERSION
+    ):
+        return ""
+
+    today = today or date.today()
+    if today >= CUSTOMIZATION_CUTOVER:
+        return CUSTOMIZATION_PASSED
+    return CUSTOMIZATION_PENDING_FMT.format(
+        cutover=CUSTOMIZATION_CUTOVER.strftime("%d %b %Y").lstrip("0")
+    )
+
+
 def _log_hook_fired() -> None:
     """Append one "hook fired" line for fault-domain triage. Fail-soft.
 
@@ -160,7 +198,12 @@ def main() -> int:
             print(NUDGE_FMT.format(command=_aiqrank_command()))
         latest = _read_stale_version()
         if latest:
-            print(VERSION_NUDGE_FMT.format(latest=latest, instruction=_update_instruction()))
+            print(
+                VERSION_NUDGE_FMT.format(
+                    latest=latest, instruction=_update_instruction()
+                )
+                + _customization_warning()
+            )
         now = time.time()
         cli_install_nudge = _cli_install_nudge(now)
         if cli_install_nudge:
