@@ -1829,6 +1829,30 @@ def process_session(
                         latest_per_day[d] = ts
 
                 if event.get("type") == "assistant":
+                    # Extended-thinking blocks. Mirrors the Codex
+                    # `reasoning_blocks` counter so the field is populated on
+                    # both sources rather than reading 0 for every Claude Code
+                    # user. Counted on subagent transcripts too: unlike the
+                    # model mix below, this measures deliberation volume, which
+                    # is real work regardless of which process produced it.
+                    # Only the block type is inspected — thinking text is never
+                    # read, stored, or uploaded.
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                bucket["reasoning_blocks"] += 1
+
+                    # Reasoning-effort label (`low`/`medium`/`high`/...), which
+                    # Claude Code records on the assistant event. Mirrors the
+                    # Codex `effort_usage` histogram. Restricted to main
+                    # sessions for the same reason as `model_usage`: a subagent
+                    # inherits its effort from the framework, so it is not a
+                    # setting the user chose. Normalized to a short label; the
+                    # helper is source-agnostic despite its name.
+                    if is_main:
+                        _increment_label_dict(bucket, "effort_usage", event.get("effort"))
+
                     usage = msg.get("usage") or {}
                     if isinstance(usage, dict):
                         ti = int(usage.get("input_tokens") or 0)
@@ -1988,6 +2012,24 @@ def process_session(
                                 isinstance(tool_use_id, str)
                                 and tool_success_dates.get(tool_use_id) == d
                             )
+                            # Successful file mutations. Mirrors the Codex
+                            # `file_changes` counter in `_apply_codex_tool_effects`
+                            # so the field means the same thing on both sources
+                            # instead of reading 0 for every Claude Code user.
+                            # Gated on the same success evidence as authorship —
+                            # a missing or errored tool_result fails closed.
+                            # Counted on subagent transcripts too, by the same
+                            # rule as `reasoning_blocks` below and for the
+                            # opposite reason from `effort_usage`: this is work
+                            # produced, not a setting the user chose, and a
+                            # delegated write mutates the tree exactly as a
+                            # direct one does. It also keeps the field
+                            # comparable to Codex, where `file_changes` counts
+                            # every successful mutation in the session and no
+                            # main/subagent split exists to mirror.
+                            if succeeded:
+                                bucket["file_changes"] += 1
+
                             if succeeded and isinstance(target_path, str) and target_path:
                                 skill_name = _authored_skill_name_from_path(target_path)
                                 if skill_name and skill_name not in bucket["authored_skill_names"]:
@@ -2573,8 +2615,8 @@ def process_codex_session(
             continue
 
         if ev_type == "turn_context":
-            _increment_codex_dict(bucket, "model_usage", payload.get("model"))
-            _increment_codex_dict(bucket, "effort_usage", payload.get("effort"))
+            _increment_label_dict(bucket, "model_usage", payload.get("model"))
+            _increment_label_dict(bucket, "effort_usage", payload.get("effort"))
             collaboration_mode = payload.get("collaboration_mode")
             if (
                 isinstance(collaboration_mode, dict)
@@ -2792,7 +2834,7 @@ def process_codex_session(
             skill_name = _codex_skill_name(skill_path)
             if skill_name and skill_name not in skill_names_seen:
                 skill_names_seen.add(skill_name)
-                _increment_codex_dict(_bucket(daily, d), "skill_counts", skill_name)
+                _increment_label_dict(_bucket(daily, d), "skill_counts", skill_name)
 
     for d in days_seen:
         bucket = _bucket(daily, d)
@@ -2847,13 +2889,13 @@ def _apply_codex_tool_effects(
         return
     bucket["tool_calls"] += 1
     bucket["main_tool_calls"] += 1
-    _increment_codex_dict(bucket, "tool_name_counts", name)
+    _increment_label_dict(bucket, "tool_name_counts", name)
 
     if name.startswith("mcp__"):
         parts = name.split("__")
         server = parts[1] if len(parts) >= 3 else ""
         if server:
-            _increment_codex_dict(bucket, "mcp_server_counts", server)
+            _increment_label_dict(bucket, "mcp_server_counts", server)
 
     if name == "spawn_agent":
         days_with_orchestration.add(d)
@@ -2861,7 +2903,7 @@ def _apply_codex_tool_effects(
 
         agent_type = _codex_arg(payload, "agent_type")
         if isinstance(agent_type, str) and agent_type:
-            _increment_codex_dict(bucket, "agent_type_counts", agent_type)
+            _increment_label_dict(bucket, "agent_type_counts", agent_type)
 
     elif name == "wait_agent":
         targets = _codex_arg(payload, "targets")
@@ -2972,7 +3014,13 @@ def _normalize_codex_label(value) -> str:
     return label[:CODEX_MAX_LABEL_LENGTH]
 
 
-def _increment_codex_dict(bucket: dict, field: str, raw_label, amount: int = 1) -> None:
+def _increment_label_dict(bucket: dict, field: str, raw_label, amount: int = 1) -> None:
+    """Add `amount` to `bucket[field][<normalized label>]`.
+
+    Source-agnostic despite having started life on the Codex path: the Claude
+    Code scan calls it for `effort_usage`, and nothing here depends on which
+    source produced the label.
+    """
     label = _normalize_codex_label(raw_label)
     if not label:
         return

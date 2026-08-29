@@ -3448,6 +3448,158 @@ class ClaudeCodeCommandDiversityTests(unittest.TestCase):
         self.assertEqual(r["command_diversity"], 0)
 
 
+class ClaudeCodeMetricParityTests(unittest.TestCase):
+    """`file_changes`, `reasoning_blocks` and `effort_usage` are populated for
+    Claude Code, not only Codex, so a zero means "did not do this" rather than
+    "this source never reports it".
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.projects = self.tmp / "projects"
+        (self.projects / "proj1").mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def rollup(self, result):
+        return claude_block(result)["rollup"]
+
+    def test_file_changes_counts_successful_write_and_edit(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("edit the module"),
+                make_tool_call_with_id("Write", {"file_path": "/repo/a.py"}, "t1"),
+                make_tool_result("t1"),
+                make_tool_call_with_id("Edit", {"file_path": "/repo/b.py"}, "t2"),
+                make_tool_result("t2"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["file_changes"], 2)
+
+    def test_file_changes_excludes_errored_and_unconfirmed_writes(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("edit the module"),
+                # Errored tool_result: must not count.
+                make_tool_call_with_id("Write", {"file_path": "/repo/a.py"}, "t1"),
+                make_tool_result("t1", is_error=True),
+                # No tool_result at all: fails closed.
+                make_tool_call_with_id("Edit", {"file_path": "/repo/b.py"}, "t2"),
+                # Only this one succeeded.
+                make_tool_call_with_id("Write", {"file_path": "/repo/c.py"}, "t3"),
+                make_tool_result("t3"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["file_changes"], 1)
+
+    def test_file_changes_counts_subagent_writes(self):
+        # A delegated write mutates the tree exactly as a direct one does, so
+        # it counts — the same rule as reasoning_blocks, and deliberately the
+        # opposite of effort_usage, which is a user-chosen setting.
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("delegate it"),
+                make_tool_call_with_id("Write", {"file_path": "/repo/a.py"}, "t1"),
+                make_tool_result("t1"),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "sessA" / "subagents" / "agent-001.jsonl",
+            [
+                make_tool_call_with_id("Edit", {"file_path": "/repo/b.py"}, "t2"),
+                make_tool_result("t2"),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["file_changes"], 2)
+
+    def test_reasoning_blocks_counts_thinking_blocks_including_subagents(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("think it through"),
+                make_assistant(
+                    content=[
+                        {"type": "thinking", "thinking": "step one"},
+                        {"type": "text", "text": "answer"},
+                    ]
+                ),
+            ],
+        )
+        write_jsonl(
+            self.projects / "proj1" / "sessA" / "subagents" / "agent-001.jsonl",
+            [make_assistant(content=[{"type": "thinking", "thinking": "sub step"}])],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        # Deliberation volume is real work in either process.
+        self.assertEqual(r["reasoning_blocks"], 2)
+
+    def test_reasoning_blocks_zero_without_thinking_blocks(self):
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [
+                make_user_msg("quick one"),
+                make_assistant(content=[{"type": "text", "text": "done"}]),
+            ],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["reasoning_blocks"], 0)
+
+    def test_effort_usage_histogram_from_main_sessions(self):
+        high = make_assistant(content=[{"type": "text", "text": "a"}])
+        high["effort"] = "high"
+        low = make_assistant(content=[{"type": "text", "text": "b"}])
+        low["effort"] = "low"
+        another_high = make_assistant(content=[{"type": "text", "text": "c"}])
+        another_high["effort"] = "high"
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [make_user_msg("go"), high, low, another_high],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["effort_usage"], {"high": 2, "low": 1})
+
+    def test_effort_usage_ignores_subagents_and_missing_labels(self):
+        main = make_assistant(content=[{"type": "text", "text": "a"}])
+        main["effort"] = "high"
+        # No effort key at all: contributes nothing.
+        bare = make_assistant(content=[{"type": "text", "text": "b"}])
+        write_jsonl(
+            self.projects / "proj1" / "sessA.jsonl",
+            [make_user_msg("go"), main, bare],
+        )
+        # A subagent inherits its effort from the framework, so it is not a
+        # user choice and must stay out of the histogram.
+        sub = make_assistant(content=[{"type": "text", "text": "c"}])
+        sub["effort"] = "medium"
+        write_jsonl(
+            self.projects / "proj1" / "sessA" / "subagents" / "agent-001.jsonl",
+            [sub],
+        )
+
+        r = self.rollup(scan(claude_dir=self.tmp))
+
+        self.assertEqual(r["effort_usage"], {"high": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
 
