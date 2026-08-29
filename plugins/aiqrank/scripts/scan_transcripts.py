@@ -1829,6 +1829,30 @@ def process_session(
                         latest_per_day[d] = ts
 
                 if event.get("type") == "assistant":
+                    # Extended-thinking blocks. Mirrors the Codex
+                    # `reasoning_blocks` counter so the field is populated on
+                    # both sources rather than reading 0 for every Claude Code
+                    # user. Counted on subagent transcripts too: unlike the
+                    # model mix below, this measures deliberation volume, which
+                    # is real work regardless of which process produced it.
+                    # Only the block type is inspected — thinking text is never
+                    # read, stored, or uploaded.
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                bucket["reasoning_blocks"] += 1
+
+                    # Reasoning-effort label (`low`/`medium`/`high`/...), which
+                    # Claude Code records on the assistant event. Mirrors the
+                    # Codex `effort_usage` histogram. Restricted to main
+                    # sessions for the same reason as `model_usage`: a subagent
+                    # inherits its effort from the framework, so it is not a
+                    # setting the user chose. Normalized to a short label; the
+                    # helper is source-agnostic despite its name.
+                    if is_main:
+                        _increment_codex_dict(bucket, "effort_usage", event.get("effort"))
+
                     usage = msg.get("usage") or {}
                     if isinstance(usage, dict):
                         ti = int(usage.get("input_tokens") or 0)
@@ -1988,6 +2012,24 @@ def process_session(
                                 isinstance(tool_use_id, str)
                                 and tool_success_dates.get(tool_use_id) == d
                             )
+                            # Successful file mutations. Mirrors the Codex
+                            # `file_changes` counter in `_apply_codex_tool_effects`
+                            # so the field means the same thing on both sources
+                            # instead of reading 0 for every Claude Code user.
+                            # Gated on the same success evidence as authorship —
+                            # a missing or errored tool_result fails closed.
+                            # Counted on subagent transcripts too, by the same
+                            # rule as `reasoning_blocks` below and for the
+                            # opposite reason from `effort_usage`: this is work
+                            # produced, not a setting the user chose, and a
+                            # delegated write mutates the tree exactly as a
+                            # direct one does. It also keeps the field
+                            # comparable to Codex, where `file_changes` counts
+                            # every successful mutation in the session and no
+                            # main/subagent split exists to mirror.
+                            if succeeded:
+                                bucket["file_changes"] += 1
+
                             if succeeded and isinstance(target_path, str) and target_path:
                                 skill_name = _authored_skill_name_from_path(target_path)
                                 if skill_name and skill_name not in bucket["authored_skill_names"]:
