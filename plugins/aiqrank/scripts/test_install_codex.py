@@ -131,6 +131,70 @@ class InstallCodexTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), b"new script\n")
         self.assertEqual(json.loads(manifest.read_text())["version"], "0.3.11")
 
+    def test_release_hash_without_manifest_entry_heals_frozen_install(self):
+        """A release-version copy upgrades even when the manifest lost its key.
+
+        Reproduces the 0.3.28 heal: an older plugin cache rewrote the manifest
+        without check_update/self_update entries, orphaning the on-disk copies;
+        KNOWN_BUNDLED_HASHES must make any released copy replaceable again.
+        """
+        artifacts = self._artifacts()
+        destination = artifacts["scripts/example.py"].destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        released_content = b"released 0.3.16 script\n"
+        destination.write_bytes(released_content)
+        manifest = self.home / ".aiqrank" / "managed_artifacts.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": "0.3.14",
+                    "artifacts": {
+                        # Rewritten by an older cache: the example.py key is gone.
+                        "prompts/aiqrank.md": {"sha256": _sha(b"old prompt\n")},
+                    },
+                }
+            )
+        )
+
+        known_hashes = dict(install_codex.KNOWN_BUNDLED_HASHES)
+        known_hashes["scripts/example.py"] = {_sha(released_content)}
+        with mock.patch.object(install_codex, "KNOWN_BUNDLED_HASHES", known_hashes):
+            result = install_codex.install_artifacts(
+                artifacts, manifest, version="0.3.28", warn=self.messages.append
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(destination.read_bytes(), b"new script\n")
+        self.assertFalse(self.messages, "a released copy must not warn 'preserving modified'")
+        saved = json.loads(manifest.read_text())
+        self.assertEqual(saved["version"], "0.3.28")
+        self.assertEqual(saved["artifacts"]["scripts/example.py"]["sha256"], _sha(b"new script\n"))
+
+    def test_manifest_rewrite_retains_entries_outside_current_bundle(self):
+        """An older SCRIPT_NAMES rewrite cannot orphan newer managed files."""
+        artifacts = self._artifacts()
+        manifest = self.home / ".aiqrank" / "managed_artifacts.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        retained_entry = {"sha256": _sha(b"newer managed script\n"), "mode": "0o700"}
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": "0.3.16",
+                    "artifacts": {"scripts/newer.py": retained_entry},
+                }
+            )
+        )
+
+        result = install_codex.install_artifacts(
+            artifacts, manifest, version="0.3.14", warn=self.messages.append
+        )
+
+        self.assertTrue(result)
+        saved = json.loads(manifest.read_text())
+        self.assertEqual(saved["artifacts"].get("scripts/newer.py"), retained_entry)
+        self.assertEqual(saved["artifacts"]["scripts/example.py"]["sha256"], _sha(b"new script\n"))
+
     def test_replace_failure_rolls_back_every_artifact_and_manifest(self):
         old_script = b"old script\n"
         old_prompt = b"old prompt\n"

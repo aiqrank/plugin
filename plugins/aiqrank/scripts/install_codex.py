@@ -21,12 +21,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-BUNDLED_VERSION = "0.3.27"
+BUNDLED_VERSION = "0.3.28"
 MANIFEST_NAME = "managed_artifacts.json"
 
-# Hashes from 0.3.10, the release immediately preceding managed upgrades.
-# Manifest hashes cover every subsequent release; this table bootstraps users
-# whose existing files predate the local manifest.
+# Hashes of every released version of each managed file, so an on-disk copy
+# matching a known release is always safe to replace. The manifest covers the
+# normal path; this table heals installs whose manifest lost those keys —
+# e.g. a hook from an older plugin cache (whose SCRIPT_NAMES was a subset)
+# rewrote the manifest without them, orphaning files managed by newer
+# releases. Files that joined SCRIPT_NAMES after 0.3.10 (scan_pi,
+# check_update, self_update, scan_agent_runtimes) were never bootstrapped
+# here, which froze such installs at 0.3.14 with "preserving modified".
 KNOWN_BUNDLED_HASHES = {
     "scripts/scan_codex.py": {
         "caa1cf3b7e474f71b025352d30a45b873630bf4a641d195559fab9d4264442dc",  # 0.3.5
@@ -49,6 +54,22 @@ KNOWN_BUNDLED_HASHES = {
     "prompts/aiqrank.md": {
         "98f1ca9997bcc53587cf199faa59a7a0ba189bd92a7ad6ed36723aa1979da20c",  # 0.3.5
         "519ed28448ebeaa5ce97074cd8e2495f3964cda257b6f7e3e9ed71f2c5b24443",  # 0.3.9-10
+    },
+    "scripts/scan_pi.py": {
+        "ed7385b67b4ac836d6a905bdd95d6de3e1619924a4cd966d0efa2dcef82a72bb",  # 0.3.13-0.3.16
+        "cdb698f4ba564bee1747130d7d252eea006f40a0e298f8a65524ddd74b576a05",  # 0.3.18+
+    },
+    "scripts/check_update.py": {
+        "0fb3bac459d35141e263e425387ad5eeee843b3d9c3ab49ca436142e894efb09",  # 0.3.15-0.3.18
+        "ce4fc8f607c2afc59d2ef2670a0136cb0e37b92a8aa30746fb54ed79e5b62912",  # 0.3.20+
+    },
+    "scripts/self_update.py": {
+        "1234fde483c3679939478e4ada7f97472fced192a830220f99caa9f046250a02",  # 0.3.16-0.3.18
+        "86311991afa77716f043be17d56c8f1415c57be7ad4256e3a96b046e88d79df6",  # 0.3.20-0.3.21
+        "707fa2e4f82d42be769756af6e606f801daaf58d1df79456987e18918d6febc3",  # 0.3.22+
+    },
+    "scripts/scan_agent_runtimes.py": {
+        "f7085abc9a1bee6934927d78a2db5c8b091adb813c6ab17c159b92a9b62c5f1e",  # 0.3.23+
     },
 }
 
@@ -197,11 +218,23 @@ def install_artifacts(
         warn_rollback("managed artifact update failed", exc)
         return False
 
+    # Retain manifest entries for files outside the current bundle so a
+    # rewrite by an older plugin cache (whose SCRIPT_NAMES is a subset)
+    # cannot orphan files managed by newer releases — the freeze the
+    # KNOWN_BUNDLED_HASHES additions above heal retroactively.
+    retained = {
+        key: entry
+        for key, entry in (manifest.get("artifacts") or {}).items()
+        if isinstance(key, str) and isinstance(entry, dict) and key not in artifacts
+    }
     manifest_body = {
         "version": version,
         "artifacts": {
-            key: {"sha256": _sha256(artifact.content), "mode": oct(artifact.mode)}
-            for key, artifact in sorted(artifacts.items())
+            **retained,
+            **{
+                key: {"sha256": _sha256(artifact.content), "mode": oct(artifact.mode)}
+                for key, artifact in sorted(artifacts.items())
+            },
         },
     }
     manifest_content = (json.dumps(manifest_body, indent=2, sort_keys=True) + "\n").encode()
