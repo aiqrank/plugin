@@ -690,8 +690,10 @@ class ScanTranscriptsTests(unittest.TestCase):
         write_jsonl(
             self.projects / "proj1" / "s.jsonl",
             [
-                make_tool_call("Write", {"file_path": "/repo/CLAUDE.md"}),
-                make_tool_call("Edit", {"file_path": "/repo/AGENTS.md"}),
+                make_tool_call_with_id("Write", {"file_path": "/repo/CLAUDE.md"}, "w1"),
+                make_tool_result("w1"),
+                make_tool_call_with_id("Edit", {"file_path": "/repo/AGENTS.md"}, "w2"),
+                make_tool_result("w2"),
                 make_tool_call("Write", {"file_path": "/repo/src/foo.py"}),
             ],
         )
@@ -924,6 +926,9 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
             "/repo/docs/plans/nested/deeper/notes.md",
             "/repo/.context/plans/idea.md",
             "/repo/sub/PLAN.md",
+            "/repo/plan.md",
+            "/repo/docs/Plans/DESIGN.MD",
+            "/repo/feature-Plan.Md",
             "/repo/feature-plan.md",
             # A `plans/` directory qualifies wherever it sits.
             "/repo/.claude/plans/idea.md",
@@ -948,7 +953,6 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
         near_miss_paths = [
             "/repo/README.md",
             "/repo/spec.md",
-            "/repo/plan.md",
             "/repo/replan.md",
             "/repo/docs/planning/notes.md",
             "/repo/docs/plans/data.txt",
@@ -1099,9 +1103,9 @@ class StructuralPlanningOutcomeTests(unittest.TestCase):
         claude = claude_block(scan(claude_dir=self.tmp))
         self.assertEqual(len(claude["daily"]), 1)
         self.assertEqual(
-            claude["daily"][0]["metrics"]["planning_measurement_version"], 2
+            claude["daily"][0]["metrics"]["planning_measurement_version"], 3
         )
-        self.assertEqual(claude["rollup"]["planning_measurement_version"], 2)
+        self.assertEqual(claude["rollup"]["planning_measurement_version"], 3)
 
     def test_serialized_envelope_contains_no_planning_sentinels(self):
         plan_path = "/Users/me/secret-project/docs/plans/2026-07-29-042-secret-initiative-plan.md"
@@ -2351,6 +2355,7 @@ class CodexOrchestrationTests(unittest.TestCase):
             tool("update_plan", "plan-1"),
             tool("update_plan", "plan-1"),
             self._codex_event({"type": "custom_tool_call", "name": "exec", "call_id": "outer-1", "input": nested}),
+            self._codex_event({"type": "custom_tool_call_output", "call_id": "outer-1", "output": "Done"}),
             self._codex_event({
                 "type": "sub_agent_activity", "event_id": "spawn-1",
                 "agent_thread_id": "agent-a", "agent_path": "/root/a", "kind": "started",

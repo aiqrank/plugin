@@ -402,8 +402,12 @@ class AgentRuntimeScannerTests(unittest.TestCase):
             },
         ]
         transcript.write_text("".join(json.dumps(event) + "\n" for event in events))
+        # Both provider transcripts carry the instruction measurement marker;
+        # merging them must MAX the version, not add it like an edit count.
+        transcript.with_name("second-provider.jsonl").write_text(json.dumps(events[0]) + "\n")
 
         metrics = scan_nanoclaw([self.root], now_ts=NOW)["rollup"]
+        self.assertEqual(metrics["instruction_writes_measurement_version"], 1)
 
         self.assertEqual(metrics["sessions"], 3)
         self.assertEqual(metrics["scheduled_task_runs"], 1)

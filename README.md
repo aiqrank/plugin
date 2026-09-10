@@ -41,6 +41,78 @@ It never prints anything else, and it stays silent when none apply:
 The third notice stops for good once AIQ Rank is installed in the CLI, and
 never appears in Codex.
 
+## Planning credit and local explanations
+
+Claude Code earns Planning credit for a recognized planning signal followed
+by a successful main-session Write/Edit on the same local date, or a successful
+main-session Write/Edit to a recognized plan artifact. Codex also supports
+apply-patch. Shell writes (including heredocs and sed) are not mutation evidence;
+Claude subagent-only writes do not credit the parent. Each qualifying session
+earns at most one credit per local date, regardless of file or edit count.
+
+A plan artifact is a Markdown file under any `plans/` directory **or** a file
+named `PLAN.md` **or** ending in `-plan.md`. Planning measurement version 3
+matches the directory, basename, and `.md` extension without case sensitivity.
+For example, `Plans/DESIGN.MD` and `plan.md` qualify; `DESIGN.md` outside such a
+directory does not qualify by naming alone. Earlier measurement versions use
+case-sensitive matching. We do not read plan content or judge its quality.
+
+Run the scanner locally with explanations (this does not upload anything):
+
+```sh
+python3 plugin/plugins/aiqrank/scripts/scan_transcripts.py --days 30 --explain-planning
+```
+
+The command above is relative to this repository; in an installed plugin, use
+its `scripts/scan_transcripts.py`. The standalone `scripts/scan_codex.py` accepts
+the same flag. Normal metrics JSON stays on stdout; an additional JSON report
+goes to stderr. Explanations cover Claude Code, Cowork's Claude-format parser,
+and Codex, and include only source, date, and counts for dates retained by the
+scanner. They never enter upload metrics. No artifact path, command, transcript
+excerpt, or session identifier appears in the explanation.
+
+Counts distinguish credited/uncredited main-session days and child-session
+days. Reasons count session-days with observed shell calls, excluded child
+mutations, missing/failed completion, completion on another date, missing
+mutation targets, or unrecognized paths without a prior planning signal.
+Each reason counts once per session-date; reasons can overlap and can coexist
+with eventual credit. These are observed detection limits, **not counts of
+missed valid plans**. Dates omitted for incomplete Codex evidence are omitted
+from explanations too; the normal metrics output carries completeness status.
+
+After upgrading, a full retained-window rescan can recover eligible historical
+activity still on disk. Current-day hook uploads alone do not repair older days.
+
+## Instruction-edit credit
+
+Plugin 0.3.29 corrects instruction-edit counters for Claude Code, Cowork, and
+Codex. `CLAUDE.md` and `AGENTS.md` match as exact basenames, including relative
+paths such as `CLAUDE.md` and `./AGENTS.md`, absolute paths, and Windows paths.
+Each Write/Edit needs a paired successful result on the invocation's local
+date. Codex also supports apply-patch, including supported nested calls with
+successful enclosing completion. Failed, unpaired, and cross-date completions
+earn no instruction-edit credit. Successful repeated edits and Claude subagent
+edits still count; there is no Planning-style main-session restriction here.
+
+Shell writes still do not increment these counters. Claude/Cowork can separately
+count recognized instruction files on disk as configuration surfaces regardless
+of the tool used to create them. File discovery, MCP-edit counters, and the
+Customization formula are unchanged. Codex's `agents_md_writes` remains the
+AGENTS.md subset of `claude_md_writes`.
+
+Daily rows carry `instruction_writes_measurement_version: 1`, independently of
+the configuration-surface marker. For the same source and date, the server uses
+instruction counts only from rows with the highest valid instruction marker;
+a corrected zero beats older attempt counts. Other dates, sources, and metrics
+are unaffected. NanoClaw's shared Claude provider parser inherits this correction
+and retains the marker when provider rows are merged.
+
+The server must support the new marker before upgraded uploads arrive. Publish
+the plugin only after that support is deployed, coordinating the advertised
+version with the public release. A full retained-window rescan can recover
+eligible historical relative-path edits and remove false attempt credit while
+transcripts remain available. Older clients cannot reproduce these semantics.
+
 ## Supported tools
 
 The plugin scans and scores activity from all of these tools in a single run:

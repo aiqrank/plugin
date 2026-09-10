@@ -109,7 +109,7 @@ class ScanCodexTests(unittest.TestCase):
         # No unknown event types in the normal fixture
         self.assertEqual(result["_unknown_event_types"], {})
 
-    def test_apply_patch_counts_file_changes_and_agents_md(self):
+    def test_apply_patch_attempts_count_activity_but_not_instruction_writes(self):
         _staged_session_root(self.tmp, "fixture_apply_patch.jsonl")
         result = scan(codex_dir=self.tmp)
         rollup = result["rollup"]
@@ -119,9 +119,10 @@ class ScanCodexTests(unittest.TestCase):
         self.assertEqual(rollup["tool_calls"], 3)
         self.assertEqual(rollup["tool_name_counts"].get("apply_patch"), 3)
 
-        # Only the first patch touched AGENTS.md
-        self.assertEqual(rollup["agents_md_writes"], 1)
-        self.assertEqual(rollup["claude_md_writes"], 1)
+        # These calls include status=completed but no paired result. Attempt
+        # activity remains visible; instruction-edit credit requires success evidence.
+        self.assertEqual(rollup["agents_md_writes"], 0)
+        self.assertEqual(rollup["claude_md_writes"], 0)
 
     def test_edge_cases_unknown_types_and_malformed_lines(self):
         _staged_session_root(self.tmp, "fixture_edge_cases.jsonl")
@@ -225,7 +226,8 @@ class ScanCodexTests(unittest.TestCase):
             result = scan(codex_dir=self.tmp, window_days=17, now_ts=123.0, mtime_after_ts=45.0)
 
         delegated.assert_called_once_with(
-            self.tmp, window_days=17, now_ts=123.0, mtime_after_ts=45.0
+            self.tmp, window_days=17, now_ts=123.0, mtime_after_ts=45.0,
+            planning_diagnostics=None,
         )
         self.assertEqual(result["source"], "codex")
         self.assertEqual(result["daily"], [])
@@ -703,9 +705,9 @@ class CodexStructuralPlanningTests(unittest.TestCase):
         result = scan(codex_dir=self.tmp)
         self.assertEqual(len(result["daily"]), 1)
         self.assertEqual(
-            result["daily"][0]["metrics"]["planning_measurement_version"], 2
+            result["daily"][0]["metrics"]["planning_measurement_version"], 3
         )
-        self.assertEqual(result["rollup"]["planning_measurement_version"], 2)
+        self.assertEqual(result["rollup"]["planning_measurement_version"], 3)
 
     def test_claude_and_codex_parity_for_equivalent_fixtures(self):
         # Equivalent structural fixtures: a planning signal followed by a

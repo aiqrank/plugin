@@ -309,7 +309,8 @@ class HookNudgeTests(unittest.TestCase):
     def test_missing_cli_plugin_nudge_is_silent_for_thirty_days(self):
         self._write_fresh_upload()
         self._install_fake_cli()
-        now = time.time()
+        # Keep frozen time exactly representable in the persisted timestamp.
+        now = float(int(time.time()))
 
         with mock.patch.object(self.mod.time, "time", return_value=now):
             first_output = self._run()

@@ -118,10 +118,10 @@ PLAN_MODE_TOOL = "ExitPlanMode"
 CLAUDE_PLAN_AGENT_TOOLS = {"Agent", "Task"}
 AIQRANK_SKILL_DIR_FRAGMENT = "/.claude/skills/aiqrank/"
 
-# `sessions_with_plan_mode` semantics marker. Version 2 broadens recognized
-# plan artifacts to Markdown files below any `plans/` directory. Emitted in
-# every daily bucket so the server can prefer the newest measurement definition.
-PLANNING_MEASUREMENT_VERSION = 2
+# `sessions_with_plan_mode` semantics marker. Version 3 makes the existing
+# plan directory, basename, and Markdown extension rules case-insensitive.
+# Emitted in every daily bucket so the server can prefer the newest definition.
+PLANNING_MEASUREMENT_VERSION = 3
 # Directory name that marks a plan artifact, matched at any depth. It used to
 # be an allowlist of two permitted parents (`docs`, `.context`), which meant
 # the same `plans/PLAN.md` counted or not depending on where the repository
@@ -254,6 +254,7 @@ _PEAK_FIELDS = (
     "config_surfaces_built",
     "config_surfaces_used",
     "customization_measurement_version",
+    "instruction_writes_measurement_version",
 )
 
 # Bumped when the `custom_creation` inputs change meaning. Lets the server
@@ -261,6 +262,9 @@ _PEAK_FIELDS = (
 # measured surfaces", the same way `planning_measurement_version` does for
 # planning. Legacy rows read as 0 and keep the write-count scoring.
 CUSTOMIZATION_MEASUREMENT_VERSION = 1
+# Paired, same-local-date instruction mutations; relative basenames qualify.
+# Independent of the durable configuration snapshot's measurement version.
+INSTRUCTION_WRITES_MEASUREMENT_VERSION = 1
 
 _DICT_FIELDS = (
     "tool_name_counts",
@@ -430,6 +434,7 @@ def scan(
     openclaw_dir: Path | None = None,
     nanoclaw_roots: list[Path] | None = None,
     authored_registry_path: Path | None = None,
+    planning_diagnostics: dict | None = None,
 ) -> dict:
     """Scan supported coding-agent transcripts within the last `window_days`.
 
@@ -442,6 +447,10 @@ def scan(
     ~/Documents/Claude/Scheduled). `codex_dir` overrides the default Codex
     root (~/.codex); pass a non-existent path to disable Codex scanning in
     tests.
+
+    `planning_diagnostics` is an optional caller-owned local accumulator,
+    never returned in the upload envelope. The CLI filters it to emitted dates
+    and prints it separately to stderr only with `--explain-planning`.
     """
     host_homes = _host_homes()
     host_home = host_homes[0]
@@ -589,6 +598,7 @@ def scan(
                     is_cowork=False,
                     local_skills=local_skills,
                     command_verbs_by_day=claude_command_verbs,
+                    planning_diagnostics=planning_diagnostics,
                 )
 
             cwd = _extract_cwd_from_project(project_dir)
@@ -630,6 +640,7 @@ def scan(
             is_cowork=True,
             local_skills=local_skills,
             command_verbs_by_day=cowork_command_verbs,
+            planning_diagnostics=planning_diagnostics,
         )
 
     for d, verbs in claude_command_verbs.items():
@@ -675,6 +686,7 @@ def scan(
             window_days=window_days,
             now_ts=now_ts,
             mtime_after_ts=mtime_after_ts,
+            planning_diagnostics=planning_diagnostics,
         )
         if codex_result is not None:
             for date_str, intervals in codex_result.get("intervals_by_day", {}).items():
@@ -1223,15 +1235,15 @@ def _is_plan_artifact_path(file_path: str) -> bool:
     """True for recognized plan artifacts, matched structurally by path only:
     a Markdown file directly or recursively under a `plans/` directory at any
     depth, or whose basename is exactly `PLAN.md` or matches `*-plan.md`.
-    File content is never inspected."""
-    file_path = _normalize_recorded_path(file_path)
+    Matching is case-insensitive. File content is never inspected."""
+    file_path = _normalize_recorded_path(file_path).lower()
     if not file_path.endswith(".md"):
         return False
     segments = [s for s in file_path.split("/") if s]
     if not segments:
         return False
     basename = segments[-1]
-    if basename == "PLAN.md" or basename.endswith("-plan.md"):
+    if basename == "plan.md" or basename.endswith("-plan.md"):
         return True
     # Any `plans/` directory that actually contains something — the final
     # segment is the file, so a trailing `plans` segment cannot qualify.
@@ -1239,6 +1251,63 @@ def _is_plan_artifact_path(file_path: str) -> bool:
         if segment == PLAN_ARTIFACT_DIR:
             return True
     return False
+
+
+def _planning_exclusion_reason(
+    target_paths: list[str], has_signal: bool, succeeded: bool,
+    completion_date: date | None, invocation_date: date, is_main: bool = True,
+) -> str | None:
+    """Explain observed mutations, without inferring that their contents are plans."""
+    if not is_main:
+        return "child_mutation_excluded"
+    if not succeeded:
+        if completion_date is not None and completion_date != invocation_date:
+            return "completion_on_other_date"
+        return "missing_or_failed_completion"
+    if not target_paths:
+        return "missing_mutation_target"
+    if not has_signal and not any(_is_plan_artifact_path(p) for p in target_paths):
+        return "unrecognized_path_without_prior_signal"
+    return None
+
+
+def _record_planning_diagnostics(
+    diagnostics: dict | None, source: str, days_seen: set[date],
+    credited: set[date], exclusions: dict[date, set[str]], is_main: bool = True,
+) -> None:
+    """Keep local counts separate from every upload metric dictionary.
+
+    Each reason counts at most once per session-date. Reasons can overlap,
+    including in sessions that eventually qualify; they are not missed plans.
+    """
+    if diagnostics is None:
+        return
+    source_days = diagnostics.setdefault(source, {})
+    for d in days_seen:
+        counts = source_days.setdefault(d, {})
+        if not is_main:
+            outcome = "child_session_days"
+        elif d in credited:
+            outcome = "credited_main_session_days"
+        else:
+            outcome = "uncredited_main_session_days"
+        counts[outcome] = counts.get(outcome, 0) + 1
+        for reason in exclusions.get(d, set()):
+            counts[reason] = counts.get(reason, 0) + 1
+
+
+def _planning_diagnostic_report(diagnostics: dict, result: dict) -> dict:
+    """Only report dates retained by the scanner (including completeness gates)."""
+    report = {}
+    for source, block in result.get("by_source", {}).items():
+        if source not in diagnostics:
+            continue
+        days = diagnostics[source]
+        report[source] = [
+            {"date": row["date"], "counts": days.get(date.fromisoformat(row["date"]), {})}
+            for row in block["daily"]
+        ]
+    return {"planning_diagnostics": report}
 
 
 def _authored_skill_name_from_path(file_path: str) -> str | None:
@@ -1728,6 +1797,7 @@ def process_session(
     is_cowork: bool = False,
     local_skills: set[str] | None = None,
     command_verbs_by_day: dict[date, set[str]] | None = None,
+    planning_diagnostics: dict | None = None,
 ) -> None:
     """Parse a single JSONL transcript and update per-day buckets.
 
@@ -1763,6 +1833,7 @@ def process_session(
     # sessions_with_plan_mode; plan_mode_invocations stays raw.
     plan_signal_dates: set[date] = set()
     days_with_plan_outcome: set[date] = set()
+    planning_exclusions: dict[date, set[str]] = {}
     # Per-day message counts within this session — used to update daily
     # max_messages_in_session at the end.
     msgs_per_day: dict[date, int] = {}
@@ -1974,6 +2045,9 @@ def process_session(
                             plan_signal_dates.add(d)
                             bucket["plan_mode_invocations"] += 1
 
+                        if planning_diagnostics is not None and name == "Bash":
+                            planning_exclusions.setdefault(d, set()).add("shell_not_mutation_evidence")
+
                         if name in ("Write", "Edit"):
                             target_path = _normalize_recorded_path(
                                 (tool_use.get("input") or {}).get("file_path") or ""
@@ -1988,6 +2062,15 @@ def process_session(
                                 isinstance(tool_use_id, str)
                                 and tool_success_dates.get(tool_use_id) == d
                             )
+                            if planning_diagnostics is not None:
+                                reason = _planning_exclusion_reason(
+                                    [target_path] if target_path else [],
+                                    d in plan_signal_dates, succeeded,
+                                    tool_success_dates.get(tool_use_id) if isinstance(tool_use_id, str) else None,
+                                    d, is_main,
+                                )
+                                if reason:
+                                    planning_exclusions.setdefault(d, set()).add(reason)
                             if succeeded and isinstance(target_path, str) and target_path:
                                 skill_name = _authored_skill_name_from_path(target_path)
                                 if skill_name and skill_name not in bucket["authored_skill_names"]:
@@ -2012,12 +2095,15 @@ def process_session(
                             ):
                                 bucket["custom_mcp_config_writes"] += 1
 
-                            if target_path.endswith("/CLAUDE.md") or target_path.endswith(
-                                "/AGENTS.md"
-                            ):
+                            if succeeded and target_path.rsplit("/", 1)[-1] in {"CLAUDE.md", "AGENTS.md"}:
                                 bucket["claude_md_writes"] += 1
     except OSError:
         return
+
+    _record_planning_diagnostics(
+        planning_diagnostics, SOURCE_COWORK if is_cowork else SOURCE_CLAUDE_CODE,
+        days_seen, days_with_plan_outcome, planning_exclusions, is_main,
+    )
 
     # Fold (date, requestId) Agent tallies into per-day peaks.
     for (d, _rid), count in agents_by_request_day.items():
@@ -2029,6 +2115,7 @@ def process_session(
 
     for d in days_seen:
         bucket = _bucket(daily, d)
+        bucket["instruction_writes_measurement_version"] = INSTRUCTION_WRITES_MEASUREMENT_VERSION
         bucket["sessions"] += 1
         if is_main:
             bucket["main_sessions"] += 1
@@ -2292,6 +2379,7 @@ def scan_codex(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now_ts: float | None = None,
     mtime_after_ts: float | None = None,
+    planning_diagnostics: dict | None = None,
 ) -> dict | None:
     """Canonical Codex scanner used by every integrated and standalone path.
 
@@ -2349,6 +2437,7 @@ def scan_codex(
                 command_verbs_by_day,
                 unknown_event_types,
                 seen_mcp_completions,
+                planning_diagnostics=planning_diagnostics,
             )
             incomplete_dates.update(outcome["incomplete_dates"])
             unlocalizable_failures += outcome["unlocalizable_failures"]
@@ -2438,6 +2527,7 @@ def process_codex_session(
     command_verbs_by_day: dict[date, set[str]] | None = None,
     unknown_event_types: dict[str, int] | None = None,
     seen_mcp_completions: set[str] | None = None,
+    planning_diagnostics: dict | None = None,
 ) -> dict:
     """Parse one Codex rollout and return aggregate-only completeness facts."""
     command_verbs_by_day = command_verbs_by_day if command_verbs_by_day is not None else {}
@@ -2452,6 +2542,7 @@ def process_codex_session(
     # far in event order vs qualified outcomes that feed the session counter.
     plan_signal_dates: set[date] = set()
     days_with_plan_outcome: set[date] = set()
+    planning_exclusions: dict[date, set[str]] | None = {} if planning_diagnostics is not None else None
     msgs_per_day: dict[date, int] = {}
     earliest_per_day: dict[date, float] = {}
     latest_per_day: dict[date, float] = {}
@@ -2727,6 +2818,8 @@ def process_codex_session(
                     launches_by_day,
                     command_verbs_by_day,
                     succeeded=succeeded,
+                    planning_exclusions=planning_exclusions,
+                    completion_date=mutation_success_dates.get(call_id) if isinstance(call_id, str) else None,
                 )
                 days_with_tools.add(d)
 
@@ -2754,6 +2847,8 @@ def process_codex_session(
                             command_verbs_by_day,
                             succeeded=succeeded,
                             nested=True,
+                            planning_exclusions=planning_exclusions,
+                            completion_date=mutation_success_dates.get(call_id) if isinstance(call_id, str) else None,
                         )
                 continue
 
@@ -2784,6 +2879,11 @@ def process_codex_session(
         failure_count += 1
         unlocalizable_failures += 1
 
+    _record_planning_diagnostics(
+        planning_diagnostics, SOURCE_CODEX, days_seen,
+        days_with_plan_outcome, planning_exclusions or {},
+    )
+
     skill_names_seen: set[str] = set()
     for d, payload, call_id in skill_candidates:
         if not output_success.get(call_id, False):
@@ -2796,6 +2896,7 @@ def process_codex_session(
 
     for d in days_seen:
         bucket = _bucket(daily, d)
+        bucket["instruction_writes_measurement_version"] = INSTRUCTION_WRITES_MEASUREMENT_VERSION
         bucket["sessions"] += 1
         bucket["main_sessions"] += 1
     for d in days_with_tools:
@@ -2840,6 +2941,8 @@ def _apply_codex_tool_effects(
     *,
     succeeded: bool = False,
     nested: bool = False,
+    planning_exclusions: dict[date, set[str]] | None = None,
+    completion_date: date | None = None,
 ) -> None:
     """Apply one direct, nested, or MCP-completion tool signal."""
     name = _normalize_tool_name(_normalize_codex_label(name))
@@ -2875,6 +2978,8 @@ def _apply_codex_tool_effects(
         bucket["plan_mode_invocations"] += 1
 
     if name in {"shell", "exec_command"}:
+        if planning_exclusions is not None:
+            planning_exclusions.setdefault(d, set()).add("shell_not_mutation_evidence")
         command = _shell_command(payload.get("arguments"))
         if command:
             verb = _first_meaningful_word(command)
@@ -2900,6 +3005,13 @@ def _apply_codex_tool_effects(
             target_paths = [fp]
 
     target_paths = [_normalize_recorded_path(path) for path in target_paths]
+
+    if planning_exclusions is not None and name in {"apply_patch", "Write", "Edit"}:
+        reason = _planning_exclusion_reason(
+            target_paths, d in plan_signal_dates, succeeded, completion_date, d,
+        )
+        if reason:
+            planning_exclusions.setdefault(d, set()).add(reason)
 
     # Planning credit requires a successful mutation with a recognized
     # target: a prior signal on the same date, or a plan-artifact path.
@@ -2927,14 +3039,10 @@ def _apply_codex_tool_effects(
         # Codex AGENTS.md (Claude's CLAUDE.md equivalent). Tracked under
         # the same `claude_md_writes` field — server-side scoring is
         # field-name-agnostic per the dual-source plan.
-        if (
-            target_path == "AGENTS.md"
-            or target_path == "CLAUDE.md"
-            or target_path.endswith("/AGENTS.md")
-            or target_path.endswith("/CLAUDE.md")
-        ):
+        instruction_name = target_path.rsplit("/", 1)[-1]
+        if succeeded and instruction_name in {"CLAUDE.md", "AGENTS.md"}:
             bucket["claude_md_writes"] += 1
-            if target_path.endswith("/AGENTS.md") or target_path == "AGENTS.md":
+            if instruction_name == "AGENTS.md":
                 bucket["agents_md_writes"] += 1
 
         # MCP config: `~/.codex/config.toml` plus any `*.mcp.json` style.
@@ -3309,6 +3417,7 @@ def _codex_apply_patch_files(payload: dict) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    planning_diagnostics = {} if "--explain-planning" in argv else None
     window_days = DEFAULT_WINDOW_DAYS
     if "--days" in argv:
         idx = argv.index("--days")
@@ -3339,7 +3448,10 @@ def main(argv: list[str]) -> int:
     try:
         if host_home_override is not None:
             os.environ["AIQRANK_HOST_HOME"] = host_home_override
-        result = scan(window_days=window_days, mtime_after_ts=mtime_after_ts)
+        result = scan(
+            window_days=window_days, mtime_after_ts=mtime_after_ts,
+            planning_diagnostics=planning_diagnostics,
+        )
     finally:
         if host_home_override is not None:
             if prior_host_home is None:
@@ -3349,6 +3461,9 @@ def main(argv: list[str]) -> int:
 
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+    if planning_diagnostics is not None:
+        json.dump(_planning_diagnostic_report(planning_diagnostics, result), sys.stderr, sort_keys=True)
+        sys.stderr.write("\n")
     return 0
 
 

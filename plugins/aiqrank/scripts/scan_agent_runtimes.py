@@ -542,6 +542,7 @@ def _scan_nanoclaw_provider_history(root: Path, daily: dict[date, dict], cutoff:
                 "max_parallel_agents",
                 "max_messages_in_session",
                 "planning_measurement_version",
+                "instruction_writes_measurement_version",
             }:
                 target[field] = max(target.get(field, 0), _int(value))
             else:
