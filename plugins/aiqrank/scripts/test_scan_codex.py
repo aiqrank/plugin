@@ -676,6 +676,35 @@ class CodexStructuralPlanningTests(unittest.TestCase):
         rollup = scan(codex_dir=self.tmp)["rollup"]
         self.assertEqual(rollup["authored_skill_names"], ["review-helper"])
 
+    def test_capitalized_skills_root_establishes_authorship(self):
+        self._write_rollout(
+            "zo-author",
+            [
+                self._patch("p1", "/home/workspace/Skills/zo-helper/SKILL.md"),
+                self._output("p1"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], ["zo-helper"])
+
+    def test_input_text_block_output_counts_as_mutation_evidence(self):
+        def blocks(text):
+            return [{"type": "input_text", "text": text}]
+
+        self._write_rollout(
+            "block-output",
+            [
+                self._patch("p1", "plugin/skills/block-ok/SKILL.md"),
+                self._output("p1", text=blocks("Done")),
+                self._patch("p2", "plugin/skills/block-failed/SKILL.md", ts="2026-04-20T12:02:00.000Z"),
+                self._output("p2", text=blocks("Error: command failed"), ts="2026-04-20T12:02:01.000Z"),
+            ],
+        )
+
+        rollup = scan(codex_dir=self.tmp)["rollup"]
+        self.assertEqual(rollup["authored_skill_names"], ["block-ok"])
+
     def test_failed_and_self_skill_mutations_never_author(self):
         self._write_rollout(
             "non-author",

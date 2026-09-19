@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-BUNDLED_VERSION = "0.3.29"
+BUNDLED_VERSION = "0.3.30"
 MANIFEST_NAME = "managed_artifacts.json"
 
 # Hashes of every released version of each managed file, so an on-disk copy

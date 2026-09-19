@@ -113,6 +113,13 @@ version with the public release. A full retained-window rescan can recover
 eligible historical relative-path edits and remove false attempt credit while
 transcripts remain available. Older clients cannot reproduce these semantics.
 
+## Codex skill authorship
+
+Plugin 0.3.30 credits Codex skill authorship for `Skills/<name>/SKILL.md`
+folders of any capitalization and for newer Codex builds that report tool output
+as structured text blocks. Authorship still requires a successful completion;
+failed, running, and ambiguous results earn no credit.
+
 ## Supported tools
 
 The plugin scans and scores activity from all of these tools in a single run:

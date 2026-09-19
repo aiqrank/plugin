@@ -1315,7 +1315,7 @@ def _authored_skill_name_from_path(file_path: str) -> str | None:
     `skills/<name>/SKILL.md` — home skill roots and plugin repositories
     alike. Excludes the aiqrank self-skill."""
     segments = [s for s in _normalize_recorded_path(file_path).split("/") if s]
-    if len(segments) < 3 or segments[-1] != "SKILL.md" or segments[-3] != "skills":
+    if len(segments) < 3 or segments[-1] != "SKILL.md" or segments[-3].lower() != "skills":
         return None
     name = segments[-2]
     if name == "aiqrank" or not _AUTHORED_NAME_RE.match(name):
@@ -3135,6 +3135,13 @@ def _codex_mutation_succeeded(payload: dict) -> bool:
     if isinstance(status, str):
         return status.lower() in {"completed", "success", "succeeded", "ok"}
     output = payload.get("output")
+    # Newer Codex builds emit output as a list of `input_text` blocks.
+    if isinstance(output, list):
+        output = "\n".join(
+            block["text"]
+            for block in output
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
     if not isinstance(output, str) or not output:
         return False
     lowered = output[:500].lower()
